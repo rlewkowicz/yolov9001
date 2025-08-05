@@ -1,0 +1,13 @@
+**/runs/
+**/__pycache__/
+/TensorRT-10.13.0/
+**/*.pt
+**/.vscode/
+/saved_model/
+/calibration_npy_files/
+**/*.tflite
+**/*.terraform*
+**/terraform.tfstate*
+/coco/
+archive.tar.gz
+**/remoteruns/

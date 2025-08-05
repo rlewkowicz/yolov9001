@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import math
+import os
+import socket
+import subprocess
+import sys
+import warnings
+from pathlib import Path
+from typing import Dict, List, Sequence, Tuple
+import click
+
+try:
+    import torch
+except ImportError:
+    torch = None
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+os.environ["TF_CPP_MAX_VLOG_LEVEL"] = "3"
+os.environ["PYTHONWARNINGS"] = "ignore"
+os.environ["ABSL_LOG_THRESHOLD"] = "ERROR"
+os.environ["ABSL_CPP_MIN_LOG_LEVEL"] = "3"
+warnings.filterwarnings("ignore")
+
+ROOT = Path(__file__).resolve().parent
+TOOLCHAIN = ROOT / "toolchain"
+SELF_NAME = Path(sys.argv[0]).stem
+
+COMMON_DEFAULTS: List[str] = []
+
+ALIASES: Dict[str, Tuple[str, str, Sequence[str]]] = {
+    "train": (
+        "train.py",
+        "Standard training",
+        [
+            "--cfg",
+            "yolov9001-np.yaml",
+            "--project",
+            str(ROOT / "runs"),
+            "--data",
+            str(TOOLCHAIN / "data" / "coco.yaml"),
+            "--hyp",
+            str(TOOLCHAIN / "data" / "hyps" / "hyp.scratch-high.yaml"),
+            "--noplots"
+        ],
+    ),
+    "ddptrain": (
+        "train.py",
+        "DDP training",
+        [
+            "--cfg",
+            "yolov9001-np.yaml",
+            "--project",
+            str(ROOT / "runs"),
+            "--data",
+            str(TOOLCHAIN / "data" / "coco.yaml"),
+            "--hyp",
+            str(TOOLCHAIN / "data" / "hyps" / "hyp.scratch-high.yaml"),
+            "--sync-bn",
+            "--noplots"
+        ],
+    ),
+    "detect": (
+        "detect.py",
+        "Object detection",
+        [
+
+        ],
+    ),
+    "val": (
+        "val.py",
+        "Model validation",
+        [
+            "--data",
+            str(TOOLCHAIN / "data" / "coco.yaml"),
+        ],
+    ),
+    "export": (
+        "export.py",
+        "Model export to onnx",
+        [
+            "--data",
+            str(TOOLCHAIN / "data" / "coco.yaml"),
+        ],
+    ),
+    "onnx": (
+        "onnx-util.py",
+        "--val or --detect",
+        [
+            "--data",
+            str(TOOLCHAIN / "data" / "coco.yaml"),
+        ],
+    )
+}
+
+CTX_ROOT = {
+    "ignore_unknown_options": True,
+    "allow_extra_args": True,
+    "help_option_names": ["-h", "--help"],
+}
+
+CTX_LEAF = {
+    "ignore_unknown_options": True,
+    "allow_extra_args": True,
+}
+
+root = click.Group(context_settings=CTX_ROOT, help="YOLOv9001 launcher")
+
+def _ensure_group(parent: click.Group, name: str) -> click.Group:
+    if name not in parent.commands:
+
+        @parent.group(name=name, context_settings=CTX_ROOT)
+        def _grp() -> None:
+            pass
+
+    return parent.commands[name]
+
+def _exec_script(
+    script: Path,
+    alias_args: Sequence[str],
+    defaults: Sequence[str],
+    user_args: List[str],
+) -> None:
+    env = dict(os.environ)
+    env["PYTHONWARNINGS"] = "ignore"
+    env["TF_CPP_MIN_LOG_LEVEL"] = "3"
+    env["TF_ENABLE_ONEDNN_OPTS"] = "0"
+    cmd = [sys.executable, str(script), *alias_args, *defaults, *user_args]
+    os.execve(cmd[0], cmd, env)
+
+def _register(
+    path: str,
+    rel_script: str,
+    short_help: str,
+    alias_args: Sequence[str],
+) -> None:
+    if path == "ddptrain":
+        return
+    parts = path.split()
+    if parts and parts[0] == SELF_NAME:
+        parts = parts[1:]
+    if not parts:
+        return
+    group = root
+    for segment in parts[:-1]:
+        group = _ensure_group(group, segment)
+    leaf_name = parts[-1]
+    target = (TOOLCHAIN / rel_script).resolve()
+
+    @group.command(
+        name=leaf_name,
+        context_settings=CTX_LEAF,
+        short_help=short_help,
+        add_help_option=False,
+    )
+    @click.pass_context
+    def _leaf(ctx: click.Context) -> None:
+        _exec_script(target, alias_args, COMMON_DEFAULTS, ctx.args)
+
+for alias_key, cfg in ALIASES.items():
+    _register(alias_key, *cfg)
+
+@root.command(
+    name="ddptrain",
+    context_settings=CTX_LEAF,
+    short_help="Launch DDP training",
+    add_help_option=False,
+)
+@click.pass_context
+def ddptrain(ctx: click.Context) -> None:
+    hosts_file = "/ml-hosts.txt"
+    current_ip = (
+        subprocess.check_output(["hostname", "-I"]).decode().split()[0]
+        if os.path.exists("/sbin/ip")
+        else socket.gethostbyname(socket.gethostname())
+    )
+
+    try:
+        with open(hosts_file, "r", encoding="utf-8") as fp:
+            hosts = [line.strip() for line in fp if line.strip()]
+    except FileNotFoundError:
+        hosts = []
+
+    if not hosts or current_ip not in hosts:
+        hosts = [current_ip]
+
+    master_addr = hosts[0]
+    node_rank = hosts.index(current_ip)
+    nnodes = len(hosts)
+    master_port = "29500"
+
+    if torch is None or not torch.cuda.is_available():
+        print("CUDA not available; cannot run DDP training.", file=sys.stderr)
+        sys.exit(1)
+
+    num_gpus = torch.cuda.device_count()
+    num_cpus = os.cpu_count() or 1
+    workers_per_proc = max(1, num_cpus // num_gpus)
+    omp_threads = max(1, num_cpus // num_gpus)
+
+    script_path = str(TOOLCHAIN / ALIASES["ddptrain"][0])
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "torch.distributed.launch",
+        "--nproc_per_node",
+        str(num_gpus),
+        "--nnodes",
+        str(nnodes),
+        "--node_rank",
+        str(node_rank),
+        "--master_addr",
+        master_addr,
+        "--master_port",
+        master_port,
+        script_path,
+    ]
+
+    cmd.extend(ALIASES["ddptrain"][2])
+    cmd.extend(["--workers", str(workers_per_proc)])
+
+    world_size = nnodes * num_gpus
+
+    if not any(a.startswith("--cache") for a in ctx.args):
+        total_mem = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')
+        if total_mem > 250 * 1024**3:
+            cmd.extend(['--cache', 'ram'])
+        else:
+            cmd.extend(['--cache', 'disk'])
+
+    if not any(a.startswith("--batch-size") for a in ctx.args):
+        gpu_mem_bytes = [
+            torch.cuda.get_device_properties(i).total_memory for i in range(num_gpus)
+        ]
+        min_mem_gib = min(gpu_mem_bytes) / (1024 ** 3)
+        reference_batch_size = 38
+        reference_memory_gib = 23.55
+        per_gpu_batch = max(
+            1,
+            math.ceil((min_mem_gib / reference_memory_gib) * reference_batch_size),
+        )
+        total_batch = per_gpu_batch * world_size
+        cmd.extend(["--batch-size", str(total_batch)])
+
+    cmd.extend(ctx.args)
+
+    env = os.environ.copy()
+    env["OMP_NUM_THREADS"] = str(omp_threads)
+    env["MASTER_ADDR"] = master_addr
+    env["MASTER_PORT"] = master_port
+    env["WORLD_SIZE"] = str(world_size)
+
+    print(
+        f"DDP launch: node_rank={node_rank}, nnodes={nnodes}, gpus_per_node={num_gpus}"
+    )
+    try:
+        subprocess.run(cmd, check=True, env=env)
+    except subprocess.CalledProcessError as exc:
+        sys.exit(exc.returncode)
+
+if __name__ == "__main__":
+    root()

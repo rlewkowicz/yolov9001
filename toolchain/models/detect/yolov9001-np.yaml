@@ -1,0 +1,55 @@
+# Nano+. I think most "Nano" models are in the 2M Param range. After pruning we're at ~4
+# This puts us between most small and nano models.
+nc: 80
+depth_multiple: 1
+width_multiple: 1
+activation: nn.Hardswish()
+anchors: 3
+
+backbone:
+  - [-1, 1, QARepVGGBlockV2, [16, 3, 2]]
+
+  - [-1, 1, QARepVGGBlockV2, [32, 3, 2]]
+  - [-1, 2, RepBlockAdd, [32, 32, QARepVGGBlockV2]]
+
+  - [-1, 1, QARepVGGBlockV2, [64, 3, 2]]
+  - [-1, 4, RepBlockAdd, [64, 64, QARepVGGBlockV2]]
+
+  - [-1, 1, QARepVGGBlockV2, [128, 3, 2]]
+  - [-1, 4, RepBlockAdd, [128, 128, QARepVGGBlockV2]]
+
+  - [-1, 1, QARepVGGBlockV2, [256, 3, 2]]
+  - [-1, 2, RepBlockAdd, [256, 256, QARepVGGBlockV2]]
+  - [-1, 1, GatedSPPF, [256, 5]]
+
+head:
+  - [9, 1, Conv, [128, 1, 1]]
+
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]
+  - [[-1, 6], 1, QuantAdd, []]
+  - [-1, 1, QARepNCSPELAN, [128, 96, 96, 2]]
+
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]
+  - [[-1, 4], 1, QuantAdd, []]
+  - [-1, 1, QARepNCSPELAN, [64, 64, 64, 2]]
+
+  - [-1, 1, AConv, [96]]
+  - [[-1, 13], 1, QuantAdd, []]
+  - [-1, 1, QARepNCSPELAN, [96, 96, 96, 2]]
+
+  - [-1, 1, AConv, [128]]
+  - [[-1, 10], 1, QuantAdd, []]
+  - [-1, 1, QARepNCSPELAN, [128, 128, 128, 2]]
+
+  - [9, 1, Conv, [128, 1, 1]]
+
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]
+  - [[-1, 6], 1, QuantAdd, []]
+  - [-1, 1, QARepNCSPELAN, [128, 96, 96, 2]]
+
+  - [-1, 1, nn.Upsample, [None, 2, 'nearest']]
+  - [[-1, 4], 1, QuantAdd, []]
+  - [-1, 1, QARepNCSPELAN, [64, 64, 64, 2]]
+
+  - [[29, 26, 23, 16, 19, 22], 1, RN_DualDDetect, [nc]]
+

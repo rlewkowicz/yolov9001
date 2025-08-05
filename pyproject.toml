@@ -1,0 +1,53 @@
+[project]
+name = "yolov9001"
+version = "0.1.0"
+
+dependencies = [
+  "torch==2.6.0",
+  "torchvision==0.21.0",
+  "torchaudio==2.6.0",
+
+  # All the rest come from PyPI
+  "sng4onnx~=1.0.4",
+  "ai-edge-litert~=1.4.0",
+  "keras~=3.10.0",
+  "tf_keras~=2.18.0",
+  "onnx2tf~=1.28.2",
+  "click~=8.2.1",
+  "onnx_graphsurgeon~=0.5.8",
+  "absl-py~=2.3.1",
+  "albumentations~=1.0.3",
+  "GitPython~=3.1.45",
+  "ipython~=8.18.1",
+  "matplotlib~=3.9.4",
+  "numpy~=1.26.4",
+  "onnx~=1.16.2",
+  "onnx-simplifier~=0.4.36",
+  "onnxruntime~=1.19.2",
+  "onnxruntime-gpu~=1.19.2",
+  "opencv-python~=4.11.0.86",
+  "pandas~=2.3.1",
+  "Pillow~=8.4.0",
+  "prettytable~=3.16.0",
+  "psutil~=7.0.0",
+  "pycocotools~=2.0.10",
+  "PyYAML~=6.0.2",
+  "requests~=2.32.4",
+  "scipy~=1.13.1",
+  "seaborn~=0.13.2",
+  "sphinx_glpi_theme~=0.6",
+  "tensorboard~=2.18.0",
+  "thop~=0.1.1",
+  "tqdm~=4.67.1",
+  "tensorflow~=2.18.0",
+]
+
+[[tool.uv.index]]
+name     = "pytorch-cu126"
+url      = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch       = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }
+torchaudio  = { index = "pytorch-cu126" }
