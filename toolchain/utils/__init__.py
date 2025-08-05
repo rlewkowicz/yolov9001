@@ -2,11 +2,11 @@ import contextlib
 import platform
 import threading
 
-def emojis(str=''):
-    return str.encode().decode('ascii', 'ignore') if platform.system() == 'Windows' else str
+def emojis(str=""):
+    return (str.encode().decode("ascii", "ignore") if platform.system() == "Windows" else str)
 
 class TryExcept(contextlib.ContextDecorator):
-    def __init__(self, msg=''):
+    def __init__(self, msg=""):
         self.msg = msg
 
     def __enter__(self):
@@ -14,7 +14,7 @@ class TryExcept(contextlib.ContextDecorator):
 
     def __exit__(self, exc_type, value, traceback):
         if value:
-            print(emojis(f"{self.msg}{': ' if self.msg else ''}{value}"))
+            print(emojis(f"{self.msg}{(': ' if self.msg else '')}{value}"))
         return True
 
 def threaded(func):
@@ -25,40 +25,27 @@ def threaded(func):
 
     return wrapper
 
-def join_threads(verbose=False):
-    main_thread = threading.current_thread()
-    for t in threading.enumerate():
-        if t is not main_thread:
-            if verbose:
-                print(f'Joining thread {t.name}')
-            t.join()
-
 def notebook_init(verbose=True):
-    print('Checking setup...')
-
+    print("Checking setup...")
     import os
     import shutil
-
-    from utils.general import check_font, check_requirements, is_colab
+    from utils.general import check_font, is_colab
     from utils.torch_utils import select_device
 
     check_font()
-
     import psutil
     from IPython import display
 
     if is_colab():
-        shutil.rmtree('/content/sample_data', ignore_errors=True)
-
+        shutil.rmtree("/content/sample_data", ignore_errors=True)
     if verbose:
         gb = 1 << 30
         ram = psutil.virtual_memory().total
-        total, used, free = shutil.disk_usage("/")
+        (total, used, free) = shutil.disk_usage("/")
         display.clear_output()
-        s = f'({os.cpu_count()} CPUs, {ram / gb:.1f} GB RAM, {(total - free) / gb:.1f}/{total / gb:.1f} GB disk)'
+        s = f"({os.cpu_count()} CPUs, {ram / gb:.1f} GB RAM, {(total - free) / gb:.1f}/{total / gb:.1f} GB disk)"
     else:
-        s = ''
-
+        s = ""
     select_device(newline=False)
-    print(emojis(f'Setup complete ✅ {s}'))
+    print(emojis(f"Setup complete ✅ {s}"))
     return display

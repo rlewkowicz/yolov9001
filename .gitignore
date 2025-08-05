@@ -6,6 +6,9 @@
 /saved_model/
 /calibration_npy_files/
 **/*.tflite
+**/*.onnx
+**/*.engine
+**/*.torchscript
 **/*.terraform*
 **/terraform.tfstate*
 /coco/
