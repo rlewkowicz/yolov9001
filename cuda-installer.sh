@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -e
 function abort() {
     echo "Error: $1" >&2
@@ -100,7 +100,7 @@ else
             echo "Warning: GCC 14 installation not configured for this OS. Skipping."
             ;;
     esac
-    if [ ${
+    if [ ${#GCC_INSTALL_COMMANDS[@]} -gt 0 ]; then
         for cmd in "${GCC_INSTALL_COMMANDS[@]}"; do
             echo "Executing: $cmd"
             if ! eval "$cmd"; then

@@ -227,7 +227,7 @@ def ddptrain(ctx: click.Context) -> None:
 
     if not any(a.startswith("--cache") for a in ctx.args):
         total_mem = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')
-        if total_mem > 250 * 1024**3:
+        if total_mem > 100 * 1024**3:
             cmd.extend(['--cache', 'ram'])
         else:
             cmd.extend(['--cache', 'disk'])

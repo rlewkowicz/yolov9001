@@ -21,7 +21,7 @@ provider "aws" {
 }
 
 variable "az_letter" {
-  default = "d"
+  default = "c"
 }
 
 data "aws_vpc" "default" {
@@ -156,7 +156,7 @@ module "jump_server" {
     #!/bin/bash
     set -e
     until sudo apt-get update -y; do echo; done    
-    until sudo apt-get install -y nginx zip aria2; do echo; done
+    until sudo apt-get install -y nginx zip aria2 linux-headers-$(uname -r) build-essential; do echo; done
 
     sudo sed -i.bak '$a\
     * soft nofile 200000\n\
@@ -190,38 +190,12 @@ module "jump_server" {
     sudo sysctl --system
     sudo sysctl -p
 
-    echo 'exec /sbin/reboot -f -p' | sudo tee /sbin/reboot1 > /dev/null
-    sudo chmod 777 /sbin/reboot1
-    sudo ln -sf /sbin/reboot1 /sbin/poweroff
-    sudo ln -sf /sbin/reboot1 /sbin/shutdown
-    sudo ln -sf /sbin/reboot1 /sbin/halt
-
-    sudo tee /etc/systemd/system/forcepoweroff.service >/dev/null <<'EOL'
-    [Unit]
-    Description=Force Immediate Poweroff
-    DefaultDependencies=no
-    Before=shutdown.target reboot.target halt.target
-
-    [Service]
-    Type=oneshot
-    ExecStart=/sbin/reboot -f -p
-    RemainAfterExit=yes
-
-    [Install]
-    WantedBy=halt.target reboot.target shutdown.target
-    EOL
-
-    sudo install -d -m755 /etc/systemd/logind.conf.d
-    sudo tee    /etc/systemd/logind.conf.d/90-force-power.conf >/dev/null <<'EOD'
-    [Login]
-    HandlePowerKey=poweroff-force
-    PowerKeyIgnoreInhibited=yes
-    EOD
-
-    sudo systemctl daemon-reload
-    sudo systemctl daemon-reexec
-    sudo systemctl enable forcepoweroff.service
-    sudo systemctl restart systemd-logind
+    for f in /etc/acpi/events/*; do
+      if [ -f "$f" ]; then
+        sed -i 's|^action=.*|action=echo o > /proc/sysrq-trigger|' "$f"
+      fi
+    done
+  
   EOF
 
   monitoring           = false
@@ -243,8 +217,8 @@ module "ml_server_group" {
   assign_eip_address          = false
   ssh_key_pair                = aws_key_pair.this.key_name 
   generate_ssh_key_pair       = false
-  instance_type               = "g6e.48xlarge"
-  instance_count              = 1
+  instance_type               = "g5.12xlarge"
+  instance_count              = 4
   root_volume_size            = 70
   monitoring                  = false
   depends_on                  = [null_resource.file_uploader]
@@ -252,7 +226,7 @@ module "ml_server_group" {
   user_data = <<-EOF
     #!/bin/bash
     until sudo apt-get update -y; do echo; done
-    until sudo apt-get install -y aria2 screen; do echo; done
+    until sudo apt-get install -y aria2 screen linux-headers-$(uname -r) build-essential; do echo; done
     sudo -u ubuntu bash -l -c "curl -LsSf https://astral.sh/uv/install.sh | sh"
 
     sudo sed -i.bak '$a\
@@ -287,38 +261,12 @@ module "ml_server_group" {
     sudo sysctl --system
     sudo sysctl -p
 
-    echo 'exec /sbin/reboot -f -p' | sudo tee /sbin/reboot1 > /dev/null
-    sudo chmod 777 /sbin/reboot1
-    sudo ln -sf /sbin/reboot1 /sbin/poweroff
-    sudo ln -sf /sbin/reboot1 /sbin/shutdown
-    sudo ln -sf /sbin/reboot1 /sbin/halt
+    for f in /etc/acpi/events/*; do
+      if [ -f "$f" ]; then
+        sed -i 's|^action=.*|action=echo o > /proc/sysrq-trigger|' "$f"
+      fi
+    done
 
-    sudo tee /etc/systemd/system/forcepoweroff.service >/dev/null <<'EOL'
-    [Unit]
-    Description=Force Immediate Poweroff
-    DefaultDependencies=no
-    Before=shutdown.target reboot.target halt.target
-
-    [Service]
-    Type=oneshot
-    ExecStart=/sbin/reboot -f -p
-    RemainAfterExit=yes
-
-    [Install]
-    WantedBy=halt.target reboot.target shutdown.target
-    EOL
-
-    sudo install -d -m755 /etc/systemd/logind.conf.d
-    sudo tee    /etc/systemd/logind.conf.d/90-force-power.conf >/dev/null <<'EOD'
-    [Login]
-    HandlePowerKey=poweroff-force
-    PowerKeyIgnoreInhibited=yes
-    EOD
-
-    sudo systemctl daemon-reload
-    sudo systemctl daemon-reexec
-    sudo systemctl enable forcepoweroff.service
-    sudo systemctl restart systemd-logind
   EOF
 
   context = module.this.context

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -e
 
 abort() {
@@ -48,7 +48,7 @@ if [ ! -f "$CONDA_EXEC_PATH" ]; then
         *) abort "Unsupported architecture: $ARCH";;
     esac
     MC_URL="https://repo.anaconda.com/miniconda/$MC_FILE"
-
+    
     TMP_DIR=$(sudo -u "$ORIGINAL_USER" mktemp -d)
 
     echo "Downloading Miniconda installer..."
@@ -105,7 +105,7 @@ fi
 ACTIVATION_LINE="conda activate $ENV_NAME"
 if ! grep -Fxq "$ACTIVATION_LINE" "$RC_FILE" 2>/dev/null; then
   echo "Adding '$ACTIVATION_LINE' to $RC_FILE to make it the default for new shells."
-  echo -e "\n
+  echo -e "\n# Automatically activate the $ENV_NAME environment\n$ACTIVATION_LINE" | tee -a "$RC_FILE" > /dev/null
 else
   echo "'$ACTIVATION_LINE' already present in $RC_FILE."
 fi
