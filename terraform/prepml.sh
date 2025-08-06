@@ -67,5 +67,5 @@ sudo -u ubuntu screen -dmS ddptrain bash -ilc '
   conda activate yolov9
   nvidia-smi >/dev/null 2>&1 || true
   cd ~/yolov9001
-  ./yolov9001 ddptrain --resume
+  ./yolov9001 ddptrain
 '

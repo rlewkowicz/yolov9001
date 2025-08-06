@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
 LABELS_URL="https://github.com/ultralytics/yolov5/releases/download/v1.0/coco2017labels-segments.zip"
@@ -25,7 +25,7 @@ checksum_and_verify() {
     local chk="${TMP_META_DIR}/${base}.md5"
     local lst="${TMP_META_DIR}/${base}.lst"
     md5sum "$zip" | awk '{print $1}' >"$chk"
-    unzip -Z1 "$zip" | sed 's
+    unzip -Z1 "$zip" | sed 's#^[./]*##' >"$lst"
     mkdir -p "$dest"
     unzip -q -o "$zip" -d "$dest"
     local missing=0
@@ -51,7 +51,7 @@ if command -v aria2c >/dev/null 2>&1; then
         done
     } >"$ARIA_LIST"
     cat >"$ARIA_HOOK" <<'HOOK'
-
+#!/usr/bin/env bash
 set -euo pipefail
 zip_path="$3"
 name="$(basename "$zip_path")"
@@ -65,7 +65,7 @@ checksum_and_verify() {
     local chk="${TMP_META_DIR}/${base}.md5"
     local lst="${TMP_META_DIR}/${base}.lst"
     md5sum "$zip" | awk '{print $1}' >"$chk"
-    unzip -Z1 "$zip" | sed 's
+    unzip -Z1 "$zip" | sed 's#^[./]*##' >"$lst"
     mkdir -p "$dest"
     unzip -q -o "$zip" -d "$dest"
     local missing=0
@@ -93,7 +93,7 @@ HOOK
       --retry-wait="$RETRY_WAIT" \
       --max-tries=0 \
       --on-download-complete="$ARIA_HOOK"
-    while [ "$(ls "$DONE_DIR" | wc -l)" -lt "${
+    while [ "$(ls "$DONE_DIR" | wc -l)" -lt "${#EXPECTED[@]}" ]; do
         sleep 1
     done
     rm -rf "$TMP_META_DIR"
@@ -122,7 +122,7 @@ download_bg "$IMAGES_BASE/val2017.zip" "$OUT_ROOT/val2017.zip" "$IMAGES_DIR"
 download_bg "$IMAGES_BASE/test2017.zip" "$OUT_ROOT/test2017.zip" "$IMAGES_DIR"
 
 wait
-while [ "$(ls "$DONE_DIR" | wc -l)" -lt "${
+while [ "$(ls "$DONE_DIR" | wc -l)" -lt "${#EXPECTED[@]}" ]; do
     echo "verifying downloads, please wait"
     sleep 1
 done

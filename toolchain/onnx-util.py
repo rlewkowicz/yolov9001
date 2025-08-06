@@ -6,15 +6,21 @@ import cv2
 import numpy as np
 import onnxruntime
 import torch
+import yaml
+from onnxruntime.quantization import QuantType, quantize_static
 from tqdm import tqdm
 import time
+import shutil
+import onnx
 
+# --- Setup Paths ---
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[1] if str(FILE.parents[1]) in sys.path else FILE.parents[0]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))
 
+# --- Utility Imports ---
 from utils.dataloaders import (
     IMG_FORMATS,
     VID_FORMATS,
@@ -39,6 +45,29 @@ from utils.general import (
 from utils.metrics import ap_per_class, box_iou
 from utils.plots import Annotator, colors
 from utils.torch_utils import select_device
+
+# =====================================================================================
+# INT8 Quantization Helper Class
+# =====================================================================================
+class ImageCalibrator:
+    def __init__(self, calib_dir_path, input_name, imgsz=(640, 640), stride=32):
+        self.input_name = input_name
+        self.dataloader = LoadImages(str(calib_dir_path), img_size=imgsz, stride=stride, auto=False)
+        self.iterator = iter(self.dataloader)
+
+    def get_next(self):
+        try:
+            _, im, _, _, _ = next(self.iterator)
+            im = im.astype(np.float32) / 255.0
+            if len(im.shape) == 3:
+                im = np.expand_dims(im, 0)
+            return {self.input_name: im}
+        except StopIteration:
+            return None
+
+# =====================================================================================
+# Main Application Logic (Detect, Validate, etc.)
+# =====================================================================================
 
 def detect(opt):
     (
@@ -156,7 +185,6 @@ def val(opt):
     imgsz = check_img_size(imgsz, s=stride)
     data = check_dataset(data)
     nc = int(data["nc"])
-
     dataloader = create_dataloader(
         data["val"],
         imgsz[0],
@@ -167,10 +195,8 @@ def val(opt):
         workers=workers,
         prefix=colorstr("val: "),
     )[0]
-
     iouv = torch.linspace(0.5, 0.95, 10, device=device)
     niou = iouv.numel()
-
     seen = 0
     s = ("%22s" + "%11s" * 6) % (
         "Class",
@@ -182,52 +208,36 @@ def val(opt):
         "mAP50-95",
     )
     stats, ap, ap_class = [], [], []
-
-    # --- Timing Initialization ---
     warmup_batches = 3
     preprocess_times = []
     inference_times = []
     postprocess_times = []
-
     pbar = tqdm(dataloader, desc=s, bar_format=TQDM_BAR_FORMAT)
-
     input_name = session.get_inputs()[0].name
     output_name = session.get_outputs()[0].name
-
     for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
-        # --- 1. Pre-processing ---
         torch.cuda.synchronize()
         t_start_pre = time.time()
-
         im = im.to(device).float() / 255.0
         targets = targets.to(device)
         nb, _, height, width = im.shape
         im_numpy = im.cpu().numpy()
-
         torch.cuda.synchronize()
         t_end_pre = time.time()
         if batch_i >= warmup_batches:
             preprocess_times.append(t_end_pre - t_start_pre)
-
-        # --- 2. Inference ---
         torch.cuda.synchronize()
         t_start_inf = time.time()
-
         pred = session.run([output_name], {input_name: im_numpy})[0]
-
         torch.cuda.synchronize()
         t_end_inf = time.time()
         if batch_i >= warmup_batches:
             inference_times.append(t_end_inf - t_start_inf)
-
-        # --- 3. Post-processing ---
         torch.cuda.synchronize()
         t_start_post = time.time()
-
         pred = torch.from_numpy(pred).to(device)
         pred = non_max_suppression(pred, conf_thres, iou_thres, max_det=max_det)
         targets[:, 2:] *= torch.tensor((width, height, width, height), device=device)
-
         for si, det in enumerate(pred):
             labels = targets[targets[:, 0] == si, 1:]
             nl = len(labels)
@@ -247,13 +257,10 @@ def val(opt):
                 labelsn = torch.cat((labels[:, 0:1], tbox), 1)
                 correct = process_batch(predn, labelsn, iouv)
             stats.append((correct, det[:, 4], det[:, 5], labels[:, 0]))
-
         torch.cuda.synchronize()
         t_end_post = time.time()
         if batch_i >= warmup_batches:
             postprocess_times.append(t_end_post - t_start_post)
-
-    # --- mAP Calculation ---
     stats = [torch.cat(x, 0).cpu().numpy() for x in zip(*stats)]
     if len(stats) and stats[0].any():
         tp, fp, p, r, f1, ap, ap_class = ap_per_class(*stats, save_dir=save_dir, names=names)
@@ -261,26 +268,20 @@ def val(opt):
         mp, mr, map50, map = p.mean(), r.mean(), ap50.mean(), ap.mean()
     else:
         mp, mr, map50, map = 0.0, 0.0, 0.0, 0.0
-
     nt = np.bincount(stats[3].astype(int), minlength=nc) if len(stats) else np.zeros(nc)
     pf = "%22s" + "%11i" * 2 + "%11.3g" * 4
     LOGGER.info(pf % ("all", seen, nt.sum(), mp, mr, map50, map))
     if nt.sum() == 0:
         LOGGER.warning(f"WARNING: No labels found in {data['val']}, cannot compute metrics.")
-
     if len(stats) and stats[0].any() and nc > 1:
         for i, c in enumerate(ap_class):
             LOGGER.info(pf % (names[c], seen, nt[c], p[i], r[i], ap50[i], ap[i]))
-
     LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}")
-
-    # --- Timing Report ---
-    if preprocess_times:  # Ensure we have data to report
+    if preprocess_times:
         num_timed_batches = len(preprocess_times)
-        avg_pre = (sum(preprocess_times) / num_timed_batches) * 1000  # ms
-        avg_inf = (sum(inference_times) / num_timed_batches) * 1000  # ms
-        avg_post = (sum(postprocess_times) / num_timed_batches) * 1000  # ms
-
+        avg_pre = (sum(preprocess_times) / num_timed_batches) * 1000
+        avg_inf = (sum(inference_times) / num_timed_batches) * 1000
+        avg_post = (sum(postprocess_times) / num_timed_batches) * 1000
         LOGGER.info(f"Average Speed (over last {num_timed_batches} batches):")
         LOGGER.info(f"  - Pre-processing:  {avg_pre:.2f}ms per batch")
         LOGGER.info(f"  - Inference:       {avg_inf:.2f}ms per batch")
@@ -291,24 +292,13 @@ def val(opt):
         )
 
 def process_batch(detections, labels, iouv):
-    """
-    Return correct predictions matrix. Both sets of boxes are in (x1, y1, x2, y2) format.
-    Arguments:
-        detections (Tensor[N, 6]), x1, y1, x2, y2, conf, class
-        labels (Tensor[M, 5]), class, x1, y1, x2, y2
-        iouv (Tensor[10]), IoU thresholds
-    Returns:
-        correct (Tensor[N, 10]), True if detection is a True Positive
-    """
     correct = torch.zeros(detections.shape[0], iouv.shape[0], dtype=torch.bool, device=iouv.device)
     iou = box_iou(labels[:, 1:], detections[:, :4])
     correct_class = labels[:, 0:1] == detections[:, 5]
     for i in range(len(iouv)):
-        x = torch.where((iou >= iouv[i]) & correct_class)  # Find matches
+        x = torch.where((iou >= iouv[i]) & correct_class)
         if x[0].shape[0]:
-            matches = (
-                torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()
-            )  # [label, detection, iou]
+            matches = (torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy())
             if x[0].shape[0] > 1:
                 matches = matches[matches[:, 2].argsort()[::-1]]
                 matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
@@ -317,6 +307,74 @@ def process_batch(detections, labels, iouv):
     return correct
 
 def main(opt):
+    if opt.int8:
+        if not opt.data:
+            raise ValueError("INT8 quantization requires a --data argument for calibration.")
+
+        model_input_path = Path(opt.weights)
+        model_output_path = model_input_path.with_stem(f"{model_input_path.stem}_int8")
+
+        if model_output_path.exists():
+            LOGGER.info(f"INT8 model already exists at {model_output_path}. Skipping quantization.")
+        else:
+            LOGGER.info(f"Starting INT8 quantization for {model_input_path}...")
+
+            data_yaml_path = Path(opt.data)
+            with open(data_yaml_path) as f:
+                data_dict = yaml.safe_load(f)
+
+            dataset_root = (data_yaml_path.parent / ".." / data_dict['path']).resolve()
+
+            calib_data_list_path = dataset_root / data_dict['train']
+            with open(calib_data_list_path) as f:
+                calib_files = [line.strip() for line in f][:200]
+
+            calib_image_paths = [str(dataset_root / p) for p in calib_files]
+            LOGGER.info(
+                f"Using {len(calib_image_paths)} images from the training set for calibration."
+            )
+
+            calib_dir = Path('./calib_images_temp')
+            calib_dir.mkdir(exist_ok=True)
+
+            for img_path_str in calib_image_paths:
+                img_path = Path(img_path_str)
+                try:
+                    os.symlink(img_path.resolve(), calib_dir / img_path.name)
+                except FileExistsError:
+                    pass
+
+            try:
+                temp_session = onnxruntime.InferenceSession(
+                    str(model_input_path), providers=["CPUExecutionProvider"]
+                )
+                input_name = temp_session.get_inputs()[0].name
+
+                calibrator = ImageCalibrator(
+                    calib_dir_path=calib_dir, input_name=input_name, imgsz=opt.imgsz
+                )
+
+                nodes_to_exclude = []
+                model = onnx.load(model_input_path)
+                for node in model.graph.node:
+                    if node.op_type in ['HardSwish', 'Softmax']:
+                        nodes_to_exclude.append(node.name)
+                LOGGER.info(f"Excluding {len(nodes_to_exclude)} nodes from quantization.")
+
+                quantize_static(
+                    model_input=model_input_path,
+                    model_output=model_output_path,
+                    calibration_data_reader=calibrator,
+                    activation_type=QuantType.QInt8,
+                    weight_type=QuantType.QInt8,
+                    nodes_to_exclude=nodes_to_exclude
+                )
+                LOGGER.info(f"Successfully created INT8 model: {model_output_path}")
+            finally:
+                shutil.rmtree(calib_dir)
+
+        opt.weights = str(model_output_path)
+
     if opt.val and opt.data is None:
         raise ValueError("Validation requires a --data argument.")
     if opt.detect and opt.source is None:
@@ -334,15 +392,17 @@ def main(opt):
         if opt.iou_thres is None:
             opt.iou_thres = 0.7
         if not hasattr(opt, "batch_size") or opt.batch_size is None:
-            opt.batch_size = 32
+            opt.batch_size = 1
     else:
         if opt.conf_thres is None:
             opt.conf_thres = 0.25
         if opt.iou_thres is None:
             opt.iou_thres = 0.45
         opt.batch_size = 1
+
     if len(opt.imgsz) == 1:
         opt.imgsz = opt.imgsz * 2
+
     if opt.detect:
         detect(opt)
     elif opt.val:
@@ -350,14 +410,12 @@ def main(opt):
 
 def parse_opt():
     parser = argparse.ArgumentParser(description="ONNX Model Inference and Validation Script")
+    parser.add_argument(
+        "--int8", action="store_true", help="Enable INT8 quantization before running"
+    )
     parser.add_argument("--weights", type=str, default=ROOT / "best.onnx", help="ONNX model path")
     parser.add_argument(
-        "--imgsz",
-        "--img-size",
-        nargs="+",
-        type=int,
-        default=[640],
-        help="inference size h,w",
+        "--imgsz", "--img-size", nargs="+", type=int, default=[640], help="inference size h,w"
     )
     parser.add_argument("--conf-thres", type=float, default=None, help="confidence threshold")
     parser.add_argument("--iou-thres", type=float, default=None, help="NMS IoU threshold")
@@ -383,12 +441,15 @@ def parse_opt():
     parser.add_argument(
         "--line-thickness", default=3, type=int, help="bounding box thickness (pixels)"
     )
-    parser.add_argument("--data", type=str, default=None, help="dataset.yaml path for validation")
+    parser.add_argument(
+        "--data", type=str, default=None, help="dataset.yaml path for validation/calibration"
+    )
     parser.add_argument("--workers", type=int, default=8, help="max dataloader workers")
-    parser.add_argument("--batch-size", type=int, default=1, help="batch size for validation")
+    parser.add_argument("--batch-size", type=int, default=None, help="batch size for validation")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--val", action="store_true", help="Run validation on a dataset")
     group.add_argument("--detect", action="store_true", help="Run detection on a source")
+
     opt = parser.parse_args()
     opt.imgsz = [int(x) for x in opt.imgsz]
     if len(opt.imgsz) == 1:

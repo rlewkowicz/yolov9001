@@ -117,7 +117,7 @@ def run(
     inplace=False,
     dynamic=False,
     simplify=False,
-    opset=21,
+    opset=19,
 ):
     t = time.time()
     include = [x.lower() for x in include]
@@ -187,7 +187,7 @@ def parse_opt():
     parser.add_argument(
         "--simplify", default=True, action="store_true", help="ONNX: simplify model"
     )
-    parser.add_argument("--opset", type=int, default=21, help="ONNX: opset version")
+    parser.add_argument("--opset", type=int, default=19, help="ONNX: opset version")
     parser.add_argument("--include", nargs="+", default=["onnx"], help="Export format")
     opt = parser.parse_args()
     print_args(vars(opt))

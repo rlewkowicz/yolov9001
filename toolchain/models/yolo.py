@@ -16,7 +16,6 @@ if str(ROOT) not in sys.path:
 if platform.system() != "Windows":
     ROOT = Path(os.path.relpath(ROOT, Path.cwd()))
 from models.common import *
-from models.experimental import *
 from utils.general import LOGGER, make_divisible
 from utils.plots import feature_visualization
 from utils.tal.anchor_generator import make_anchors, dist2bbox
@@ -199,7 +198,7 @@ class BaseModel(nn.Module):
             if isinstance(m, RepConvN) and hasattr(m, "fuse_convs"):
                 m.fuse_convs()
                 m.forward = m.forward_fuse
-            elif isinstance(m, (Conv, DWConv)) and hasattr(m, "bn"):
+            elif isinstance(m, Conv) and hasattr(m, "bn"):
                 m.conv = fuse_conv_and_bn(m.conv, m.bn)
                 delattr(m, "bn")
                 m.forward = m.forward_fuse

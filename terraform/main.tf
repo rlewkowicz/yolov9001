@@ -21,7 +21,7 @@ provider "aws" {
 }
 
 variable "az_letter" {
-  default = "b"
+  default = "d"
 }
 
 data "aws_vpc" "default" {

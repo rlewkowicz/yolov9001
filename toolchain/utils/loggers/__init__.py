@@ -61,6 +61,8 @@ class Loggers:
         self.plots = not opt.noplots
         self.logger = logger
         self.include = include
+
+        # --- CORRECTED: Dynamically build the keys, starting without LRs ---
         self.keys = [
             "train/box_loss",
             "train/cls_loss",
@@ -72,10 +74,8 @@ class Loggers:
             "val/box_loss",
             "val/cls_loss",
             "val/dfl_loss",
-            "x/lr0",
-            "x/lr1",
-            "x/lr2",
         ]
+
         self.best_keys = [
             "best/epoch",
             "best/precision",
@@ -86,21 +86,30 @@ class Loggers:
         for k in LOGGERS:
             setattr(self, k, None)
         self.csv = True
+
+        # ClearML
         if not clearml:
             prefix = colorstr("ClearML: ")
             s = f"{prefix}run 'pip install clearml' to automatically track, visualize and remotely train YOLO 🚀 in ClearML"
             self.logger.info(s)
+
+        # Comet
         if not comet_ml:
             prefix = colorstr("Comet: ")
             s = f"{prefix}run 'pip install comet_ml' to automatically track and visualize YOLO 🚀 runs in Comet"
             self.logger.info(s)
+
         s = self.save_dir
+
+        # TensorBoard
         if "tb" in self.include and (not self.opt.evolve):
             prefix = colorstr("TensorBoard: ")
             self.logger.info(
                 f"{prefix}Start with 'tensorboard --logdir {s.parent}', view at http://localhost:6006/"
             )
             self.tb = SummaryWriter(str(s))
+
+        # W&B
         if wandb and "wandb" in self.include:
             wandb_artifact_resume = isinstance(self.opt.resume, str
                                               ) and self.opt.resume.startswith("wandb-artifact://")
@@ -112,10 +121,14 @@ class Loggers:
             self.wandb = WandbLogger(self.opt, run_id)
         else:
             self.wandb = None
+
+        # ClearML
         if clearml and "clearml" in self.include:
             self.clearml = ClearmlLogger(self.opt, self.hyp)
         else:
             self.clearml = None
+
+        # Comet
         if comet_ml and "comet" in self.include:
             if isinstance(self.opt.resume, str) and self.opt.resume.startswith("comet://"):
                 run_id = self.opt.resume.split("/")[-1]
@@ -205,7 +218,15 @@ class Loggers:
             self.comet_logger.on_val_end(nt, tp, fp, p, r, f1, ap, ap50, ap_class, confusion_matrix)
 
     def on_fit_epoch_end(self, vals, epoch, best_fitness, fi):
+        # --- CORRECTED: Dynamically add learning rate keys on the first run ---
+        num_vals = len(vals)
+        num_keys = len(self.keys)
+        if num_vals > num_keys:
+            num_lrs = num_vals - num_keys
+            self.keys.extend([f'x/lr{i}' for i in range(num_lrs)])
+
         x = dict(zip(self.keys, vals))
+
         if self.csv:
             file = self.save_dir / "results.csv"
             n = len(x) + 1
@@ -215,6 +236,7 @@ class Loggers:
             )
             with open(file, "a") as f:
                 f.write(s + ("%20.5g," * n % tuple([epoch] + vals)).rstrip(",") + "\n")
+
         if self.tb:
             for k, v in x.items():
                 self.tb.add_scalar(k, v, epoch)
@@ -222,6 +244,7 @@ class Loggers:
             for k, v in x.items():
                 (title, series) = k.split("/")
                 self.clearml.task.get_logger().report_scalar(title, series, v, epoch)
+
         if self.wandb:
             if best_fitness == fi:
                 best_results = [epoch] + vals[3:7]
@@ -229,9 +252,11 @@ class Loggers:
                     self.wandb.wandb_run.summary[name] = best_results[i]
             self.wandb.log(x)
             self.wandb.end_epoch(best_result=best_fitness == fi)
+
         if self.clearml:
             self.clearml.current_epoch_logged_images = set()
             self.clearml.current_epoch += 1
+
         if self.comet_logger:
             self.comet_logger.on_fit_epoch_end(x, epoch=epoch)
 
@@ -261,9 +286,11 @@ class Loggers:
         ]
         files = [self.save_dir / f for f in files if (self.save_dir / f).exists()]
         self.logger.info(f"Results saved to {colorstr('bold', self.save_dir)}")
+
         if self.tb and (not self.clearml):
             for f in files:
                 self.tb.add_image(f.stem, cv2.imread(str(f))[..., ::-1], epoch, dataformats="HWC")
+
         if self.wandb:
             self.wandb.log(dict(zip(self.keys[3:10], results)))
             self.wandb.log({"Results": [wandb.Image(str(f), caption=f.name) for f in files]})
@@ -275,12 +302,14 @@ class Loggers:
                     aliases=["latest", "best", "stripped"],
                 )
             self.wandb.finish_run()
+
         if self.clearml and (not self.opt.evolve):
             self.clearml.task.update_output_model(
                 model_path=str(best if best.exists() else last),
                 name="Best Model",
                 auto_delete_file=False,
             )
+
         if self.comet_logger:
             final_results = dict(zip(self.keys[3:10], results))
             self.comet_logger.on_train_end(files, self.save_dir, last, best, epoch, final_results)

@@ -58,6 +58,7 @@ ALIASES: Dict[str, Tuple[str, str, Sequence[str]]] = {
             str(TOOLCHAIN / "data" / "coco.yaml"),
             "--hyp",
             str(TOOLCHAIN / "data" / "hyps" / "hyp.scratch-high.yaml"),
+            "--optimizer", "LION",
             "--sync-bn",
             "--noplots"
         ],

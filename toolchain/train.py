@@ -18,6 +18,7 @@ import torch.nn as nn
 import yaml
 from torch.optim import lr_scheduler
 from tqdm import tqdm
+from utils.lion import Lion
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]
@@ -67,7 +68,6 @@ from utils.torch_utils import (
     de_parallel,
     select_device,
     smart_DDP,
-    smart_optimizer,
     smart_resume,
     torch_distributed_zero_first,
 )
@@ -117,6 +117,9 @@ def train(hyp, opt, device, callbacks):
     if isinstance(hyp, str):
         with open(hyp, errors="ignore") as f:
             hyp = yaml.safe_load(f)
+
+    optimizer_settings = hyp["optimizer"][opt.optimizer]
+
     LOGGER.info(colorstr("hyperparameters: ") + ", ".join(f"{k}={v}" for k, v in hyp.items()))
     opt.hyp = hyp.copy()
 
@@ -159,7 +162,11 @@ def train(hyp, opt, device, callbacks):
         ckpt = torch.load(weights, map_location="cpu", weights_only=False)
         model = Model(cfg or ckpt["model"].yaml, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)
         exclude = ["anchor"] if (cfg or hyp.get("anchors")) and not resume else []
-        csd = ckpt["model"].float().state_dict()
+        model_in_ckpt = ckpt['model']
+        if hasattr(model_in_ckpt, 'state_dict'):
+            csd = model_in_ckpt.float().state_dict()
+        else:
+            csd = model_in_ckpt
         csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)
         model.load_state_dict(csd, strict=False)
         LOGGER.info(f"Transferred {len(csd)}/{len(model.state_dict())} items from {weights}")
@@ -180,21 +187,81 @@ def train(hyp, opt, device, callbacks):
         batch_size = check_train_batch_size(model, imgsz, amp)
         loggers.on_params_update({"batch_size": batch_size})
 
+    optimizer = None
+
     nbs = 64
     accumulate = max(round(nbs / batch_size), 1)
-    hyp["weight_decay"] *= batch_size * accumulate / nbs
-    optimizer = smart_optimizer(
-        model, opt.optimizer, hyp["lr0"], hyp["momentum"], hyp["weight_decay"]
-    )
+    raw_weight_decay = optimizer_settings["weight_decay"]
+    scaled_weight_decay = raw_weight_decay * batch_size * accumulate / nbs
 
-    if opt.cos_lr:
-        lf = one_cycle(1, hyp["lrf"], epochs)
-    elif opt.flat_cos_lr:
-        lf = one_flat_cycle(1, hyp["lrf"], epochs)
-    elif opt.fixed_lr:
+    g = ([], [], [])
+    bn = tuple(v for k, v in nn.__dict__.items() if "Norm" in k)
+    for v in model.modules():
+        if hasattr(v, "bias") and isinstance(v.bias, nn.Parameter) and v.bias.requires_grad:
+            g[2].append(v.bias)
+        if isinstance(v, bn):
+            if v.weight.requires_grad:
+                g[1].append(v.weight)
+        elif hasattr(v, "weight") and isinstance(v.weight, nn.Parameter) and v.weight.requires_grad:
+            g[0].append(v.weight)
+
+        for i in range(1, 8):
+            if hasattr(v, f"im{i}"):
+                if hasattr(v[f"im{i}"], "implicit"):
+                    if v[f"im{i}"].implicit.requires_grad:
+                        g[1].append(v[f"im{i}"].implicit)
+                else:
+                    for iv in v[f"im{i}"]:
+                        if iv.implicit.requires_grad:
+                            g[1].append(iv.implicit)
+            if hasattr(v, f"ia{i}"):
+                if hasattr(v[f"ia{i}"], "implicit"):
+                    if v[f"ia{i}"].implicit.requires_grad:
+                        g[1].append(v[f"ia{i}"].implicit)
+                else:
+                    for iv in v[f"ia{i}"]:
+                        if iv.implicit.requires_grad:
+                            g[1].append(iv.implicit)
+
+    param_groups = [
+        {"params": g[0], "weight_decay": scaled_weight_decay},
+        {"params": g[1], "weight_decay": 0.0},
+        {"params": g[2], "weight_decay": 0.0},
+    ]
+
+    if opt.optimizer == "SGD":
+        lr = optimizer_settings["lr0"]
+        momentum = optimizer_settings["momentum"]
+        optimizer = torch.optim.SGD(
+            param_groups,
+            lr=lr,
+            momentum=momentum,
+            nesterov=True,
+        )
+    elif opt.optimizer == "LION":
+        lr = optimizer_settings["lr0"]
+        b1 = optimizer_settings["b1"]
+        b2 = optimizer_settings["b2"]
+        optimizer = Lion(
+            param_groups,
+            lr=lr,
+            betas=(b1, b2),
+            weight_decay=scaled_weight_decay,
+        )
+    else:
+        raise NotImplementedError(f"Unknown optimizer {opt.optimizer}")
+
+    lr_scheduler_type = optimizer_settings.get("lr_scheduler_type", "cosine")
+    lrf = optimizer_settings["lrf"]
+
+    if lr_scheduler_type == "cosine":
+        lf = one_cycle(1, lrf, epochs)
+    elif lr_scheduler_type == "flat_cosine":
+        lf = one_flat_cycle(1, lrf, epochs)
+    elif lr_scheduler_type == "fixed":
         lf = lambda x: 1.0
     else:
-        lf = lambda x: (1 - x / epochs) * (1.0 - hyp["lrf"]) + hyp["lrf"]
+        lf = lambda x: (1 - x / epochs) * (1.0 - lrf) + lrf
 
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
 
@@ -277,7 +344,8 @@ def train(hyp, opt, device, callbacks):
 
     t0 = time.time()
     nb = len(train_loader)
-    nw = max(round(hyp["warmup_epochs"] * nb), 100)
+
+    nw = max(round(optimizer_settings["warmup_epochs"] * nb), 100)
 
     last_opt_step = -1
     maps = np.zeros(nc)
@@ -332,16 +400,33 @@ def train(hyp, opt, device, callbacks):
 
                 accumulate = max(1, np.interp(ni, xi, [1, nbs / batch_size]).round())
                 for j, x in enumerate(optimizer.param_groups):
+
                     x["lr"] = np.interp(
                         ni,
                         xi,
                         [
-                            hyp["warmup_bias_lr"] if j == 0 else 0.0,
+                            optimizer_settings["warmup_bias_lr"] if j == 0 else 0.0,
                             x["initial_lr"] * lf(epoch),
                         ],
                     )
-                    if "momentum" in x:
-                        x["momentum"] = np.interp(ni, xi, [hyp["warmup_momentum"], hyp["momentum"]])
+                    if opt.optimizer == 'SGD':
+                        if 'momentum' in x:
+                            x['momentum'] = np.interp(
+                                ni, xi, [
+                                    optimizer_settings['warmup_momentum'],
+                                    optimizer_settings['momentum']
+                                ]
+                            )
+
+                    elif opt.optimizer == 'LION':
+                        if 'betas' in x:
+                            # Interpolate beta1 (the momentum term in Lion)
+                            new_beta1 = np.interp(
+                                ni, xi,
+                                [optimizer_settings['warmup_momentum'], optimizer_settings['b1']]
+                            )
+                            # Betas tuple is immutable, so create a new one
+                            x['betas'] = (new_beta1, x['betas'][1])
 
             if opt.multi_scale:
                 sz = random.randrange(imgsz * 0.5, imgsz * 1.5 + gs) // gs * gs
