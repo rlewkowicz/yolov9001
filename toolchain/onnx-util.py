@@ -13,14 +13,12 @@ import time
 import shutil
 import onnx
 
-# --- Setup Paths ---
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[1] if str(FILE.parents[1]) in sys.path else FILE.parents[0]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))
 
-# --- Utility Imports ---
 from utils.dataloaders import (
     IMG_FORMATS,
     VID_FORMATS,
@@ -46,9 +44,6 @@ from utils.metrics import ap_per_class, box_iou
 from utils.plots import Annotator, colors
 from utils.torch_utils import select_device
 
-# =====================================================================================
-# INT8 Quantization Helper Class
-# =====================================================================================
 class ImageCalibrator:
     def __init__(self, calib_dir_path, input_name, imgsz=(640, 640), stride=32):
         self.input_name = input_name
@@ -64,10 +59,6 @@ class ImageCalibrator:
             return {self.input_name: im}
         except StopIteration:
             return None
-
-# =====================================================================================
-# Main Application Logic (Detect, Validate, etc.)
-# =====================================================================================
 
 def detect(opt):
     (
@@ -367,7 +358,7 @@ def main(opt):
                     calibration_data_reader=calibrator,
                     activation_type=QuantType.QInt8,
                     weight_type=QuantType.QInt8,
-                    nodes_to_exclude=nodes_to_exclude
+                    nodes_to_exclude=nodes_to_exclude,
                 )
                 LOGGER.info(f"Successfully created INT8 model: {model_output_path}")
             finally:

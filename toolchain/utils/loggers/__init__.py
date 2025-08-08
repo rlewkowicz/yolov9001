@@ -62,7 +62,6 @@ class Loggers:
         self.logger = logger
         self.include = include
 
-        # --- CORRECTED: Dynamically build the keys, starting without LRs ---
         self.keys = [
             "train/box_loss",
             "train/cls_loss",
@@ -87,13 +86,11 @@ class Loggers:
             setattr(self, k, None)
         self.csv = True
 
-        # ClearML
         if not clearml:
             prefix = colorstr("ClearML: ")
             s = f"{prefix}run 'pip install clearml' to automatically track, visualize and remotely train YOLO 🚀 in ClearML"
             self.logger.info(s)
 
-        # Comet
         if not comet_ml:
             prefix = colorstr("Comet: ")
             s = f"{prefix}run 'pip install comet_ml' to automatically track and visualize YOLO 🚀 runs in Comet"
@@ -101,7 +98,6 @@ class Loggers:
 
         s = self.save_dir
 
-        # TensorBoard
         if "tb" in self.include and (not self.opt.evolve):
             prefix = colorstr("TensorBoard: ")
             self.logger.info(
@@ -109,7 +105,6 @@ class Loggers:
             )
             self.tb = SummaryWriter(str(s))
 
-        # W&B
         if wandb and "wandb" in self.include:
             wandb_artifact_resume = isinstance(self.opt.resume, str
                                               ) and self.opt.resume.startswith("wandb-artifact://")
@@ -122,13 +117,11 @@ class Loggers:
         else:
             self.wandb = None
 
-        # ClearML
         if clearml and "clearml" in self.include:
             self.clearml = ClearmlLogger(self.opt, self.hyp)
         else:
             self.clearml = None
 
-        # Comet
         if comet_ml and "comet" in self.include:
             if isinstance(self.opt.resume, str) and self.opt.resume.startswith("comet://"):
                 run_id = self.opt.resume.split("/")[-1]
@@ -218,7 +211,6 @@ class Loggers:
             self.comet_logger.on_val_end(nt, tp, fp, p, r, f1, ap, ap50, ap_class, confusion_matrix)
 
     def on_fit_epoch_end(self, vals, epoch, best_fitness, fi):
-        # --- CORRECTED: Dynamically add learning rate keys on the first run ---
         num_vals = len(vals)
         num_keys = len(self.keys)
         if num_vals > num_keys:

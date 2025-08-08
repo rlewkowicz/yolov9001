@@ -93,6 +93,14 @@ ALIASES: Dict[str, Tuple[str, str, Sequence[str]]] = {
             "--data",
             str(TOOLCHAIN / "data" / "coco.yaml"),
         ],
+    ),
+    "compare": (
+        "compare.py",
+        "Convert an onnx model to int8 and check QE",
+        [
+            "--data",
+            str(TOOLCHAIN / "data" / "coco.yaml"),
+        ],
     )
 }
 
@@ -227,7 +235,7 @@ def ddptrain(ctx: click.Context) -> None:
 
     if not any(a.startswith("--cache") for a in ctx.args):
         total_mem = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')
-        if total_mem > 100 * 1024**3:
+        if total_mem > 120 * 1024**3:
             cmd.extend(['--cache', 'ram'])
         else:
             cmd.extend(['--cache', 'disk'])

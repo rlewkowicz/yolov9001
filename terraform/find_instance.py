@@ -122,7 +122,6 @@ def main():
         print("no common region with valid non-zero pricing found", file=sys.stderr)
         sys.exit(1)
 
-    # extract just the trailing letter from each AZ (e.g., 'us-east-1a' → 'a')
     letters = sorted({az[-1] for az in res["azs"]})
     print(f"Region: {res['region']}")
     print(f"AZ: {','.join(letters)}")

@@ -194,17 +194,19 @@ def train(hyp, opt, device, callbacks):
     raw_weight_decay = optimizer_settings["weight_decay"]
     scaled_weight_decay = raw_weight_decay * batch_size * accumulate / nbs
 
-    g = ([], [], [])
-    bn = tuple(v for k, v in nn.__dict__.items() if "Norm" in k)
-    for v in model.modules():
-        if hasattr(v, "bias") and isinstance(v.bias, nn.Parameter) and v.bias.requires_grad:
-            g[2].append(v.bias)
-        if isinstance(v, bn):
-            if v.weight.requires_grad:
-                g[1].append(v.weight)
-        elif hasattr(v, "weight") and isinstance(v.weight, nn.Parameter) and v.weight.requires_grad:
-            g[0].append(v.weight)
+    g = [[], [], []]
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
 
+        if '.bias' in name:
+            g[2].append(p)
+        elif p.ndim == 1:
+            g[1].append(p)
+        else:
+            g[0].append(p)
+
+    for v in model.modules():
         for i in range(1, 8):
             if hasattr(v, f"im{i}"):
                 if hasattr(v[f"im{i}"], "implicit"):
@@ -222,6 +224,8 @@ def train(hyp, opt, device, callbacks):
                     for iv in v[f"ia{i}"]:
                         if iv.implicit.requires_grad:
                             g[1].append(iv.implicit)
+
+    g[1] = list(set(g[1]))
 
     param_groups = [
         {"params": g[0], "weight_decay": scaled_weight_decay},
@@ -246,8 +250,13 @@ def train(hyp, opt, device, callbacks):
             param_groups,
             lr=lr,
             betas=(b1, b2),
-            weight_decay=scaled_weight_decay,
         )
+    elif opt.optimizer == "AdamW":
+        lr = optimizer_settings["lr0"]
+        b1 = optimizer_settings["b1"]
+        b2 = optimizer_settings["b2"]
+        eps = optimizer_settings.get('eps', 1e-8)
+        optimizer = torch.optim.AdamW(param_groups, lr=lr, betas=(b1, b2), eps=eps)
     else:
         raise NotImplementedError(f"Unknown optimizer {opt.optimizer}")
 
@@ -420,12 +429,18 @@ def train(hyp, opt, device, callbacks):
 
                     elif opt.optimizer == 'LION':
                         if 'betas' in x:
-                            # Interpolate beta1 (the momentum term in Lion)
                             new_beta1 = np.interp(
                                 ni, xi,
                                 [optimizer_settings['warmup_momentum'], optimizer_settings['b1']]
                             )
-                            # Betas tuple is immutable, so create a new one
+                            x['betas'] = (new_beta1, x['betas'][1])
+
+                    elif opt.optimizer == 'AdamW':
+                        if 'betas' in x:
+                            new_beta1 = np.interp(
+                                ni, xi,
+                                [optimizer_settings['warmup_momentum'], optimizer_settings['b1']]
+                            )
                             x['betas'] = (new_beta1, x['betas'][1])
 
             if opt.multi_scale:

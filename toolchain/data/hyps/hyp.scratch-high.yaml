@@ -10,14 +10,25 @@ optimizer:
     warmup_bias_lr: 0.1
   LION:
     lr_scheduler_type: cosine
-    lr0: 0.003
+    lr0: 0.001
     lrf: 0.01
-    b1: 0.9
-    b2: 0.99
-    weight_decay: 0.01
-    warmup_epochs: 3
-    warmup_momentum: 0.95
-    warmup_bias_lr: 0.8
+    b1: 0.95
+    b2: 0.98
+    weight_decay: 0.005
+    warmup_epochs: 5
+    warmup_momentum: 0.8
+    warmup_bias_lr: 0.002
+  AdamW:
+    lr_scheduler_type: cosine
+    lr0: 0.01
+    lrf: 0.01
+    b1: 0.937
+    b2: 0.999
+    eps: 0.0000001 
+    weight_decay: 0.0005
+    warmup_epochs: 5
+    warmup_momentum: 0.8
+    warmup_bias_lr: 0.002
 box: 7.5
 cls: 0.5
 cls_pw: 1.0

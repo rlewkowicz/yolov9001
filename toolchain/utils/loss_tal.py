@@ -136,6 +136,14 @@ class RN_ComputeLoss(nn.Module):
         (pred_distri,
          pred_scores) = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats],
                                   2).split((self.reg_max * 4, self.nc), 1)
+
+        if not torch.isfinite(pred_distri).all() or not torch.isfinite(pred_scores).all():
+            raise ValueError(
+                "Error: NaN or inf found in model predictions. "
+                "This is the primary sign of an exploding gradient. "
+                "Try lowering your learning rate (`lr0`)."
+            )
+
         pred_scores = pred_scores.permute(0, 2, 1).contiguous()
         pred_distri = pred_distri.permute(0, 2, 1).contiguous()
         dtype = pred_scores.dtype
@@ -167,7 +175,9 @@ class RN_ComputeLoss(nn.Module):
             mask_gt,
         )
         target_bboxes /= stride_tensor
-        target_scores_sum = max(target_scores.sum(), 1)
+
+        target_scores_sum = target_scores.sum().clamp(min=1)
+
         loss[1] = (self.BCEcls(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum)
         if fg_mask.sum():
             pred_bboxes_decoded = self.bbox_decode(anchor_points, pred_distri)
@@ -198,4 +208,4 @@ class RN_ComputeLoss(nn.Module):
         loss[1] *= self.hyp.get("cls", 0.5)
         loss[2] *= self.hyp.get("dfl", 1.5)
         batch_size = feats[0][0].shape[0]
-        return (loss.sum() * batch_size, loss.detach())
+        return (loss.sum(), loss.detach())

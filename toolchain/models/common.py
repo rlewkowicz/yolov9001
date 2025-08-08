@@ -487,7 +487,7 @@ class RepVGGBlock(nn.Module):
         self.groups = groups
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.nonlinearity = nn.ReLU()
+        self.nonlinearity = nn.ReLU6()
         assert kernel_size == 3 and padding == 1
         padding_11 = padding - kernel_size // 2
         if use_se:

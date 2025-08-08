@@ -128,23 +128,19 @@ def run(
         assert device.type != "cpu", ("--half only compatible with GPU export, i.e. use --device 0")
         assert not dynamic, "--half not compatible with --dynamic"
 
-    # Load model
     model = attempt_load(weights, device=device, inplace=True, fuse=True)
 
     gs = int(max(model.stride))
     imgsz = [check_img_size(x, gs) for x in imgsz]
     im = torch.zeros(batch_size, 3, *imgsz).to(device)
 
-    # Update model for export
     model.eval()
     for k, m in model.named_modules():
-        # Correctly identify our custom detection head
         if isinstance(m, RN_DualDDetect):
             m.inplace = inplace
             m.dynamic = dynamic
             m.export = True
 
-    # Warmup
     for _ in range(2):
         y = model(im)
     if half:
@@ -155,11 +151,9 @@ def run(
         f"\n{colorstr('PyTorch:')} starting from {file} with output shape {shape} ({file_size(file):.1f} MB)"
     )
 
-    # Export
     if "onnx" in include:
         export_onnx(model, im, file, opset, dynamic, simplify)
 
-    # Log results
     LOGGER.info(f"\nExport complete ({time.time() - t:.1f}s)")
     LOGGER.info(f"Results saved to {colorstr('bold', file.parent.resolve())}")
     LOGGER.info(f"Visualize:       https://netron.app")
