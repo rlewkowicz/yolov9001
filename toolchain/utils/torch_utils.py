@@ -12,8 +12,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
-from utils.general import LOGGER, check_version, colorstr, file_date, git_describe
-from utils.lion import Lion
+from utils.general import LOGGER, check_version, file_date, git_describe
 
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", -1))
 RANK = int(os.getenv("RANK", -1))
@@ -277,121 +276,6 @@ def copy_attr(a, b, include=(), exclude=()):
         else:
             setattr(a, k, v)
 
-def smart_optimizer(model, name="Adam", lr=0.001, momentum=0.9, decay=1e-05):
-    g = ([], [], [])
-    bn = tuple((v for (k, v) in nn.__dict__.items() if "Norm" in k))
-    for v in model.modules():
-        if hasattr(v, "bias") and isinstance(v.bias, nn.Parameter):
-            g[2].append(v.bias)
-        if isinstance(v, bn):
-            g[1].append(v.weight)
-        elif hasattr(v, "weight") and isinstance(v.weight, nn.Parameter):
-            g[0].append(v.weight)
-        if hasattr(v, "im"):
-            if hasattr(v.im, "implicit"):
-                g[1].append(v.im.implicit)
-            else:
-                for iv in v.im:
-                    g[1].append(iv.implicit)
-        if hasattr(v, "ia"):
-            if hasattr(v.ia, "implicit"):
-                g[1].append(v.ia.implicit)
-            else:
-                for iv in v.ia:
-                    g[1].append(iv.implicit)
-        if hasattr(v, "im2"):
-            if hasattr(v.im2, "implicit"):
-                g[1].append(v.im2.implicit)
-            else:
-                for iv in v.im2:
-                    g[1].append(iv.implicit)
-        if hasattr(v, "ia2"):
-            if hasattr(v.ia2, "implicit"):
-                g[1].append(v.ia2.implicit)
-            else:
-                for iv in v.ia2:
-                    g[1].append(iv.implicit)
-        if hasattr(v, "im3"):
-            if hasattr(v.im3, "implicit"):
-                g[1].append(v.im3.implicit)
-            else:
-                for iv in v.im3:
-                    g[1].append(iv.implicit)
-        if hasattr(v, "ia3"):
-            if hasattr(v.ia3, "implicit"):
-                g[1].append(v.ia3.implicit)
-            else:
-                for iv in v.ia3:
-                    g[1].append(iv.implicit)
-        if hasattr(v, "im4"):
-            if hasattr(v.im4, "implicit"):
-                g[1].append(v.im4.implicit)
-            else:
-                for iv in v.im4:
-                    g[1].append(iv.implicit)
-        if hasattr(v, "ia4"):
-            if hasattr(v.ia4, "implicit"):
-                g[1].append(v.ia4.implicit)
-            else:
-                for iv in v.ia4:
-                    g[1].append(iv.implicit)
-        if hasattr(v, "im5"):
-            if hasattr(v.im5, "implicit"):
-                g[1].append(v.im5.implicit)
-            else:
-                for iv in v.im5:
-                    g[1].append(iv.implicit)
-        if hasattr(v, "ia5"):
-            if hasattr(v.ia5, "implicit"):
-                g[1].append(v.ia5.implicit)
-            else:
-                for iv in v.ia5:
-                    g[1].append(iv.implicit)
-        if hasattr(v, "im6"):
-            if hasattr(v.im6, "implicit"):
-                g[1].append(v.im6.implicit)
-            else:
-                for iv in v.im6:
-                    g[1].append(iv.implicit)
-        if hasattr(v, "ia6"):
-            if hasattr(v.ia6, "implicit"):
-                g[1].append(v.ia6.implicit)
-            else:
-                for iv in v.ia6:
-                    g[1].append(iv.implicit)
-        if hasattr(v, "im7"):
-            if hasattr(v.im7, "implicit"):
-                g[1].append(v.im7.implicit)
-            else:
-                for iv in v.im7:
-                    g[1].append(iv.implicit)
-        if hasattr(v, "ia7"):
-            if hasattr(v.ia7, "implicit"):
-                g[1].append(v.ia7.implicit)
-            else:
-                for iv in v.ia7:
-                    g[1].append(iv.implicit)
-    if name == "Adam":
-        optimizer = torch.optim.Adam(g[2], lr=lr, betas=(momentum, 0.999))
-    elif name == "AdamW":
-        optimizer = torch.optim.AdamW(
-            g[2], lr=lr, betas=(momentum, 0.999), weight_decay=0.0, amsgrad=True
-        )
-    elif name == "RMSProp":
-        optimizer = torch.optim.RMSprop(g[2], lr=lr, momentum=momentum)
-    elif name == "SGD":
-        optimizer = torch.optim.SGD(g[2], lr=lr, momentum=momentum, nesterov=True)
-    elif name == "LION":
-        optimizer = Lion(g[2], lr=lr, betas=(momentum, 0.99), weight_decay=0.0)
-    else:
-        raise NotImplementedError(f"Optimizer {name} not implemented.")
-    optimizer.add_param_group({"params": g[0], "weight_decay": decay})
-    optimizer.add_param_group({"params": g[1], "weight_decay": 0.0})
-    LOGGER.info(
-        f"{colorstr('optimizer:')} {type(optimizer).__name__}(lr={lr}) with parameter groups {len(g[1])} weight(decay=0.0), {len(g[0])} weight(decay={decay}), {len(g[2])} bias"
-    )
-    return optimizer
-
 def smart_resume(ckpt, optimizer, ema=None, weights="yolov5s.pt", epochs=300, resume=True):
     best_fitness = 0.0
     start_epoch = ckpt["epoch"] + 1
@@ -436,10 +320,6 @@ class EarlyStopping:
         return stop
 
 class ModelEMA:
-    """Updated Exponential Moving Average (EMA) from https://github.com/rwightman/pytorch-image-models
-    Keeps a moving average of everything in the model state_dict (parameters and buffers)
-    For EMA details see https://www.tensorflow.org/api_docs/python/tf/train/ExponentialMovingAverage
-    """
     def __init__(self, model, decay=0.9999, tau=2000, updates=0):
         self.ema = deepcopy(de_parallel(model)).eval()
         self.updates = updates
@@ -451,10 +331,31 @@ class ModelEMA:
         self.updates += 1
         d = self.decay(self.updates)
         msd = de_parallel(model).state_dict()
-        for k, v in self.ema.state_dict().items():
-            if v.dtype.is_floating_point:
-                v *= d
-                v += (1 - d) * msd[k].detach()
+        esd = self.ema.state_dict()
+        with torch.no_grad():
+            need_reload = False
+            for k in list(esd.keys()):
+                if k not in msd:
+                    continue
+                if (
+                    "activation_post_process" in k or "observer" in k or "fake_quant" in k or
+                    "quant" in k and "weight" not in k
+                ):
+                    esd[k] = msd[k].detach().clone()
+                    need_reload = True
+                    continue
+
+                e = esd[k]
+                m = msd[k].detach()
+                if e.shape == m.shape and e.dtype.is_floating_point and m.dtype.is_floating_point:
+                    e.mul_(d).add_(m, alpha=1.0 - d)
+                elif e.shape == m.shape:
+                    e.copy_(m)
+                else:
+                    esd[k] = m.clone()
+                    need_reload = True
+            if need_reload:
+                self.ema.load_state_dict(esd, strict=False)
 
     def update_attr(self, model, include=(), exclude=("process_group", "reducer")):
         copy_attr(self.ema, model, include, exclude)

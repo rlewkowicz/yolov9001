@@ -190,12 +190,6 @@ class Loggers:
         if self.comet_logger:
             self.comet_logger.on_val_start()
 
-    def on_val_image_end(self, pred, predn, path, names, im):
-        if self.wandb:
-            self.wandb.val_one_image(pred, predn, path, names, im)
-        if self.clearml:
-            self.clearml.log_image_with_boxes(path, pred, names, im)
-
     def on_val_batch_end(self, batch_i, im, targets, paths, shapes, out):
         if self.comet_logger:
             self.comet_logger.on_val_batch_end(batch_i, im, targets, paths, shapes, out)

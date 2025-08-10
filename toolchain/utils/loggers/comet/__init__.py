@@ -25,7 +25,6 @@ except (ModuleNotFoundError, ImportError):
 
 import PIL
 import torch
-import torchvision.transforms as T
 import yaml
 
 from utils.dataloaders import img2label_paths
@@ -49,12 +48,9 @@ IOU_THRES = float(os.getenv("IOU_THRES", 0.6))
 
 COMET_LOG_BATCH_METRICS = (os.getenv("COMET_LOG_BATCH_METRICS", "false").lower() == "true")
 COMET_BATCH_LOGGING_INTERVAL = os.getenv("COMET_BATCH_LOGGING_INTERVAL", 1)
-COMET_PREDICTION_LOGGING_INTERVAL = os.getenv("COMET_PREDICTION_LOGGING_INTERVAL", 1)
 COMET_LOG_PER_CLASS_METRICS = (os.getenv("COMET_LOG_PER_CLASS_METRICS", "false").lower() == "true")
 
 RANK = int(os.getenv("RANK", -1))
-
-to_pil = T.ToPILImage()
 
 class CometLogger:
     """Log metrics, parameters, source code, models and much more
@@ -400,19 +396,12 @@ class CometLogger:
     def on_train_start(self):
         self.log_parameters(self.hyp)
 
-    def on_train_epoch_start(self):
-        return
-
     def on_train_epoch_end(self, epoch):
         self.experiment.curr_epoch = epoch
 
         return
 
-    def on_train_batch_start(self):
-        return
-
     def on_train_batch_end(self, log_dict, step):
-        self.experiment.curr_step = step
         if self.log_batch_metrics and (step % self.comet_log_batch_interval == 0):
             self.log_metrics(log_dict, step=step)
 
@@ -447,9 +436,6 @@ class CometLogger:
         self.finish_run()
 
     def on_val_start(self):
-        return
-
-    def on_val_batch_start(self):
         return
 
     def on_val_batch_end(self, batch_i, images, targets, paths, shapes, outputs):

@@ -3,12 +3,6 @@ import math
 from torch.optim.optimizer import Optimizer
 
 class Lion(Optimizer):
-    r"""Implements the Refined Lion algorithm.
-
-    This optimizer has been adapted from the paper 'Refined Lion: A new
-    optimizer for better training of deep neural networks'.
-    https://www.nature.com/articles/s41598-025-07112-4
-    """
     def __init__(
         self,
         params,
@@ -56,17 +50,22 @@ class Lion(Optimizer):
                 state = self.state[p]
                 if not state:
                     state["step"] = 0
-                    state["exp_avg"] = torch.zeros_like(p.data)
+                    state["exp_avg"] = torch.zeros_like(p)
                 state["step"] += 1
                 exp_avg = state["exp_avg"]
+
                 c_t = exp_avg.mul(beta1).add(grad, alpha=1 - beta1)
+
                 if bc:
                     c_hat = c_t.div(1 - beta1**state["step"])
                 else:
                     c_hat = c_t
+
                 update = (2.0 / math.pi) * torch.atan(alpha * c_hat)
                 if wd != 0:
-                    update = update.add(p.data, alpha=wd)
-                p.data.add_(-lr, update)
+                    update = update.add(p, alpha=wd)
+
+                p.add_(update, alpha=-lr)
+
                 exp_avg.mul_(beta2).add_(grad, alpha=1 - beta2)
         return loss

@@ -10,7 +10,7 @@ def check_train_batch_size(model, imgsz=640, amp=True):
     with torch.cuda.amp.autocast(amp):
         return autobatch(deepcopy(model).train(), imgsz)
 
-def autobatch(model, imgsz=640, fraction=0.80, batch_size=16):
+def autobatch(model, imgsz=640, fraction=0.85, batch_size=16):
     prefix = colorstr("AutoBatch: ")
     LOGGER.info(f"{prefix}Computing optimal batch size for --imgsz {imgsz}")
     device = next(model.parameters()).device

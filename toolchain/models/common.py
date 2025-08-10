@@ -1,25 +1,25 @@
 from copy import copy
 from pathlib import Path
-import cv2
 import numpy as np
 import pandas as pd
-import requests
 import torch
 import torch.nn as nn
 from IPython.display import display
 from PIL import Image
-from torch.cuda import amp
 from utils import TryExcept
-from utils.dataloaders import exif_transpose, letterbox
-from utils.general import LOGGER, Profile, colorstr, increment_path, is_notebook, make_divisible, non_max_suppression, scale_boxes, xyxy2xywh
+from utils.general import LOGGER, colorstr, increment_path, is_notebook, xyxy2xywh
 from utils.plots import Annotator, colors, save_one_box
-from utils.torch_utils import copy_attr, smart_inference_mode
 from torch.nn import Parameter
 from utils import TryExcept
-from utils.dataloaders import exif_transpose, letterbox
-from utils.general import LOGGER, Profile, colorstr, increment_path, is_notebook, make_divisible, non_max_suppression, scale_boxes, xyxy2xywh
+from utils.general import LOGGER, colorstr, increment_path, is_notebook, xyxy2xywh
 from utils.plots import Annotator, colors, save_one_box
-from utils.torch_utils import copy_attr, smart_inference_mode
+
+class Requant(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        return x
 
 def autopad(k, p=None, d=1):
     if d > 1:
@@ -162,14 +162,16 @@ class DFL(nn.Module):
     def __init__(self, c1=17):
         super().__init__()
         self.conv = nn.Conv2d(c1, 1, 1, bias=False).requires_grad_(False)
-        self.conv.weight.data[:] = nn.Parameter(
-            torch.arange(c1, dtype=torch.float).view(1, c1, 1, 1)
-        )
+        self.conv.weight.data[:] = torch.arange(c1, dtype=torch.float).view(1, c1, 1, 1)
         self.c1 = c1
+        self.requant = Requant()
 
     def forward(self, x):
-        (b, c, a) = x.shape
-        return self.conv(x.view(b, 4, self.c1, a).transpose(2, 1).softmax(1)).view(b, 4, a)
+        b, c, a = x.shape
+        rq = getattr(self, "requant", nn.Identity())
+        x = x.view(b, 4, self.c1, a).transpose(2, 1)
+        x = rq(x.softmax(1))
+        return self.conv(x).view(b, 4, a)
 
 class Silence(nn.Module):
     def __init__(self):
@@ -221,95 +223,6 @@ class DetectMultiBackend(nn.Module):
             )
             self.forward(im)
 
-class AutoShape(nn.Module):
-    conf = 0.25
-    iou = 0.45
-    agnostic = False
-    multi_label = False
-    classes = None
-    max_det = 1000
-    amp = False
-
-    def __init__(self, model, verbose=True):
-        super().__init__()
-        if verbose:
-            LOGGER.info('Adding AutoShape... ')
-        copy_attr(self, model, include=('yaml', 'nc', 'hyp', 'names', 'stride', 'abc'), exclude=())
-        self.dmb = isinstance(model, DetectMultiBackend)
-        self.pt = not self.dmb or model.pt
-        self.model = model.eval()
-        if self.pt:
-            m = self.model.model.model[-1] if self.dmb else self.model.model[-1]
-            m.inplace = False
-            m.export = True
-
-    def _apply(self, fn):
-        self = super()._apply(fn)
-        from models.yolo import Detect, Segment
-        if self.pt:
-            m = self.model.model.model[-1] if self.dmb else self.model.model[-1]
-            if isinstance(m, (Detect, Segment)):
-                for k in ('stride', 'anchor_grid', 'stride_grid', 'grid'):
-                    x = getattr(m, k)
-                    setattr(m, k, list(map(fn, x)
-                                      )) if isinstance(x, (list, tuple)) else setattr(m, k, fn(x))
-        return self
-
-    @smart_inference_mode()
-    def forward(self, ims, size=640, augment=False, profile=False):
-        dt = (Profile(), Profile(), Profile())
-        with dt[0]:
-            if isinstance(size, int):
-                size = (size, size)
-            p = next(self.model.parameters()
-                    ) if self.pt else torch.empty(1, device=self.model.device)
-            autocast = self.amp and p.device.type != 'cpu'
-            if isinstance(ims, torch.Tensor):
-                with amp.autocast(autocast):
-                    return self.model(ims.to(p.device).type_as(p), augment=augment)
-            (n, ims) = (len(ims), list(ims)) if isinstance(ims, (list, tuple)) else (1, [ims])
-            (shape0, shape1, files) = ([], [], [])
-            for (i, im) in enumerate(ims):
-                f = f'image{i}'
-                if isinstance(im, (str, Path)):
-                    (im, f) = (
-                        Image.open(
-                            requests.get(im, stream=True).raw if str(im).startswith('http') else im
-                        ), im
-                    )
-                    im = np.asarray(exif_transpose(im))
-                elif isinstance(im, Image.Image):
-                    (im, f) = (np.asarray(exif_transpose(im)), getattr(im, 'filename', f) or f)
-                files.append(Path(f).with_suffix('.jpg').name)
-                if im.shape[0] < 5:
-                    im = im.transpose((1, 2, 0))
-                im = im[..., :3] if im.ndim == 3 else cv2.cvtColor(im, cv2.COLOR_GRAY2BGR)
-                s = im.shape[:2]
-                shape0.append(s)
-                g = max(size) / max(s)
-                shape1.append([int(y * g) for y in s])
-                ims[i] = im if im.data.contiguous else np.ascontiguousarray(im)
-            shape1 = [make_divisible(x, self.stride) for x in np.array(shape1).max(0)]
-            x = [letterbox(im, shape1, auto=False)[0] for im in ims]
-            x = np.ascontiguousarray(np.array(x).transpose((0, 3, 1, 2)))
-            x = torch.from_numpy(x).to(p.device).type_as(p) / 255
-        with amp.autocast(autocast):
-            with dt[1]:
-                y = self.model(x, augment=augment)
-            with dt[2]:
-                y = non_max_suppression(
-                    y if self.dmb else y[0],
-                    self.conf,
-                    self.iou,
-                    self.classes,
-                    self.agnostic,
-                    self.multi_label,
-                    max_det=self.max_det
-                )
-                for i in range(n):
-                    scale_boxes(shape1, y[i][:, :4], shape0[i])
-            return Detections(ims, y, files, dt, self.names, x.shape)
-
 class Detections:
     def __init__(self, ims, pred, files, times=(0, 0, 0), names=None, shape=None):
         super().__init__()
@@ -322,8 +235,6 @@ class Detections:
         self.times = times
         self.xyxy = pred
         self.xywh = [xyxy2xywh(x) for x in pred]
-        self.xyxyn = [x / g for (x, g) in zip(self.xyxy, gn)]
-        self.xywhn = [x / g for (x, g) in zip(self.xywh, gn)]
         self.n = len(self.pred)
         self.t = tuple((x.t / self.n * 1000.0 for x in times))
         self.s = tuple(shape)
@@ -468,138 +379,6 @@ class ConvModule(nn.Module):
             return self.conv(x)
         return self.act(self.conv(x))
 
-class RepVGGBlock(nn.Module):
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        kernel_size=3,
-        stride=1,
-        padding=1,
-        dilation=1,
-        groups=1,
-        padding_mode='zeros',
-        deploy=False,
-        use_se=False
-    ):
-        super(RepVGGBlock, self).__init__()
-        self.deploy = deploy
-        self.groups = groups
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.nonlinearity = nn.ReLU6()
-        assert kernel_size == 3 and padding == 1
-        padding_11 = padding - kernel_size // 2
-        if use_se:
-            raise NotImplementedError('se block not supported yet')
-        else:
-            self.se = nn.Identity()
-        if self.deploy:
-            self.rbr_reparam = nn.Conv2d(
-                in_channels,
-                out_channels,
-                kernel_size,
-                stride,
-                padding=padding,
-                dilation=dilation,
-                groups=groups,
-                bias=True,
-                padding_mode=padding_mode
-            )
-        else:
-            self.rbr_identity = nn.BatchNorm2d(
-                in_channels
-            ) if out_channels == in_channels and stride == 1 else None
-            self.rbr_dense = ConvModule(
-                in_channels,
-                out_channels,
-                kernel_size,
-                stride,
-                activation_type=None,
-                padding=padding,
-                groups=groups
-            )
-            self.rbr_1x1 = ConvModule(
-                in_channels,
-                out_channels,
-                1,
-                stride,
-                activation_type=None,
-                padding=padding_11,
-                groups=groups
-            )
-
-    def forward(self, inputs):
-        if self.deploy:
-            return self.nonlinearity(self.se(self.rbr_reparam(inputs)))
-        id_out = self.rbr_identity(inputs) if self.rbr_identity is not None else 0
-        return self.nonlinearity(self.se(self.rbr_dense(inputs) + self.rbr_1x1(inputs) + id_out))
-
-    def get_equivalent_kernel_bias(self):
-        (kernel3x3, bias3x3) = self._fuse_bn_tensor(self.rbr_dense)
-        (kernel1x1, bias1x1) = self._fuse_bn_tensor(self.rbr_1x1)
-        (kernelid, biasid) = self._fuse_bn_tensor(self.rbr_identity)
-        return (
-            kernel3x3 + self._pad_1x1_to_3x3_tensor(kernel1x1) + kernelid,
-            bias3x3 + bias1x1 + biasid
-        )
-
-    def _pad_1x1_to_3x3_tensor(self, kernel1x1):
-        if kernel1x1 is None:
-            return 0
-        else:
-            return torch.nn.functional.pad(kernel1x1, [1, 1, 1, 1])
-
-    def _fuse_bn_tensor(self, branch):
-        if branch is None:
-            return (0, 0)
-        if isinstance(branch, ConvModule):
-            kernel = branch.conv.weight
-            bias = branch.conv.bias
-            return (kernel, bias)
-        elif isinstance(branch, nn.BatchNorm2d):
-            if not hasattr(self, 'id_tensor'):
-                input_dim = self.in_channels // self.groups
-                kernel_value = np.zeros((self.in_channels, input_dim, 3, 3), dtype=np.float32)
-                for i in range(self.in_channels):
-                    kernel_value[i, i % input_dim, 1, 1] = 1
-                self.id_tensor = torch.from_numpy(kernel_value).to(branch.weight.device)
-            kernel = self.id_tensor
-            running_mean = branch.running_mean
-            running_var = branch.running_var
-            gamma = branch.weight
-            beta = branch.bias
-            eps = branch.eps
-            std = (running_var + eps).sqrt()
-            t = (gamma / std).reshape(-1, 1, 1, 1)
-            return (kernel * t, beta - running_mean * gamma / std)
-
-    def switch_to_deploy(self):
-        if self.deploy:
-            return
-        (kernel, bias) = self.get_equivalent_kernel_bias()
-        self.rbr_reparam = nn.Conv2d(
-            in_channels=self.in_channels,
-            out_channels=self.out_channels,
-            kernel_size=3,
-            stride=self.rbr_dense.conv.stride,
-            padding=1,
-            dilation=self.rbr_dense.conv.dilation,
-            groups=self.groups,
-            bias=True
-        )
-        self.rbr_reparam.weight.data = kernel
-        self.rbr_reparam.bias.data = bias
-        for para in self.parameters():
-            para.detach_()
-        self.__delattr__('rbr_dense')
-        self.__delattr__('rbr_1x1')
-        if hasattr(self, 'rbr_identity'):
-            self.__delattr__('rbr_identity')
-        if hasattr(self, 'id_tensor'):
-            self.__delattr__('id_tensor')
-        self.deploy = True
-
 class QARepVGGBlockV2(nn.Module):
     def __init__(
         self,
@@ -619,7 +398,7 @@ class QARepVGGBlockV2(nn.Module):
         self.groups = groups
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.nonlinearity = nn.ReLU()
+        self.nonlinearity = nn.Hardswish()
         assert kernel_size == 3 and padding == 1
         if use_se:
             raise NotImplementedError('se block not supported yet')
@@ -755,11 +534,9 @@ class QARepVGGBlockV2(nn.Module):
         self.deploy = True
 
 class RepBlockAdd(nn.Module):
-    """
-    RepBlock with an added skip connection, as proposed in the YOLOv6+ paper.
-    This block adds the initial input to the final output of the sequence.
-    """
-    def __init__(self, in_channels, out_channels, n=1, block=RepVGGBlock, basic_block=RepVGGBlock):
+    def __init__(
+        self, in_channels, out_channels, n=1, block=QARepVGGBlockV2, basic_block=QARepVGGBlockV2
+    ):
         super().__init__()
         self.add = in_channels == out_channels
         self.conv1 = block(in_channels, out_channels)
@@ -775,19 +552,19 @@ class RepBlockAdd(nn.Module):
                     for _ in range(n - 1)
                 )
             ) if n > 1 else None
+        self.requant = Requant() if self.add else nn.Identity()
 
     def forward(self, x):
         identity = x
         out = self.conv1(x)
         if self.block is not None:
             out = self.block(out)
-        if self.add:
-            return out + identity
-        else:
-            return out
+        out = out + identity if self.add else out
+        rq = getattr(self, "requant", nn.Identity())
+        return rq(out)
 
 class BottleRep(nn.Module):
-    def __init__(self, in_channels, out_channels, basic_block=RepVGGBlock, weight=False):
+    def __init__(self, in_channels, out_channels, basic_block=QARepVGGBlockV2, weight=False):
         super().__init__()
         self.conv1 = basic_block(in_channels, out_channels)
         self.conv2 = basic_block(out_channels, out_channels)
@@ -816,8 +593,10 @@ class GatedPool(nn.Module):
 
     def forward(self, x):
         gate_input = torch.mean(x, dim=1, keepdim=True)
-        gate = self.gate_act(self.gate_conv(gate_input))
-        return gate * self.max_pool(x) + (1 - gate) * self.avg_pool(x)
+        g = self.gate_act(self.gate_conv(gate_input))
+        mp = self.max_pool(x)
+        ap = self.avg_pool(x)
+        return ap + g * (mp - ap)
 
 class GatedSPPF(nn.Module):
     def __init__(self, c1, c2, k=5):
@@ -847,9 +626,11 @@ class QuantAdd(nn.Module):
         super().__init__()
         self.cv1 = Conv(c1, c2, 1, 1)
         self.cv2 = Conv(c2, c2, 1, 1)
+        self.requant = Requant()
 
     def forward(self, x):
-        return self.cv1(x[0]) + self.cv2(x[1])
+        rq = getattr(self, "requant", nn.Identity())
+        return rq(self.cv1(x[0]) + self.cv2(x[1]))
 
 class QARepNBottleneck(nn.Module):
     def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5):
@@ -885,6 +666,7 @@ class QARepNCSPELAN(nn.Module):
         self.proj2 = Conv(self.c_split, c2, 1, 1)
         self.proj3 = Conv(c4, c2, 1, 1)
         self.proj4 = Conv(c4, c2, 1, 1)
+        self.requant = Requant()
 
     def forward(self, x):
         y = list(self.cv1(x).chunk(2, 1))
@@ -893,4 +675,5 @@ class QARepNCSPELAN(nn.Module):
         p2 = self.proj2(y[1])
         p3 = self.proj3(y[2])
         p4 = self.proj4(y[3])
-        return p1 + p2 + p3 + p4
+        rq = getattr(self, "requant", nn.Identity())
+        return rq(p1 + p2 + p3 + p4)

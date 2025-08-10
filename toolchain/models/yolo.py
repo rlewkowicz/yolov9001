@@ -8,6 +8,8 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.ao.quantization as tq
+from torch.ao.quantization import QuantStub, DeQuantStub
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[1]
@@ -24,7 +26,6 @@ from utils.torch_utils import (
     initialize_weights,
     model_info,
     scale_img,
-    time_sync,
 )
 
 try:
@@ -79,33 +80,51 @@ class RN_DualDDetect(nn.Module):
             for x in ch[self.nl:]
         ))
         self.dfl2 = DFL(self.reg_max)
+        self.requant1 = Requant()
+        self.requant2 = Requant()
+
+    def _export_like_from_d2(self, d2, shape, anchors=None, strides=None):
+        if anchors is None or strides is None:
+            anc, strd = (x.transpose(0, 1) for x in make_anchors(d2, self.stride, 0.5))
+        else:
+            anc, strd = anchors, strides
+        (box2, cls2) = torch.cat([di.view(shape[0], self.no, -1) for di in d2],
+                                 2).split((self.reg_max * 4, self.nc), 1)
+        pixel_anchor_points2 = anc.unsqueeze(0) * strd
+        pixel_pred_dist2 = self.dfl2(box2) * strd
+        dbox2 = dist2bbox(pixel_pred_dist2, pixel_anchor_points2, xywh=True, dim=1)
+        return torch.cat((dbox2, F.hardsigmoid(cls2)), 1)
 
     def forward(self, x):
         shape = x[0].shape
         has_aux_branch = hasattr(self, "cv2")
+        rq1 = getattr(self, "requant1", nn.Identity())
+        rq2 = getattr(self, "requant2", nn.Identity())
         d1 = []
         d2 = []
         if has_aux_branch:
             for i in range(self.nl):
-                d1.append(torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1))
-                d2.append(torch.cat((self.cv4[i](x[self.nl + i]), self.cv5[i](x[self.nl + i])), 1))
+                d1.append(rq1(torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)))
+                d2.append(
+                    rq2(torch.cat((self.cv4[i](x[self.nl + i]), self.cv5[i](x[self.nl + i])), 1))
+                )
         else:
             for i in range(self.nl):
-                d2.append(torch.cat((self.cv4[i](x[i]), self.cv5[i](x[i])), 1))
+                d2.append(rq2(torch.cat((self.cv4[i](x[i]), self.cv5[i](x[i])), 1)))
+
         if self.training:
             return [d1, d2]
+
         if self.dynamic or self.shape != shape:
             (self.anchors,
              self.strides) = (x.transpose(0, 1) for x in make_anchors(d2, self.stride, 0.5))
             self.shape = shape
-        (box2, cls2) = torch.cat([di.view(shape[0], self.no, -1) for di in d2],
-                                 2).split((self.reg_max * 4, self.nc), 1)
-        pixel_anchor_points2 = self.anchors.unsqueeze(0) * self.strides
-        pixel_pred_dist2 = self.dfl2(box2) * self.strides
-        dbox2 = dist2bbox(pixel_pred_dist2, pixel_anchor_points2, xywh=True, dim=1)
-        y_main = torch.cat((dbox2, F.hardsigmoid(cls2)), 1)
+
+        y_main = self._export_like_from_d2(d2, shape, self.anchors, self.strides)
+
         if not has_aux_branch:
             return y_main if self.export else (y_main, d2)
+
         (box, cls) = torch.cat([di.view(shape[0], self.no, -1) for di in d1],
                                2).split((self.reg_max * 4, self.nc), 1)
         (aux_anchors, aux_strides) = (x.transpose(0, 1) for x in make_anchors(d1, self.stride, 0.5))
@@ -125,35 +144,30 @@ class RN_DualDDetect(nn.Module):
             b[-1].bias.data[:self.nc] = math.log(5 / self.nc / (640 / s)**2)
 
 class BaseModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.quant = None
+        self.dequant = None
+        self.qconfig = None
+
     def forward(self, x, profile=False, visualize=False):
+        if self.quant is not None and self.dequant is not None:
+            x = self.quant(x)
+            x = self._forward_once(x, profile, visualize)
+            x = self.dequant(x)
+            return x
         return self._forward_once(x, profile, visualize)
 
     def _forward_once(self, x, profile=False, visualize=False):
-        (y, dt) = ([], [])
+        y, dt = [], []
         for m in self.model:
             if m.f != -1:
-                x = (y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f])
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
             x = m(x)
             y.append(x if m.i in self.save else None)
             if visualize:
                 feature_visualization(x, m.type, m.i, save_dir=visualize)
         return x
-
-    def _profile_one_layer(self, m, x, dt):
-        c = m == self.model[-1]
-        o = (
-            thop.profile(m, inputs=(x.copy() if c else x, ), verbose=False)[0] / 1000000000.0 *
-            2 if thop else 0
-        )
-        t = time_sync()
-        for _ in range(10):
-            m(x.copy() if c else x)
-        dt.append((time_sync() - t) * 100)
-        if m == self.model[0]:
-            LOGGER.info(f"{'time (ms)':>10s} {'GFLOPs':>10s} {'params':>10s}  module")
-        LOGGER.info(f"{dt[-1]:10.2f} {o:10.2f} {m.np:10.0f}  {m.type}")
-        if c:
-            LOGGER.info(f"{sum(dt):10.2f} {'-':>10s} {'-':>10s}  Total")
 
     def fuse(self):
         LOGGER.info("Fusing layers... ")
@@ -179,29 +193,46 @@ class BaseModel(nn.Module):
                         visited.add(actual_idx)
             for i in range(backbone_len, len(self.model) - 1):
                 if i not in layers_to_keep:
-                    LOGGER.info(f"Pruning neck layer {i} by replacing with Silence()...")
                     silent_module = Silence()
                     silent_module.i = self.model[i].i
                     silent_module.f = self.model[i].f
                     silent_module.type = "models.common.Silence"
                     silent_module.np = 0
                     self.model[i] = silent_module
-            LOGGER.info("Pruning auxiliary layers from RN_DualDDetect head...")
-            delattr(detect_head, "cv2")
-            delattr(detect_head, "cv3")
-            delattr(detect_head, "dfl")
+            if hasattr(detect_head, "cv2"):
+                delattr(detect_head, "cv2")
+            if hasattr(detect_head, "cv3"):
+                delattr(detect_head, "cv3")
+            if hasattr(detect_head, "dfl"):
+                delattr(detect_head, "dfl")
             detect_head.f = main_head_input_indices
-            LOGGER.info(f"Re-wired RN_DualDDetect to accept inputs from: {detect_head.f}")
+        for m in self.model.modules():
+            if isinstance(m, RepBlockAdd) and not hasattr(m, "requant"):
+                m.requant = Requant() if getattr(m, "add", False) else nn.Identity()
+            elif isinstance(m, (QuantAdd, QARepNCSPELAN, DFL)) and not hasattr(m, "requant"):
+                m.requant = Requant()
+        detect_head = self.model[-1]
+        if isinstance(detect_head, RN_DualDDetect):
+            if not hasattr(detect_head, "requant1"):
+                detect_head.requant1 = Requant()
+            if not hasattr(detect_head, "requant2"):
+                detect_head.requant2 = Requant()
         for m in self.model.modules():
             if hasattr(m, "switch_to_deploy"):
                 m.switch_to_deploy()
             if isinstance(m, RepConvN) and hasattr(m, "fuse_convs"):
+                rq = getattr(m, "requant", None)
                 m.fuse_convs()
                 m.forward = m.forward_fuse
+                if rq is not None:
+                    m.requant = rq
             elif isinstance(m, Conv) and hasattr(m, "bn"):
+                rq = getattr(m, "requant", None)
                 m.conv = fuse_conv_and_bn(m.conv, m.bn)
                 delattr(m, "bn")
                 m.forward = m.forward_fuse
+                if rq is not None:
+                    m.requant = rq
         self.info()
         return self
 
@@ -217,14 +248,37 @@ class BaseModel(nn.Module):
             m.strides = fn(m.strides)
         return self
 
+    def _fuse_for_qat(self):
+        for m in self.model.modules():
+            if isinstance(m, Conv) and hasattr(m, 'bn') and m.bn is not None:
+                try:
+                    tq.fuse_modules(m, ['conv', 'bn'], inplace=True)
+                except Exception:
+                    pass
+
+    def enable_qat(self, backend='fbgemm', per_channel=True):
+        torch.backends.quantized.engine = backend
+        self.quant = QuantStub()
+        self.dequant = DeQuantStub()
+        if per_channel:
+            self.qconfig = tq.get_default_qat_qconfig(backend)
+        else:
+            self.qconfig = tq.qconfig.QConfig(
+                activation=tq.default_fake_quant, weight=tq.default_weight_fake_quant
+            )
+        self.train()
+        self._fuse_for_qat()
+        tq.prepare_qat(self, inplace=True)
+
 class DetectionModel(BaseModel):
-    def __init__(self, cfg="yolo.yaml", ch=3, nc=None, anchors=None):
+    def __init__(
+        self, cfg="yolo.yaml", ch=3, nc=None, anchors=None, qat=False, qat_per_channel=True
+    ):
         super().__init__()
         if isinstance(cfg, dict):
             self.yaml = cfg
         else:
             import yaml
-
             self.yaml_file = Path(cfg).name
             with open(cfg, encoding="ascii", errors="ignore") as f:
                 self.yaml = yaml.safe_load(f)
@@ -248,6 +302,8 @@ class DetectionModel(BaseModel):
             m.bias_init()
         initialize_weights(self)
         self.info()
+        if qat:
+            self.enable_qat(backend='fbgemm', per_channel=bool(qat_per_channel))
         LOGGER.info("")
 
     def forward(self, x, augment=False, profile=False, visualize=False):
@@ -317,48 +373,58 @@ def parse_model(d, ch):
     na = len(anchors[0]) // 2 if isinstance(anchors, list) else anchors
     no = na * (nc + 5)
     (layers, save, c2) = ([], [], ch[-1])
+
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):
         m = eval(m) if isinstance(m, str) else m
         for j, a in enumerate(args):
             with contextlib.suppress(NameError):
                 args[j] = eval(a) if isinstance(a, str) else a
+
         n = n_ = max(round(n * gd), 1) if n > 1 else n
-        if m in {
-            Conv,
-            AConv,
-            nn.ConvTranspose2d,
-            QARepVGGBlockV2,
-            GatedSPPF,
-            QARepNCSPELAN,
-        }:
-            (c1, c2) = (ch[f], args[0])
+
+        if m is RepBlockAdd:
+            c1, c2 = ch[f], args[0]
             if c2 != no:
                 c2 = make_divisible(c2 * gw, 8)
-            args = [c1, c2, *args[1:]]
-        elif m in {RepBlockAdd}:
-            (c1, c2) = (ch[f], args[0])
-            if c2 != no:
-                c2 = make_divisible(c2 * gw, 8)
-            args = [c1, c2, n_, args[2]]
-            n = 1
-        elif m is nn.BatchNorm2d:
-            args = [ch[f]]
-        elif m is QuantAdd:
-            (c1, c2_target) = (ch[f[0]], ch[f[1]])
-            args = [c1, c2_target]
-            c2 = c2_target
-        elif m is RN_DualDDetect:
-            args.append([ch[x] for x in f])
+            block_class = args[2] if len(args) > 2 else QARepVGGBlockV2
+            m_ = m(c1, c2, n=n_, block=block_class)
+            args = [c1, c2, n_, block_class.__name__]
         else:
-            c2 = ch[f]
-        m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)
+            c1 = ch[f] if isinstance(f, int) else ch[f[0]]
+            if m in {
+                Conv,
+                AConv,
+                nn.ConvTranspose2d,
+                QARepVGGBlockV2,
+                GatedSPPF,
+                QARepNCSPELAN,
+            }:
+                c2 = args[0]
+                if c2 != no:
+                    c2 = make_divisible(c2 * gw, 8)
+                args = [c1, c2, *args[1:]]
+            elif m is nn.BatchNorm2d:
+                args = [c1]
+                c2 = c1
+            elif m is QuantAdd:
+                c2_target = ch[f[1]]
+                args = [c1, c2_target]
+                c2 = c2_target
+            elif m is RN_DualDDetect:
+                args.append([ch[x] for x in f])
+                c2 = c1
+            else:
+                c2 = c1
+            m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)
+
         t = str(m)[8:-2].replace("__main__.", "")
-        np = sum((x.numel() for x in m_.parameters()))
+        np = sum(x.numel() for x in m_.parameters())
         (m_.i, m_.f, m_.type, m_.np) = (i, f, t, np)
         LOGGER.info(f"{i:>3}{str(f):>18}{n_:>3}{np:10.0f}  {t:<40}{str(args):<30}")
-        save.extend((x % i for x in ([f] if isinstance(f, int) else f) if x != -1))
+        save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)
         layers.append(m_)
         if i == 0:
             ch = []
         ch.append(c2)
+
     return (nn.Sequential(*layers), sorted(save))

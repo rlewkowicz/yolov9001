@@ -66,7 +66,8 @@ ALIASES: Dict[str, Tuple[str, str, Sequence[str]]] = {
         "detect.py",
         "Object detection",
         [
-
+            "--project",
+            str(ROOT / "runs"),
         ],
     ),
     "val": (
@@ -75,6 +76,8 @@ ALIASES: Dict[str, Tuple[str, str, Sequence[str]]] = {
         [
             "--data",
             str(TOOLCHAIN / "data" / "coco.yaml"),
+            "--project",
+            str(ROOT / "runs"),
         ],
     ),
     "export": (
@@ -91,6 +94,8 @@ ALIASES: Dict[str, Tuple[str, str, Sequence[str]]] = {
         [
             "--data",
             str(TOOLCHAIN / "data" / "coco.yaml"),
+            "--project",
+            str(ROOT / "runs"),
         ],
     ),
     "compare": (
@@ -234,17 +239,21 @@ def ddptrain(ctx: click.Context) -> None:
 
     if not any(a.startswith("--cache") for a in ctx.args):
         total_mem = os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES')
-        if total_mem > 120 * 1024**3:
+        if total_mem > 120 * num_gpus * 1024**3:
             cmd.extend(['--cache', 'ram'])
         else:
             cmd.extend(['--cache', 'disk'])
 
     if not any(a.startswith("--batch-size") for a in ctx.args):
+        if "--qat" in ctx.args:
+            reference_batch_size = 15
+        else:
+            reference_batch_size = 39
+        
         gpu_mem_bytes = [
             torch.cuda.get_device_properties(i).total_memory for i in range(num_gpus)
         ]
         min_mem_gib = min(gpu_mem_bytes) / (1024 ** 3)
-        reference_batch_size = 38
         reference_memory_gib = 23.55
         per_gpu_batch = max(
             1,

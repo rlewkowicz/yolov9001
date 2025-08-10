@@ -37,12 +37,10 @@ RANK = int(os.getenv("RANK", -1))
 NUM_THREADS = min(8, max(1, os.cpu_count() - 1))
 DATASETS_DIR = Path(os.getenv("YOLOv5_DATASETS_DIR", ROOT.parent / "datasets"))
 AUTOINSTALL = str(os.getenv("YOLOv5_AUTOINSTALL", True)).lower() == "true"
-VERBOSE = str(os.getenv("YOLOv5_VERBOSE", True)).lower() == "true"
 TQDM_BAR_FORMAT = "{l_bar}{bar:10}| {n_fmt}/{total_fmt} {elapsed}"
 FONT = "Arial.ttf"
 torch.set_printoptions(linewidth=320, precision=5, profile="long")
 np.set_printoptions(linewidth=320, formatter={"float_kind": "{:11.5g}".format})
-pd.options.display.max_columns = 10
 cv2.setNumThreads(0)
 os.environ["NUMEXPR_MAX_THREADS"] = str(NUM_THREADS)
 os.environ["OMP_NUM_THREADS"] = ("1" if platform.system() == "darwin" else str(NUM_THREADS))
@@ -203,18 +201,6 @@ def file_size(path):
         return sum((f.stat().st_size for f in path.glob("**/*") if f.is_file())) / mb
     else:
         return 0.0
-
-def check_online():
-    import socket
-
-    def run_once():
-        try:
-            socket.create_connection(("1.1.1.1", 443), 5)
-            return True
-        except OSError:
-            return False
-
-    return run_once() or run_once()
 
 def git_describe(path=ROOT):
     try:
@@ -422,35 +408,6 @@ def check_dataset(data, autodownload=True):
             LOGGER.info(f"Dataset download {s}")
     check_font("Arial.ttf" if is_ascii(data["names"]) else "Arial.Unicode.ttf", progress=True)
     return data
-
-def check_amp(model):
-    from models.common import AutoShape
-
-    def amp_allclose(model, im):
-        m = AutoShape(model, verbose=False)
-        a = m(im).xywhn[0]
-        m.amp = True
-        b = m(im).xywhn[0]
-        return a.shape == b.shape and torch.allclose(a, b, atol=0.1)
-
-    prefix = colorstr("AMP: ")
-    device = next(model.parameters()).device
-    if device.type in ("cpu", "mps"):
-        return False
-    f = ROOT / "data" / "images" / "bus.jpg"
-    im = (
-        f if f.exists() else
-        "https://ultralytics.com/images/bus.jpg" if check_online() else np.ones((640, 640, 3))
-    )
-    try:
-        LOGGER.info(f"{prefix}checks passed ✅")
-        return True
-    except Exception:
-        help_url = "https://github.com/ultralytics/yolov5/issues/7908"
-        LOGGER.warning(
-            f"{prefix}checks failed ❌, disabling Automatic Mixed Precision. See {help_url}"
-        )
-        return False
 
 def yaml_load(file="data.yaml"):
     with open(file, errors="ignore") as f:

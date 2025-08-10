@@ -217,7 +217,7 @@ module "ml_server_group" {
   assign_eip_address          = false
   ssh_key_pair                = aws_key_pair.this.key_name 
   generate_ssh_key_pair       = false
-  instance_type               = "g5.12xlarge"
+  instance_type               = "g6.12xlarge"
   instance_count              = 4
   root_volume_size            = 70
   monitoring                  = false
@@ -282,7 +282,7 @@ resource "null_resource" "file_uploader" {
 
   provisioner "local-exec" {
     working_dir = "${path.module}/../"
-    command     = "python mktar.py -i last.pt"
+    command     = "python mktar.py -i best.pt"
   }
 
   connection {

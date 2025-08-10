@@ -16,23 +16,23 @@ while true; do
   (
     set -euo pipefail
 
-    MIN_MEM_KB=204857600
+    MIN_MEM_KB=304857600
     TOTAL_MEM_KB=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
-    if [ "$TOTAL_MEM_KB" -ge "$MIN_MEM_KB" ]; then
-      sudo mkdir -p /home/tmp
-      sudo rsync -av /home/ubuntu/. /home/tmp/.
-      sudo mount -t tmpfs -o size=100G tmpfs /home/ubuntu/
-      sudo chown -R ubuntu:ubuntu /home/ubuntu/
-      sudo rsync -av /home/tmp/. /home/ubuntu/.
-      sudo chown -R ubuntu:ubuntu /home/ubuntu/
-    else
+    # if [ "$TOTAL_MEM_KB" -ge "$MIN_MEM_KB" ]; then
+    #   sudo mkdir -p /home/tmp
+    #   sudo rsync -av /home/ubuntu/. /home/tmp/.
+    #   sudo mount -t tmpfs -o size=100G tmpfs /home/ubuntu/
+    #   sudo chown -R ubuntu:ubuntu /home/ubuntu/
+    #   sudo rsync -av /home/tmp/. /home/ubuntu/.
+    #   sudo chown -R ubuntu:ubuntu /home/ubuntu/
+    # else
       if [ -d "/opt/dlami/nvme" ]; then
         sudo rsync -av /home/ubuntu/. /opt/dlami/nvme/.
         sudo chown -R ubuntu:ubuntu /opt/dlami/nvme
         sudo rm -rf /home/ubuntu/
         sudo ln -s /opt/dlami/nvme /home/ubuntu
       fi
-    fi
+    # fi
 
     cd /home/ubuntu
 
@@ -67,5 +67,7 @@ sudo -u ubuntu screen -dmS ddptrain bash -ilc '
   conda activate yolov9
   nvidia-smi >/dev/null 2>&1 || true
   cd ~/yolov9001
-  ./yolov9001 ddptrain
+  ./yolov9001 ddptrain --optimizer LION --epochs 200 --cache ram
+  # ./yolov9001 ddptrain --optimizer SGD --epochs 300 --cache ram --weights ./best.pt --hyp hyp.finetune-coco.yaml
+  # exec bash
 '

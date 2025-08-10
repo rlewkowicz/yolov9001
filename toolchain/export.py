@@ -3,12 +3,14 @@ import os
 import platform
 import sys
 import time
+from copy import deepcopy
 from pathlib import Path
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import pandas as pd
 import torch
+import torch.nn as nn
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]
@@ -45,32 +47,78 @@ def try_export(inner_func):
             with Profile() as dt:
                 f, model = inner_func(*args, **kwargs)
             LOGGER.info(
-                f"{prefix} export success ✅ {dt.t:.1f}s, saved as {f} ({file_size(f):.1f} MB)"
+                f"{prefix} export success {dt.t:.1f}s, saved as {f} ({file_size(f):.1f} MB)"
             )
             return f, model
         except Exception as e:
-            LOGGER.info(f"{prefix} export failure ❌ {dt.t:.1f}s: {e}")
+            LOGGER.info(f"{prefix} export failure {dt.t:.1f}s: {e}")
             return None, None
 
     return outer_func
+
+def _replace_modules_recursively(m):
+    for n, c in list(m.named_children()):
+        name = c.__class__.__name__
+        if "FakeQuantize" in name or "Observer" in name:
+            setattr(m, n, nn.Identity())
+        else:
+            _replace_modules_recursively(c)
+
+def _prepare_model_for_onnx_export(src_model):
+    m = deepcopy(src_model).eval()
+    try:
+        import torch.ao.quantization as tq
+        tq.convert(m, inplace=True)
+    except Exception:
+        pass  # fall through to soft-disabling below
+
+    for mod in m.modules():
+        try:
+            if hasattr(mod, "set_observer_enabled"):
+                mod.set_observer_enabled(False)
+        except Exception:
+            pass
+        try:
+            if hasattr(mod, "set_fake_quant_enabled"):
+                mod.set_fake_quant_enabled(False)
+        except Exception:
+            pass
+
+        try:
+            if hasattr(mod, "observer_enabled"):
+                setattr(mod, "observer_enabled", False)
+        except Exception:
+            pass
+        try:
+            if hasattr(mod, "fake_quant_enabled"):
+                setattr(mod, "fake_quant_enabled", False)
+        except Exception:
+            pass
+
+    _replace_modules_recursively(m)
+    return m
 
 @try_export
 def export_onnx(model, im, file, opset, dynamic, simplify, prefix=colorstr("ONNX:")):
     check_requirements("onnx")
     import onnx
-
     LOGGER.info(f"\n{prefix} starting export with onnx {onnx.__version__}...")
     f = file.with_suffix(".onnx")
+
+    export_model = _prepare_model_for_onnx_export(model)
 
     output_names = ["output0"]
     if dynamic:
         dynamic = {"images": {0: "batch", 2: "height", 3: "width"}}
-        if isinstance(model, DetectionModel):
+        if isinstance(export_model, DetectionModel):
             dynamic["output0"] = {0: "batch", 1: "anchors"}
 
+    use_model = export_model.cpu() if dynamic else export_model
+    use_im = im.cpu() if dynamic else im
+
     torch.onnx.export(
-        model.cpu() if dynamic else model,
-        im.cpu() if dynamic else im,
+        use_model,
+        use_im,
         f,
         verbose=False,
         opset_version=opset,
@@ -96,7 +144,6 @@ def export_onnx(model, im, file, opset, dynamic, simplify, prefix=colorstr("ONNX
                 ("onnxruntime-gpu" if cuda else "onnxruntime", "onnx-simplifier>=0.4.1")
             )
             import onnxsim
-
             LOGGER.info(f"{prefix} simplifying with onnx-simplifier {onnxsim.__version__}...")
             model_onnx, check = onnxsim.simplify(model_onnx)
             assert check, "assert check failed"
@@ -171,7 +218,7 @@ def parse_opt():
         nargs="+",
         type=int,
         default=[640, 640],
-        help="image (h, w)",
+        help="image (h, w)"
     )
     parser.add_argument("--batch-size", type=int, default=1, help="batch size")
     parser.add_argument("--device", default="cpu", help="cuda device, i.e. 0 or 0,1,2,3 or cpu")

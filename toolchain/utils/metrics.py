@@ -151,11 +151,6 @@ class ConfusionMatrix:
     def matrix(self):
         return self.matrix
 
-    def tp_fp(self):
-        tp = self.matrix.diagonal()
-        fp = self.matrix.sum(1) - tp
-        return (tp[:-1], fp[:-1])
-
     @TryExcept("WARNING ⚠️ ConfusionMatrix plot failure")
     def plot(self, normalize=True, save_dir="", names=()):
         import seaborn as sn

@@ -2,8 +2,6 @@ import math
 import random
 import cv2
 import numpy as np
-import torch
-import torchvision.transforms as T
 import torchvision.transforms.functional as TF
 from utils.general import (
     LOGGER,
@@ -202,83 +200,3 @@ def box_candidates(box1, box2, wh_thr=2, ar_thr=100, area_thr=0.1, eps=1e-16):
     (w2, h2) = (box2[2] - box2[0], box2[3] - box2[1])
     ar = np.maximum(w2 / (h2 + eps), h2 / (w2 + eps))
     return ((w2 > wh_thr) & (h2 > wh_thr) & (w2 * h2 / (w1 * h1 + eps) > area_thr) & (ar < ar_thr))
-
-def classify_albumentations(
-    augment=True,
-    size=224,
-    scale=(0.08, 1.0),
-    ratio=(0.75, 1.0 / 0.75),
-    hflip=0.5,
-    vflip=0.0,
-    jitter=0.4,
-    mean=IMAGENET_MEAN,
-    std=IMAGENET_STD,
-    auto_aug=False,
-):
-    prefix = colorstr("albumentations: ")
-    try:
-        import albumentations as A
-        from albumentations.pytorch import ToTensorV2
-
-        check_version(A.__version__, "1.0.3", hard=True)
-        if augment:
-            T = [A.RandomResizedCrop(height=size, width=size, scale=scale, ratio=ratio)]
-            if auto_aug:
-                LOGGER.info(f"{prefix}auto augmentations are currently not supported")
-            else:
-                if hflip > 0:
-                    T += [A.HorizontalFlip(p=hflip)]
-                if vflip > 0:
-                    T += [A.VerticalFlip(p=vflip)]
-                if jitter > 0:
-                    color_jitter = (float(jitter), ) * 3
-                    T += [A.ColorJitter(*color_jitter, 0)]
-        else:
-            T = [
-                A.SmallestMaxSize(max_size=size),
-                A.CenterCrop(height=size, width=size),
-            ]
-        T += [A.Normalize(mean=mean, std=std), ToTensorV2()]
-        LOGGER.info(
-            prefix + ", ".join((f"{x}".replace("always_apply=False, ", "") for x in T if x.p))
-        )
-        return A.Compose(T)
-    except ImportError:
-        LOGGER.warning(
-            f"{prefix}⚠️ not found, install with `pip install albumentations` (recommended)"
-        )
-    except Exception as e:
-        LOGGER.info(f"{prefix}{e}")
-
-def classify_transforms(size=224):
-    assert isinstance(
-        size, int
-    ), (f"ERROR: classify_transforms size {size} must be integer, not (list, tuple)")
-    return T.Compose([CenterCrop(size), ToTensor(), T.Normalize(IMAGENET_MEAN, IMAGENET_STD)])
-
-class CenterCrop:
-    def __init__(self, size=640):
-        super().__init__()
-        (self.h, self.w) = (size, size) if isinstance(size, int) else size
-
-    def __call__(self, im):
-        (imh, imw) = im.shape[:2]
-        m = min(imh, imw)
-        (top, left) = ((imh - m) // 2, (imw - m) // 2)
-        return cv2.resize(
-            im[top:top + m, left:left + m],
-            (self.w, self.h),
-            interpolation=cv2.INTER_LINEAR,
-        )
-
-class ToTensor:
-    def __init__(self, half=False):
-        super().__init__()
-        self.half = half
-
-    def __call__(self, im):
-        im = np.ascontiguousarray(im.transpose((2, 0, 1))[::-1])
-        im = torch.from_numpy(im)
-        im = im.half() if self.half else im.float()
-        im /= 255.0
-        return im
