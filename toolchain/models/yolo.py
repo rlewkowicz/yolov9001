@@ -85,16 +85,30 @@ class RN_DualDDetect(nn.Module):
         self.requant2 = Requant()
 
     def _export_like_from_d2(self, d2, shape, anchors=None, strides=None):
+        (box2, cls2) = torch.cat([di.view(shape[0], self.no, -1) for di in d2],
+                                 2).split((self.reg_max * 4, self.nc), 1)
+        if self.training and not torch.onnx.is_in_onnx_export():
+            return torch.cat((box2, cls2), 1)
         if anchors is None or strides is None:
             anc, strd = (x.transpose(0, 1) for x in make_anchors(d2, self.stride, 0.5))
         else:
             anc, strd = anchors, strides
-        (box2, cls2) = torch.cat([di.view(shape[0], self.no, -1) for di in d2],
-                                 2).split((self.reg_max * 4, self.nc), 1)
         pixel_anchor_points2 = anc.unsqueeze(0) * strd
         pixel_pred_dist2 = self.dfl2(box2) * strd
         dbox2 = dist2bbox(pixel_pred_dist2, pixel_anchor_points2, xywh=True, dim=1)
         return torch.cat((dbox2, F.hardsigmoid(cls2)), 1)
+
+    def export_like_for_calib(self, d2, shape, anchors=None, strides=None):
+        (box2, cls2) = torch.cat([di.view(shape[0], self.no, -1) for di in d2],
+                                 2).split((self.reg_max * 4, self.nc), 1)
+        if anchors is None or strides is None:
+            anc, strd = (x.transpose(0, 1) for x in make_anchors(d2, self.stride, 0.5))
+        else:
+            anc, strd = anchors, strides
+        pixel_anchor_points2 = anc.unsqueeze(0) * strd
+        pixel_pred_dist2 = self.dfl2(box2) * strd
+        dbox2 = dist2bbox(pixel_pred_dist2, pixel_anchor_points2, xywh=True, dim=1)
+        return torch.cat((dbox2, cls2), 1)
 
     def forward(self, x):
         shape = x[0].shape
