@@ -80,6 +80,7 @@ class RN_DualDDetect(nn.Module):
             for x in ch[self.nl:]
         ))
         self.dfl2 = DFL(self.reg_max)
+
         self.requant1 = Requant()
         self.requant2 = Requant()
 
@@ -206,6 +207,7 @@ class BaseModel(nn.Module):
             if hasattr(detect_head, "dfl"):
                 delattr(detect_head, "dfl")
             detect_head.f = main_head_input_indices
+
         for m in self.model.modules():
             if isinstance(m, RepBlockAdd) and not hasattr(m, "requant"):
                 m.requant = Requant() if getattr(m, "add", False) else nn.Identity()
@@ -217,6 +219,7 @@ class BaseModel(nn.Module):
                 detect_head.requant1 = Requant()
             if not hasattr(detect_head, "requant2"):
                 detect_head.requant2 = Requant()
+
         for m in self.model.modules():
             if hasattr(m, "switch_to_deploy"):
                 m.switch_to_deploy()
@@ -233,6 +236,7 @@ class BaseModel(nn.Module):
                 m.forward = m.forward_fuse
                 if rq is not None:
                     m.requant = rq
+
         self.info()
         return self
 
@@ -366,9 +370,10 @@ def parse_model(d, ch):
         d.get("activation"),
     )
     if act:
-        Conv.default_act = eval(act)
-        if "RepConvN" in globals():
-            RepConvN.default_act = eval(act)
+        act_module = eval(act)
+        for module_class in (Conv, RepConvN, QARepVGGBlockV2):
+            if hasattr(module_class, 'default_act'):
+                module_class.default_act = act_module
         LOGGER.info(f"activation: {act}")
     na = len(anchors[0]) // 2 if isinstance(anchors, list) else anchors
     no = na * (nc + 5)
@@ -391,14 +396,7 @@ def parse_model(d, ch):
             args = [c1, c2, n_, block_class.__name__]
         else:
             c1 = ch[f] if isinstance(f, int) else ch[f[0]]
-            if m in {
-                Conv,
-                AConv,
-                nn.ConvTranspose2d,
-                QARepVGGBlockV2,
-                GatedSPPF,
-                QARepNCSPELAN,
-            }:
+            if m in {Conv, AConv, nn.ConvTranspose2d, QARepVGGBlockV2, GatedSPPF, QARepNCSPELAN}:
                 c2 = args[0]
                 if c2 != no:
                     c2 = make_divisible(c2 * gw, 8)

@@ -43,6 +43,7 @@ class BboxLoss(nn.Module):
         anchor_points,
         target_bboxes,
         target_scores,
+        target_scores_sum,
         fg_mask,
     ):
         bbox_mask = fg_mask.unsqueeze(-1).repeat([1, 1, 4])
@@ -50,16 +51,17 @@ class BboxLoss(nn.Module):
         target_bboxes_pos = torch.masked_select(target_bboxes, bbox_mask).view(-1, 4)
         bbox_weight = torch.masked_select(target_scores.sum(-1), fg_mask).unsqueeze(-1)
         iou = bbox_iou(pred_bboxes_pos, target_bboxes_pos, xywh=False, CIoU=True)
-        loss_iou = ((1.0 - iou) * bbox_weight).sum()
+        loss_iou_sum = ((1.0 - iou) * bbox_weight).sum()
         if self.use_dfl:
             dist_mask = fg_mask.unsqueeze(-1).repeat([1, 1, (self.reg_max + 1) * 4])
             pred_dist_pos = torch.masked_select(pred_dist, dist_mask).view(-1, 4, self.reg_max + 1)
             target_ltrb = bbox2dist(anchor_points, target_bboxes, self.reg_max)
             target_ltrb_pos = torch.masked_select(target_ltrb, bbox_mask).view(-1, 4)
-            loss_dfl = (self._df_loss(pred_dist_pos, target_ltrb_pos) * bbox_weight).sum()
+            loss_dfl = self._df_loss(pred_dist_pos, target_ltrb_pos) * bbox_weight
+            loss_dfl_sum = loss_dfl.sum()
         else:
-            loss_dfl = torch.tensor(0.0, device=pred_dist.device)
-        return (loss_iou, loss_dfl)
+            loss_dfl_sum = torch.tensor(0.0, device=pred_dist.device)
+        return loss_iou_sum, loss_dfl_sum, target_scores_sum
 
     def _df_loss(self, pred_dist, target):
         target_left = target.to(torch.long)
@@ -130,12 +132,13 @@ class RN_ComputeLoss(nn.Module):
         return dist2bbox(pred_dist, anchor_points, xywh=False)
 
     def _calculate_loss_for_branch(self, feats, targets, imgsz):
+        loss = torch.zeros(3, device=self.device)
         (pred_distri,
          pred_scores) = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats],
                                   2).split((self.reg_max * 4, self.nc), 1)
         if not torch.isfinite(pred_distri).all() or not torch.isfinite(pred_scores).all():
             print(
-                "Error: NaN or inf found in model predictions. Try lowering your learning rate (`lr0`)."
+                "Error: NaN or inf found in model predictions. This is the primary sign of an exploding gradient. Try lowering your learning rate (`lr0`)."
             )
         pred_scores = pred_scores.permute(0, 2, 1).contiguous()
         pred_distri = pred_distri.permute(0, 2, 1).contiguous()
@@ -152,10 +155,8 @@ class RN_ComputeLoss(nn.Module):
         pixel_pred_dist = pred_distri.detach()
         if self.use_dfl:
             (b, a, c) = pixel_pred_dist.shape
-            pixel_pred_dist = (
-                pixel_pred_dist.view(b, a, 4, c // 4).softmax(3).matmul(
-                    self.proj.type(pixel_pred_dist.dtype)
-                )
+            pixel_pred_dist = pixel_pred_dist.view(b, a, 4, c // 4).softmax(3).matmul(
+                self.proj.type(pixel_pred_dist.dtype)
             )
         pixel_pred_dist *= stride_tensor
         pred_bboxes_for_assigner = dist2bbox(pixel_pred_dist, pixel_anchor_points, xywh=False)
@@ -168,40 +169,34 @@ class RN_ComputeLoss(nn.Module):
             mask_gt,
         )
         target_bboxes /= stride_tensor
-        den_local = target_scores.sum().to(torch.float32)
-        cls_numer = self.BCEcls(pred_scores, target_scores.to(dtype)).sum().to(torch.float32)
-        iou_numer = torch.tensor(0.0, device=self.device, dtype=torch.float32)
-        dfl_numer = torch.tensor(0.0, device=self.device, dtype=torch.float32)
+        target_scores_sum_local = target_scores.sum()
+        cls_num_local = self.BCEcls(pred_scores, target_scores.to(dtype)).sum()
+        iou_sum_local = torch.zeros((), device=self.device)
+        dfl_sum_local = torch.zeros((), device=self.device)
         if fg_mask.sum():
             pred_bboxes_decoded = self.bbox_decode(anchor_points, pred_distri)
-            li, ld = self.bbox_loss(
+            iou_sum_local, dfl_sum_local, _den = self.bbox_loss(
                 pred_distri,
                 pred_bboxes_decoded,
                 anchor_points,
                 target_bboxes,
                 target_scores,
+                target_scores_sum_local,
                 fg_mask,
             )
-            iou_numer = li.to(torch.float32)
-            dfl_numer = ld.to(torch.float32)
-        do_ddp = (
-            torch.distributed.is_available() and torch.distributed.is_initialized() and
-            self.ddp_reduce
-        )
-        if do_ddp:
-            torch.distributed.all_reduce(cls_numer, op=torch.distributed.ReduceOp.SUM)
-            torch.distributed.all_reduce(den_local, op=torch.distributed.ReduceOp.SUM)
-            torch.distributed.all_reduce(iou_numer, op=torch.distributed.ReduceOp.SUM)
-            torch.distributed.all_reduce(dfl_numer, op=torch.distributed.ReduceOp.SUM)
-        den_global = torch.clamp(den_local, min=1.0)
-        loss_cls = cls_numer / den_global
-        loss_iou = iou_numer / den_global
-        loss_dfl = dfl_numer / den_global
-        return torch.stack([
-            loss_iou.to(self.device),
-            loss_cls.to(self.device),
-            loss_dfl.to(self.device)
-        ])
+
+        if self.ddp_reduce and torch.distributed.is_available(
+        ) and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(cls_num_local, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(target_scores_sum_local, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(iou_sum_local, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(dfl_sum_local, op=torch.distributed.ReduceOp.SUM)
+
+        denom = target_scores_sum_local.clamp(min=1)
+        loss[1] = cls_num_local / denom
+        loss[0] = iou_sum_local / denom
+        loss[2] = dfl_sum_local / denom
+        return loss
 
     def __call__(self, p, targets, img=None, epoch=0):
         feats = p[1] if isinstance(p, tuple) else p

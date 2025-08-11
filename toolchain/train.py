@@ -11,7 +11,7 @@ import contextlib
 import torch
 import torch.nn.functional as F
 from utils.torch_utils import de_parallel
-from utils.tal.anchor_generator import make_anchors, dist2bbox
+from utils.tal.anchor_generator import make_anchors, dist2bbox  # kept, though no longer needed directly
 
 import numpy as np
 import torch
@@ -108,22 +108,27 @@ class EMAMinMax:
             return None
         if self.per_channel:
             return {
-                "per_channel": True, "min": self.min.cpu().numpy().tolist(), "max":
-                    self.max.cpu().numpy().tolist(), "channels": int(self.channels)
+                "per_channel": True,
+                "min": self.min.cpu().numpy().tolist(),
+                "max": self.max.cpu().numpy().tolist(),
+                "channels": int(self.channels),
             }
         else:
             return {
                 "per_channel":
-                    False, "min":
-                        float(
-                            self.min.cpu().item() if self.min.numel() ==
-                            1 else self.min.mean().cpu().item()
-                        ), "max":
-                            float(
-                                self.max.cpu().item() if self.max.numel() ==
-                                1 else self.max.mean().cpu().item()
-                            ), "channels":
-                                int(self.channels if self.channels is not None else 0)
+                    False,
+                "min":
+                    float(
+                        self.min.cpu().item() if self.min.numel() ==
+                        1 else self.min.mean().cpu().item()
+                    ),
+                "max":
+                    float(
+                        self.max.cpu().item() if self.max.numel() ==
+                        1 else self.max.mean().cpu().item()
+                    ),
+                "channels":
+                    int(self.channels if self.channels is not None else 0),
             }
 
 def train(hyp, opt, device, callbacks):
@@ -405,60 +410,33 @@ def train(hyp, opt, device, callbacks):
         channels=None, momentum=opt.int8_calib_momentum, per_channel=opt.int8_per_channel
     ) if opt.record_int8_calib else None
 
-    def _export_form_from_training(pred, model_ref):
+    def _export_like_from_training(pred, model_ref):
         base = de_parallel(model_ref)
         if not hasattr(base, "model") or not base.model:
             return None
-
-        detect_head = base.model[-1]
-        if not (hasattr(detect_head, "dfl2") and hasattr(detect_head, "reg_max")):
+        head = base.model[-1]
+        if not hasattr(head, "_export_like_from_d2"):
             return None
 
         d2 = None
         if isinstance(pred, (list, tuple)):
-            if len(pred) == 2 and isinstance(pred[1], list):
-                d_lists = pred[1]
-                if isinstance(d_lists,
-                              (list,
-                               tuple)) and len(d_lists) >= 2 and isinstance(d_lists[1], list):
-                    d2 = d_lists[1]
+            if len(pred) >= 2 and isinstance(pred[1], list):
+                d2 = pred[1]
             elif len(pred) >= 1 and isinstance(pred[0], list):
-                d_lists = pred[1] if len(pred) >= 2 and isinstance(pred[1], list) else None
-                if isinstance(d_lists,
-                              (list,
-                               tuple)) and len(d_lists) >= 2 and isinstance(d_lists[1], list):
-                    d2 = d_lists[1]
+                cand = pred[-1]
+                if isinstance(cand, list):
+                    d2 = cand
 
-        if d2 is None or not isinstance(d2, list) or len(d2) == 0:
+        if not d2 or not isinstance(d2, list):
             return None
 
+        shape = d2[0].shape
         no_autocast = torch.cuda.amp.autocast(
             enabled=False
         ) if torch.cuda.is_available() else contextlib.nullcontext()
         with torch.no_grad(), no_autocast:
             d2 = [t.float() for t in d2]
-            shape = d2[0].shape
-            B = shape[0]
-
-            anchors, strides = (
-                x.transpose(0, 1) for x in make_anchors(d2, detect_head.stride, 0.5)
-            )
-            anchors = anchors.float()
-            strides = strides.float()
-
-            no = detect_head.no
-            regmax = detect_head.reg_max
-            nc_local = detect_head.nc
-
-            cat = torch.cat([di.view(B, no, -1) for di in d2], dim=2)
-            box2, cls2 = cat.split((regmax * 4, nc_local), dim=1)
-
-            pixel_anchor_points2 = anchors.unsqueeze(0) * strides
-            pixel_pred_dist2 = detect_head.dfl2(box2) * strides
-            dbox2 = dist2bbox(pixel_pred_dist2, pixel_anchor_points2, xywh=True, dim=1)
-
-            y_main = torch.cat((dbox2, F.hardsigmoid(cls2)), dim=1)
-            return y_main
+            return head._export_like_from_d2(d2, shape)
 
     callbacks.run("on_train_start")
     LOGGER.info(
@@ -537,10 +515,9 @@ def train(hyp, opt, device, callbacks):
                     loss *= 4.0
 
             if head_observer is not None:
-                with torch.no_grad():
-                    y_main = _export_form_from_training(pred, model)
-                    if isinstance(y_main, torch.Tensor) and y_main.dim() >= 2:
-                        head_observer.update(y_main.detach())
+                y_main = _export_like_from_training(pred, model)
+                if isinstance(y_main, torch.Tensor) and y_main.dim() >= 2:
+                    head_observer.update(y_main.detach())
 
             scaler.scale(loss).backward()
 
@@ -621,20 +598,30 @@ def train(hyp, opt, device, callbacks):
                     head_state = head_observer.state_dict()
                     if head_state is not None:
                         quant_meta = {
-                            "head": head_state, "input": {"range": [0.0, 1.0], "dtype": "float"},
-                            "names": names, "nc": int(nc), "stride": [
+                            "head": head_state,
+                            "input": {"range": [0.0, 1.0], "dtype": "float"},
+                            "names": names,
+                            "nc": int(nc),
+                            "stride": [
                                 int(s) for s in
                                 (model.stride.tolist() if hasattr(model, "stride") else [])
-                            ], "per_channel": bool(opt.int8_per_channel), "momentum":
-                                float(opt.int8_calib_momentum), "note":
-                                    "export-like tensor is [xywh(px), sigmoid(cls)]"
+                            ],
+                            "per_channel": bool(opt.int8_per_channel),
+                            "momentum": float(opt.int8_calib_momentum),
+                            "note": "export-like tensor is [xywh(px), sigmoid(cls)]",
                         }
 
                 ckpt = {
-                    "epoch": epoch, "best_fitness": best_fitness, "model": ckpt_model, "ema":
-                        ckpt_ema, "updates": ema.updates if ema else None, "optimizer":
-                            optimizer.state_dict(), "opt": vars(opt), "git": GIT_INFO, "date":
-                                datetime.now().isoformat(), "int8_calib": quant_meta
+                    "epoch": epoch,
+                    "best_fitness": best_fitness,
+                    "model": ckpt_model,
+                    "ema": ckpt_ema,
+                    "updates": ema.updates if ema else None,
+                    "optimizer": optimizer.state_dict(),
+                    "opt": vars(opt),
+                    "git": GIT_INFO,
+                    "date": datetime.now().isoformat(),
+                    "int8_calib": quant_meta,
                 }
                 torch.save(ckpt, last)
                 if best_fitness == fi:

@@ -60,6 +60,19 @@ class ImageCalibrator:
         self.files = calib_files
         self.iterator = iter(self.files)
 
+    def get_next(self):
+        try:
+            img_path = next(self.iterator)
+            loader = LoadImages(img_path, img_size=self.imgsz, stride=self.stride, auto=False)
+            _, im, _, _, _ = next(iter(loader))
+            if im.dtype != np.float32:
+                im = im.astype(np.float32) / 255.0
+            if len(im.shape) == 3:
+                im = np.expand_dims(im, 0)
+            return {self.input_name: im}
+        except StopIteration:
+            return None
+
 def get_providers(opt_device):
     avail = onnxruntime.get_available_providers()
     if "CUDAExecutionProvider" in avail:
@@ -298,6 +311,17 @@ def quantize_model(opt):
 
     providers = get_providers(opt.device)
 
+    tmp_sess = onnxruntime.InferenceSession(str(model_input_path), providers=providers)
+    input_name = tmp_sess.get_inputs()[0].name
+    model_meta = tmp_sess.get_modelmeta().custom_metadata_map
+    stride = int(model_meta.get("stride", 32))
+    out_shape = tmp_sess.get_outputs()[0].shape  # e.g., [1, C, N]
+    expect_c = out_shape[1] if isinstance(out_shape,
+                                          (list, tuple)) and len(out_shape) >= 2 and isinstance(
+                                              out_shape[1], int
+                                          ) else None
+    del tmp_sess
+
     good_calib_images = list_all_tensors_no_nan_inf(
         model_input_path, candidate_image_paths, opt.imgsz, providers
     )
@@ -306,16 +330,6 @@ def quantize_model(opt):
     )
     if not good_calib_images:
         raise ValueError("No stable images found for calibration.")
-
-    temp_session = onnxruntime.InferenceSession(str(model_input_path), providers=providers)
-    input_name = temp_session.get_inputs()[0].name
-    model_meta = temp_session.get_modelmeta().custom_metadata_map
-    stride = int(model_meta.get("stride", 32))
-    del temp_session
-
-    calibrator = ImageCalibrator(
-        calib_files=good_calib_images, input_name=input_name, imgsz=opt.imgsz, stride=stride
-    )
 
     model_path_for_quant = model_input_path
     model = onnx.load(str(model_input_path))
@@ -333,12 +347,13 @@ def quantize_model(opt):
         model_path_for_quant = preprocessed_model_path
 
     tmp_q_path = model_input_path.with_stem(f"{model_input_path.stem}_int8_tmp")
-
     LOGGER.info("Running Quantization (MinMax, QOperator, Act=QUInt8, W=QInt8)...")
     quantize_static(
         model_input=str(model_path_for_quant),
         model_output=str(tmp_q_path),
-        calibration_data_reader=calibrator,
+        calibration_data_reader=ImageCalibrator(
+            calib_files=good_calib_images, input_name=input_name, imgsz=opt.imgsz, stride=stride
+        ),
         quant_format=QuantFormat.QOperator,
         activation_type=QuantType.QUInt8,
         weight_type=QuantType.QInt8,
@@ -346,27 +361,46 @@ def quantize_model(opt):
         nodes_to_exclude=[],
         calibrate_method=CalibrationMethod.MinMax,
         extra_options={
-            "ActivationSymmetric": False,
-            "WeightSymmetric": True,
-            "EnableSubgraph": True,
-            "ForceQuantizeNoInputCheck": True,
+            "ActivationSymmetric": False, "WeightSymmetric": True, "EnableSubgraph": True,
+            "ForceQuantizeNoInputCheck": True
         },
     )
 
-    calib_meta = read_calib_from_metadata(str(model_input_path))
+    pt_path = opt.pt or str(Path(model_input_path).with_suffix(".pt"))
+    calib_meta = None
+    dq = dq_from_pt(pt_path,
+                    expect_channels=expect_c) if pt_path and Path(pt_path).exists() else None
+    if dq is not None:
+        sc, zp = dq["scale"], dq["zero_point"]
+        if isinstance(sc, np.ndarray):
+            sc = sc.astype(np.float32).reshape(-1)
+            zp = zp.astype(np.float32).reshape(-1)
+            mins = (-zp * sc).tolist()
+            maxs = ((255.0 - zp) * sc).tolist()
+            calib_meta = {"per_channel": True, "min": mins, "max": maxs}
+        else:
+            sc = float(sc)
+            zp = float(zp)
+            minv = -zp * sc
+            maxv = (255.0 - zp) * sc
+            calib_meta = {"per_channel": False, "min": float(minv), "max": float(maxv)}
+        LOGGER.info("Using PT checkpoint calibration for output QuantizeLinear.")
+    else:
+        calib_meta = read_calib_from_metadata(str(model_input_path))
+        if calib_meta is None:
+            LOGGER.info("No PT/ONNX output calibration found; using default 1/255 for outputs.")
+
     LOGGER.info(f"Writing final INT8 model with uint8 outputs -> {model_output_path_uint8}")
     force_uint8_outputs(str(tmp_q_path), str(model_output_path_uint8), calib_meta=calib_meta)
 
-    try:
-        if Path(tmp_q_path).exists():
-            os.remove(tmp_q_path)
-    except Exception:
-        pass
-    try:
-        if model_path_for_quant != model_input_path and Path(model_path_for_quant).exists():
-            os.remove(model_path_for_quant)
-    except Exception:
-        pass
+    for p in [
+        tmp_q_path, model_path_for_quant if model_path_for_quant != model_input_path else None
+    ]:
+        try:
+            if p and Path(p).exists():
+                os.remove(p)
+        except Exception:
+            pass
 
     if not Path(model_output_path_uint8).exists():
         raise RuntimeError(

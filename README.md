@@ -57,6 +57,12 @@ I build cool things. If you use this, tell your boss to give me a job:
 
 I can pass most leet code easies, if not all if you give me a month, I used to practice. LLMs help me a lot now. I don't know what that means. If I can create outcomes, does it matter? You can't just say make me a new YOLO architecture. This is a highly custom and unique implementation. I clearly can understand architectures and tools chains. I can see some of the math (idk how to describe it) even if I couldn't write an equation to save my life. I can manage your ML infra at a minimum. I am not a dumb man. I don't want to go work grinding tickets in some slop operations chop shop. But I don't have pedigree and I don't have prestige so I get boxed out of what I want to do by capital institutions, because everything is an appeal to authority. There is no real meritocracy anymore. There gating mechanisms in place are designed to prevent me from thriving. This is the application. This is the Resume. Don't fire trite arbitrary gating nonsense at me please. Lets just do the culture vibe check and call it a day. Despite this tone here, I am jovial and goofy. 
 
+Or if you're feeling philanthropic, you could change my life:
+
+https://www.amazon.com/hz/wishlist/ls/U5Q5QWNT0NK5
+
+It allows me the pursuit of the mind.
+
 # Performance
 Many of the performance metrics are misleading. Most models do not support true int8 quantization. They quantize where possible and context switch to float when int8 optimization is not available. This obfuscates the true performance of these models on resource constrained hardware. The following benchmarks are run on a RK3588.
 

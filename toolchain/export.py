@@ -70,7 +70,7 @@ def _prepare_model_for_onnx_export(src_model):
         import torch.ao.quantization as tq
         tq.convert(m, inplace=True)
     except Exception:
-        pass  # fall through to soft-disabling below
+        pass
 
     for mod in m.modules():
         try:

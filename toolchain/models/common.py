@@ -19,6 +19,15 @@ class Requant(nn.Module):
         super().__init__()
 
     def forward(self, x):
+        if torch.onnx.is_in_onnx_export():
+            return x.clone()
+        return x
+
+class Silence(nn.Module):
+    def __init__(self):
+        super(Silence, self).__init__()
+
+    def forward(self, x):
         return x
 
 def autopad(k, p=None, d=1):
@@ -54,9 +63,7 @@ class AConv(nn.Module):
         return self.cv1(x)
 
 class RepConvN(nn.Module):
-    """RepConv is a basic rep-style block, including training and deploy status
-    This code is based on https://github.com/DingXiaoH/RepVGG/blob/main/repvgg.py
-    """
+    """RepConv is a basic rep-style block, including training and deploy status."""
     default_act = nn.Hardswish()
 
     def __init__(self, c1, c2, k=3, s=1, p=1, g=1, d=1, act=True, bn=False, deploy=False):
@@ -72,11 +79,9 @@ class RepConvN(nn.Module):
         self.conv2 = Conv(c1, c2, 1, s, p=p - k // 2, g=g, act=False)
 
     def forward_fuse(self, x):
-        """Forward process"""
         return self.act(self.conv(x))
 
     def forward(self, x):
-        """Forward process"""
         id_out = 0 if self.bn is None else self.bn(x)
         return self.act(self.conv1(x) + self.conv2(x) + id_out)
 
@@ -173,12 +178,326 @@ class DFL(nn.Module):
         x = rq(x.softmax(1))
         return self.conv(x).view(b, 4, a)
 
-class Silence(nn.Module):
-    def __init__(self):
-        super(Silence, self).__init__()
+class GatedPool(nn.Module):
+    def __init__(self, kernel_size=5, stride=1):
+        super(GatedPool, self).__init__()
+        padding = (kernel_size - 1) // 2
+        self.gate_conv = nn.Conv2d(1, 1, 1, bias=True)
+        self.gate_act = nn.Hardsigmoid()
+        self.max_pool = nn.MaxPool2d(kernel_size, stride, padding)
+        self.avg_pool = nn.AvgPool2d(kernel_size, stride, padding)
+
+        self.requant_gate_in = Requant()
+        self.requant_mp_in = Requant()
+        self.requant_ap_in = Requant()
+        self.requant_out = Requant()
 
     def forward(self, x):
-        return x
+        gate_input = torch.mean(x, dim=1, keepdim=True)
+        g = self.gate_act(self.gate_conv(self.requant_gate_in(gate_input)))
+        mp = self.max_pool(self.requant_mp_in(x))
+        ap = self.avg_pool(self.requant_ap_in(x))
+        out = ap + g * (mp - ap)
+        return self.requant_out(out)
+
+class GatedSPPF(nn.Module):
+    def __init__(self, c1, c2, k=5):
+        super().__init__()
+        c_ = c1 // 2
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c_ * 4, c2, 1, 1)
+
+        self.m1 = GatedPool(kernel_size=k, stride=1)
+        self.m2 = GatedPool(kernel_size=k, stride=1)
+        self.m3 = GatedPool(kernel_size=k, stride=1)
+
+        self.norm_x = Conv(c_, c_, 1, 1)
+        self.norm_y1 = Conv(c_, c_, 1, 1)
+        self.norm_y2 = Conv(c_, c_, 1, 1)
+        self.norm_y3 = Conv(c_, c_, 1, 1)
+
+        self.requant_cat = Requant()
+
+    def forward(self, x):
+        x_hidden = self.cv1(x)
+
+        y1 = self.m1(x_hidden)
+        y2 = self.m2(y1)
+        y3 = self.m3(y2)
+
+        norm_x = self.norm_x(x_hidden)
+        norm_y1 = self.norm_y1(y1)
+        norm_y2 = self.norm_y2(y2)
+        norm_y3 = self.norm_y3(y3)
+
+        cat = torch.cat([norm_x, norm_y1, norm_y2, norm_y3], 1)
+        return self.cv2(self.requant_cat(cat))
+
+class QuantAdd(nn.Module):
+    def __init__(self, c1, c2):
+        super().__init__()
+        self.cv1 = Conv(c1, c2, 1, 1)
+        self.cv2 = Conv(c2, c2, 1, 1)
+        self.requant = Requant()
+
+    def forward(self, x):
+        rq = getattr(self, "requant", nn.Identity())
+        return rq(self.cv1(x[0]) + self.cv2(x[1]))
+
+class QARepNBottleneck(nn.Module):
+    def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5):
+        super().__init__()
+        c_ = int(c2 * e)
+        self.cv1 = QARepVGGBlockV2(c1, c_, k[0], 1)
+        self.cv2 = Conv(c_, c2, k[1], 1, g=g)
+        self.add = shortcut and c1 == c2
+        if self.add:
+            self.requant = Requant()
+
+    def forward(self, x):
+        if self.add:
+            return self.requant(x + self.cv2(self.cv1(x)))
+        else:
+            return self.cv2(self.cv1(x))
+
+class QARepNCSP(nn.Module):
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        super().__init__()
+        c_ = int(c2 * e)
+        self.cv1 = Conv(c1, c_, 1, 1)
+        self.cv2 = Conv(c1, c_, 1, 1)
+        self.cv3 = Conv(2 * c_, c2, 1)
+        self.m = nn.Sequential(*(QARepNBottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+
+    def forward(self, x):
+        return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
+
+class QARepNCSPELAN(nn.Module):
+    def __init__(self, c1, c2, c3, c4, c5=1):
+        super().__init__()
+        self.c_split = c3 // 2
+        self.cv1 = Conv(c1, c3, 1, 1)
+        self.cv2 = nn.Sequential(QARepNCSP(self.c_split, c4, c5), Conv(c4, c4, 3, 1))
+        self.cv3 = nn.Sequential(QARepNCSP(c4, c4, c5), Conv(c4, c4, 3, 1))
+        self.proj1 = Conv(self.c_split, c2, 1, 1)
+        self.proj2 = Conv(self.c_split, c2, 1, 1)
+        self.proj3 = Conv(c4, c2, 1, 1)
+        self.proj4 = Conv(c4, c2, 1, 1)
+        self.requant = Requant()
+
+    def forward(self, x):
+        y = list(self.cv1(x).chunk(2, 1))
+        y.extend((m(y[-1]) for m in [self.cv2, self.cv3]))
+        p1 = self.proj1(y[0])
+        p2 = self.proj2(y[1])
+        p3 = self.proj3(y[2])
+        p4 = self.proj4(y[3])
+        rq = getattr(self, "requant", nn.Identity())
+        return rq(p1 + p2 + p3 + p4)
+
+class QARepVGGBlockV2(nn.Module):
+    default_act = nn.Hardswish()
+
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        kernel_size=3,
+        stride=1,
+        padding=1,
+        dilation=1,
+        groups=1,
+        padding_mode='zeros',
+        deploy=False,
+        use_se=False
+    ):
+        super(QARepVGGBlockV2, self).__init__()
+        self.deploy = deploy
+        self.groups = groups
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.nonlinearity = self.default_act
+        assert kernel_size == 3 and padding == 1
+        if use_se:
+            raise NotImplementedError('se block not supported yet')
+        else:
+            self.se = nn.Identity()
+        if self.deploy:
+            self.rbr_reparam = nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size,
+                stride,
+                padding=padding,
+                dilation=dilation,
+                groups=groups,
+                bias=True
+            )
+        else:
+            self.rbr_dense = ConvModule(
+                in_channels,
+                out_channels,
+                kernel_size,
+                stride,
+                activation_type=None,
+                padding=padding,
+                groups=groups
+            )
+            self.rbr_1x1 = nn.Conv2d(
+                in_channels, out_channels, kernel_size=1, stride=stride, groups=groups, bias=False
+            )
+            self.rbr_identity = nn.Identity(
+            ) if out_channels == in_channels and stride == 1 else None
+            self.rbr_avg = nn.AvgPool2d(kernel_size=kernel_size, stride=stride, padding=padding) \
+                if out_channels == in_channels and stride == 1 else None
+            self.bn = nn.BatchNorm2d(out_channels)
+            self._id_tensor = None
+
+    def forward(self, inputs):
+        if self.deploy:
+            return self.nonlinearity(self.se(self.rbr_reparam(inputs)))
+        id_out = self.rbr_identity(inputs) if self.rbr_identity is not None else 0
+        avg_out = self.rbr_avg(inputs) if self.rbr_avg is not None else 0
+        return self.nonlinearity(
+            self.bn(self.se(self.rbr_dense(inputs) + self.rbr_1x1(inputs) + id_out + avg_out))
+        )
+
+    def get_equivalent_kernel_bias(self):
+        (kernel3x3, bias3x3) = self._fuse_bn_tensor(self.rbr_dense)
+        kernel = kernel3x3 + self._pad_1x1_to_3x3_tensor(self.rbr_1x1.weight)
+        if self.rbr_avg is not None:
+            kernelavg = self._avg_to_3x3_tensor(self.rbr_avg)
+            kernel = kernel + kernelavg.to(self.rbr_1x1.weight.device)
+        bias = bias3x3
+        if self.rbr_identity is not None:
+            if not hasattr(self, '_id_tensor') or self._id_tensor is None:
+                input_dim = self.in_channels // self.groups
+                kernel_value = np.zeros((self.in_channels, input_dim, 3, 3), dtype=np.float32)
+                for i in range(self.in_channels):
+                    kernel_value[i, i % input_dim, 1, 1] = 1
+                self._id_tensor = torch.from_numpy(kernel_value).to(self.rbr_1x1.weight.device)
+            id_tensor = self._id_tensor
+            kernel = kernel + id_tensor
+        return (kernel, bias)
+
+    def _avg_to_3x3_tensor(self, avgp):
+        channels = self.in_channels
+        groups = self.groups
+        kernel_size = avgp.kernel_size
+        input_dim = channels // groups
+        k = torch.zeros((channels, input_dim, kernel_size, kernel_size))
+        k[np.arange(channels), np.tile(np.arange(input_dim), groups), :, :] = 1.0 / kernel_size**2
+        return k
+
+    def _pad_1x1_to_3x3_tensor(self, kernel1x1):
+        if kernel1x1 is None:
+            return 0
+        else:
+            return torch.nn.functional.pad(kernel1x1, [1, 1, 1, 1])
+
+    def _fuse_bn_tensor(self, branch):
+        if branch is None:
+            return (0, 0)
+        if isinstance(branch, ConvModule):
+            kernel = branch.conv.weight
+            running_mean = branch.bn.running_mean
+            running_var = branch.bn.running_var
+            gamma = branch.bn.weight
+            beta = branch.bn.bias
+            eps = branch.bn.eps
+            std = (running_var + eps).sqrt()
+            t = (gamma / std).reshape(-1, 1, 1, 1)
+            return (kernel * t, beta - running_mean * gamma / std)
+        return (0, 0)
+
+    def switch_to_deploy(self):
+        if self.deploy:
+            return
+        (kernel, bias) = self.get_equivalent_kernel_bias()
+        running_mean = self.bn.running_mean
+        running_var = self.bn.running_var
+        gamma = self.bn.weight
+        beta = self.bn.bias
+        eps = self.bn.eps
+        std = (running_var + eps).sqrt()
+        t = (gamma / std).reshape(-1, 1, 1, 1)
+        fused_kernel = kernel * t
+        fused_bias = beta + (bias - running_mean) * gamma / std
+        self.rbr_reparam = nn.Conv2d(
+            in_channels=self.in_channels,
+            out_channels=self.out_channels,
+            kernel_size=3,
+            stride=self.rbr_dense.conv.stride,
+            padding=1,
+            dilation=self.rbr_dense.conv.dilation,
+            groups=self.groups,
+            bias=True
+        )
+        self.rbr_reparam.weight.data = fused_kernel
+        self.rbr_reparam.bias.data = fused_bias
+        for para in self.parameters():
+            para.detach_()
+        self.__delattr__('rbr_dense')
+        self.__delattr__('rbr_1x1')
+        self.__delattr__('bn')
+        if hasattr(self, 'rbr_identity'):
+            self.__delattr__('rbr_identity')
+        if hasattr(self, 'rbr_avg'):
+            self.__delattr__('rbr_avg')
+        if hasattr(self, 'id_tensor'):
+            self.__delattr__('id_tensor')
+        if hasattr(self, '_id_tensor'):
+            self.__delattr__('_id_tensor')
+        self.deploy = True
+
+class RepBlockAdd(nn.Module):
+    def __init__(
+        self, in_channels, out_channels, n=1, block=QARepVGGBlockV2, basic_block=QARepVGGBlockV2
+    ):
+        super().__init__()
+        self.add = in_channels == out_channels
+        self.conv1 = block(in_channels, out_channels)
+        self.block = nn.Sequential(
+            *(block(out_channels, out_channels) for _ in range(n - 1))
+        ) if n > 1 else None
+        if block == BottleRep:
+            self.conv1 = BottleRep(in_channels, out_channels, basic_block=basic_block, weight=True)
+            n = n // 2
+            self.block = nn.Sequential(
+                *(
+                    BottleRep(out_channels, out_channels, basic_block=basic_block, weight=True)
+                    for _ in range(n - 1)
+                )
+            ) if n > 1 else None
+        self.requant = Requant() if self.add else nn.Identity()
+
+    def forward(self, x):
+        identity = x
+        out = self.conv1(x)
+        if self.block is not None:
+            out = self.block(out)
+        out = out + identity if self.add else out
+        rq = getattr(self, "requant", nn.Identity())
+        return rq(out)
+
+class BottleRep(nn.Module):
+    def __init__(self, in_channels, out_channels, basic_block=QARepVGGBlockV2, weight=False):
+        super().__init__()
+        self.conv1 = basic_block(in_channels, out_channels)
+        self.conv2 = basic_block(out_channels, out_channels)
+        if in_channels != out_channels:
+            self.shortcut = False
+        else:
+            self.shortcut = True
+        if weight:
+            self.alpha = Parameter(torch.ones(1))
+        else:
+            self.alpha = 1.0
+
+    def forward(self, x):
+        outputs = self.conv1(x)
+        outputs = self.conv2(outputs)
+        return outputs + self.alpha * x if self.shortcut else outputs
 
 class DetectMultiBackend(nn.Module):
     def __init__(
@@ -366,7 +685,7 @@ class ConvModule(nn.Module):
         )
         self.bn = nn.BatchNorm2d(out_channels)
         if activation_type is not None:
-            self.act = nn.Hardswish()
+            self.act = Conv.default_act
         self.activation_type = activation_type
 
     def forward(self, x):
@@ -378,302 +697,3 @@ class ConvModule(nn.Module):
         if self.activation_type is None:
             return self.conv(x)
         return self.act(self.conv(x))
-
-class QARepVGGBlockV2(nn.Module):
-    def __init__(
-        self,
-        in_channels,
-        out_channels,
-        kernel_size=3,
-        stride=1,
-        padding=1,
-        dilation=1,
-        groups=1,
-        padding_mode='zeros',
-        deploy=False,
-        use_se=False
-    ):
-        super(QARepVGGBlockV2, self).__init__()
-        self.deploy = deploy
-        self.groups = groups
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.nonlinearity = nn.Hardswish()
-        assert kernel_size == 3 and padding == 1
-        if use_se:
-            raise NotImplementedError('se block not supported yet')
-        else:
-            self.se = nn.Identity()
-        if self.deploy:
-            self.rbr_reparam = nn.Conv2d(
-                in_channels,
-                out_channels,
-                kernel_size,
-                stride,
-                padding=padding,
-                dilation=dilation,
-                groups=groups,
-                bias=True
-            )
-        else:
-            self.rbr_dense = ConvModule(
-                in_channels,
-                out_channels,
-                kernel_size,
-                stride,
-                activation_type=None,
-                padding=padding,
-                groups=groups
-            )
-            self.rbr_1x1 = nn.Conv2d(
-                in_channels, out_channels, kernel_size=1, stride=stride, groups=groups, bias=False
-            )
-            self.rbr_identity = nn.Identity(
-            ) if out_channels == in_channels and stride == 1 else None
-            self.rbr_avg = nn.AvgPool2d(
-                kernel_size=kernel_size, stride=stride, padding=padding
-            ) if out_channels == in_channels and stride == 1 else None
-            self.bn = nn.BatchNorm2d(out_channels)
-            self._id_tensor = None
-
-    def forward(self, inputs):
-        if self.deploy:
-            return self.nonlinearity(self.se(self.rbr_reparam(inputs)))
-        id_out = self.rbr_identity(inputs) if self.rbr_identity is not None else 0
-        avg_out = self.rbr_avg(inputs) if self.rbr_avg is not None else 0
-        return self.nonlinearity(
-            self.bn(self.se(self.rbr_dense(inputs) + self.rbr_1x1(inputs) + id_out + avg_out))
-        )
-
-    def get_equivalent_kernel_bias(self):
-        (kernel3x3, bias3x3) = self._fuse_bn_tensor(self.rbr_dense)
-        kernel = kernel3x3 + self._pad_1x1_to_3x3_tensor(self.rbr_1x1.weight)
-        if self.rbr_avg is not None:
-            kernelavg = self._avg_to_3x3_tensor(self.rbr_avg)
-            kernel = kernel + kernelavg.to(self.rbr_1x1.weight.device)
-        bias = bias3x3
-        if self.rbr_identity is not None:
-            if not hasattr(self, '_id_tensor') or self._id_tensor is None:
-                input_dim = self.in_channels // self.groups
-                kernel_value = np.zeros((self.in_channels, input_dim, 3, 3), dtype=np.float32)
-                for i in range(self.in_channels):
-                    kernel_value[i, i % input_dim, 1, 1] = 1
-                self._id_tensor = torch.from_numpy(kernel_value).to(self.rbr_1x1.weight.device)
-            id_tensor = self._id_tensor
-            kernel = kernel + id_tensor
-        return (kernel, bias)
-
-    def _avg_to_3x3_tensor(self, avgp):
-        channels = self.in_channels
-        groups = self.groups
-        kernel_size = avgp.kernel_size
-        input_dim = channels // groups
-        k = torch.zeros((channels, input_dim, kernel_size, kernel_size))
-        k[np.arange(channels), np.tile(np.arange(input_dim), groups), :, :] = 1.0 / kernel_size**2
-        return k
-
-    def _pad_1x1_to_3x3_tensor(self, kernel1x1):
-        if kernel1x1 is None:
-            return 0
-        else:
-            return torch.nn.functional.pad(kernel1x1, [1, 1, 1, 1])
-
-    def _fuse_bn_tensor(self, branch):
-        if branch is None:
-            return (0, 0)
-        if isinstance(branch, ConvModule):
-            kernel = branch.conv.weight
-            running_mean = branch.bn.running_mean
-            running_var = branch.bn.running_var
-            gamma = branch.bn.weight
-            beta = branch.bn.bias
-            eps = branch.bn.eps
-            std = (running_var + eps).sqrt()
-            t = (gamma / std).reshape(-1, 1, 1, 1)
-            return (kernel * t, beta - running_mean * gamma / std)
-        return (0, 0)
-
-    def switch_to_deploy(self):
-        if self.deploy:
-            return
-        (kernel, bias) = self.get_equivalent_kernel_bias()
-        running_mean = self.bn.running_mean
-        running_var = self.bn.running_var
-        gamma = self.bn.weight
-        beta = self.bn.bias
-        eps = self.bn.eps
-        std = (running_var + eps).sqrt()
-        t = (gamma / std).reshape(-1, 1, 1, 1)
-        fused_kernel = kernel * t
-        fused_bias = beta + (bias - running_mean) * gamma / std
-        self.rbr_reparam = nn.Conv2d(
-            in_channels=self.in_channels,
-            out_channels=self.out_channels,
-            kernel_size=3,
-            stride=self.rbr_dense.conv.stride,
-            padding=1,
-            dilation=self.rbr_dense.conv.dilation,
-            groups=self.groups,
-            bias=True
-        )
-        self.rbr_reparam.weight.data = fused_kernel
-        self.rbr_reparam.bias.data = fused_bias
-        for para in self.parameters():
-            para.detach_()
-        self.__delattr__('rbr_dense')
-        self.__delattr__('rbr_1x1')
-        self.__delattr__('bn')
-        if hasattr(self, 'rbr_identity'):
-            self.__delattr__('rbr_identity')
-        if hasattr(self, 'rbr_avg'):
-            self.__delattr__('rbr_avg')
-        if hasattr(self, 'id_tensor'):
-            self.__delattr__('id_tensor')
-        if hasattr(self, '_id_tensor'):
-            self.__delattr__('_id_tensor')
-        self.deploy = True
-
-class RepBlockAdd(nn.Module):
-    def __init__(
-        self, in_channels, out_channels, n=1, block=QARepVGGBlockV2, basic_block=QARepVGGBlockV2
-    ):
-        super().__init__()
-        self.add = in_channels == out_channels
-        self.conv1 = block(in_channels, out_channels)
-        self.block = nn.Sequential(
-            *(block(out_channels, out_channels) for _ in range(n - 1))
-        ) if n > 1 else None
-        if block == BottleRep:
-            self.conv1 = BottleRep(in_channels, out_channels, basic_block=basic_block, weight=True)
-            n = n // 2
-            self.block = nn.Sequential(
-                *(
-                    BottleRep(out_channels, out_channels, basic_block=basic_block, weight=True)
-                    for _ in range(n - 1)
-                )
-            ) if n > 1 else None
-        self.requant = Requant() if self.add else nn.Identity()
-
-    def forward(self, x):
-        identity = x
-        out = self.conv1(x)
-        if self.block is not None:
-            out = self.block(out)
-        out = out + identity if self.add else out
-        rq = getattr(self, "requant", nn.Identity())
-        return rq(out)
-
-class BottleRep(nn.Module):
-    def __init__(self, in_channels, out_channels, basic_block=QARepVGGBlockV2, weight=False):
-        super().__init__()
-        self.conv1 = basic_block(in_channels, out_channels)
-        self.conv2 = basic_block(out_channels, out_channels)
-        if in_channels != out_channels:
-            self.shortcut = False
-        else:
-            self.shortcut = True
-        if weight:
-            self.alpha = Parameter(torch.ones(1))
-        else:
-            self.alpha = 1.0
-
-    def forward(self, x):
-        outputs = self.conv1(x)
-        outputs = self.conv2(outputs)
-        return outputs + self.alpha * x if self.shortcut else outputs
-
-class GatedPool(nn.Module):
-    def __init__(self, kernel_size=5, stride=1):
-        super(GatedPool, self).__init__()
-        padding = (kernel_size - 1) // 2
-        self.gate_conv = nn.Conv2d(1, 1, 1, bias=True)
-        self.gate_act = nn.Hardsigmoid()
-        self.max_pool = nn.MaxPool2d(kernel_size, stride, padding)
-        self.avg_pool = nn.AvgPool2d(kernel_size, stride, padding)
-
-    def forward(self, x):
-        gate_input = torch.mean(x, dim=1, keepdim=True)
-        g = self.gate_act(self.gate_conv(gate_input))
-        mp = self.max_pool(x)
-        ap = self.avg_pool(x)
-        return ap + g * (mp - ap)
-
-class GatedSPPF(nn.Module):
-    def __init__(self, c1, c2, k=5):
-        super().__init__()
-        c_ = c1 // 2
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c_ * 4, c2, 1, 1)
-        self.m = GatedPool(kernel_size=k, stride=1)
-        self.norm_x = Conv(c_, c_, 1, 1)
-        self.norm_y1 = Conv(c_, c_, 1, 1)
-        self.norm_y2 = Conv(c_, c_, 1, 1)
-        self.norm_y3 = Conv(c_, c_, 1, 1)
-
-    def forward(self, x):
-        x_hidden = self.cv1(x)
-        y1 = self.m(x_hidden)
-        y2 = self.m(y1)
-        y3 = self.m(y2)
-        norm_x = self.norm_x(x_hidden)
-        norm_y1 = self.norm_y1(y1)
-        norm_y2 = self.norm_y2(y2)
-        norm_y3 = self.norm_y3(y3)
-        return self.cv2(torch.cat([norm_x, norm_y1, norm_y2, norm_y3], 1))
-
-class QuantAdd(nn.Module):
-    def __init__(self, c1, c2):
-        super().__init__()
-        self.cv1 = Conv(c1, c2, 1, 1)
-        self.cv2 = Conv(c2, c2, 1, 1)
-        self.requant = Requant()
-
-    def forward(self, x):
-        rq = getattr(self, "requant", nn.Identity())
-        return rq(self.cv1(x[0]) + self.cv2(x[1]))
-
-class QARepNBottleneck(nn.Module):
-    def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5):
-        super().__init__()
-        c_ = int(c2 * e)
-        self.cv1 = QARepVGGBlockV2(c1, c_, k[0], 1)
-        self.cv2 = Conv(c_, c2, k[1], 1, g=g)
-        self.add = shortcut and c1 == c2
-
-    def forward(self, x):
-        return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
-
-class QARepNCSP(nn.Module):
-    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
-        super().__init__()
-        c_ = int(c2 * e)
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c1, c_, 1, 1)
-        self.cv3 = Conv(2 * c_, c2, 1)
-        self.m = nn.Sequential(*(QARepNBottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
-
-    def forward(self, x):
-        return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
-
-class QARepNCSPELAN(nn.Module):
-    def __init__(self, c1, c2, c3, c4, c5=1):
-        super().__init__()
-        self.c_split = c3 // 2
-        self.cv1 = Conv(c1, c3, 1, 1)
-        self.cv2 = nn.Sequential(QARepNCSP(self.c_split, c4, c5), Conv(c4, c4, 3, 1))
-        self.cv3 = nn.Sequential(QARepNCSP(c4, c4, c5), Conv(c4, c4, 3, 1))
-        self.proj1 = Conv(self.c_split, c2, 1, 1)
-        self.proj2 = Conv(self.c_split, c2, 1, 1)
-        self.proj3 = Conv(c4, c2, 1, 1)
-        self.proj4 = Conv(c4, c2, 1, 1)
-        self.requant = Requant()
-
-    def forward(self, x):
-        y = list(self.cv1(x).chunk(2, 1))
-        y.extend((m(y[-1]) for m in [self.cv2, self.cv3]))
-        p1 = self.proj1(y[0])
-        p2 = self.proj2(y[1])
-        p3 = self.proj3(y[2])
-        p4 = self.proj4(y[3])
-        rq = getattr(self, "requant", nn.Identity())
-        return rq(p1 + p2 + p3 + p4)

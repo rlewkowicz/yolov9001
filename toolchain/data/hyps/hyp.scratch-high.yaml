@@ -25,13 +25,13 @@ optimizer:
     warmup_bias_lr: 1
   AdamW:
     lr_scheduler_type: cosine
-    lr0: 0.0045
+    lr0: 0.0075
     lrf: 0.01
     b1: 0.937
     b2: 0.999
     eps: 0.0000001 
     weight_decay: 0.0005
-    warmup_epochs: 6
+    warmup_epochs: 5
     warmup_momentum: 0.8
     warmup_bias_lr: 0.002
 box: 7.5
