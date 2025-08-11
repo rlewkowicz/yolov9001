@@ -16,7 +16,6 @@ from onnxruntime.quantization.shape_inference import quant_pre_process
 from scipy.spatial.distance import cosine
 from tqdm import tqdm
 import torch
-import torch.nn.functional as F
 import ast
 
 FILE = Path(__file__).resolve()
@@ -28,7 +27,6 @@ ROOT = Path(os.path.relpath(ROOT, Path.cwd()))
 from utils.dataloaders import LoadImages
 from utils.general import LOGGER, print_args, check_img_size, increment_path, scale_boxes, non_max_suppression
 from utils.plots import Annotator, colors
-from utils.tal.anchor_generator import make_anchors, dist2bbox
 
 def safe_cosine(a: np.ndarray, b: np.ndarray) -> float:
     if a.size == 0 or b.size == 0:
@@ -74,18 +72,25 @@ class ImageCalibrator:
 
 def get_providers(opt_device):
     avail = onnxruntime.get_available_providers()
-    if "CUDAExecutionProvider" in avail and opt_device != 'cpu':
+    if "CUDAExecutionProvider" in avail and opt_device != "cpu":
         return ["CUDAExecutionProvider"] + (["CPUExecutionProvider"] if "CPUExecutionProvider" in avail else [])
     return ["CPUExecutionProvider"]
 
 def create_debug_session(model_path, providers, disable_optim=False):
+    if model_path is None:
+        raise ValueError("create_debug_session: model_path is None")
     model_path = str(model_path)
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"create_debug_session: model not found: {model_path}")
     model = onnx.load(model_path)
     model = shape_inference.infer_shapes(model)
-    tensor_type_map = {tensor.name: tensor.data_type for tensor in model.graph.initializer}
+    tensor_type_map = {}
+    for tensor in model.graph.initializer:
+        tensor_type_map[tensor.name] = tensor.data_type
     for tensor_info in list(model.graph.input) + list(model.graph.value_info) + list(model.graph.output):
-        if tensor_info.name not in tensor_type_map:
-            tensor_type_map[tensor_info.name] = tensor_info.type.tensor_type.elem_type
+        if tensor_info.name in tensor_type_map:
+            continue
+        tensor_type_map[tensor_info.name] = tensor_info.type.tensor_type.elem_type
     all_tensor_names = {tensor.name for tensor in model.graph.initializer}
     for node in model.graph.node:
         all_tensor_names.update(node.input)
@@ -96,141 +101,327 @@ def create_debug_session(model_path, providers, disable_optim=False):
             data_type = tensor_type_map.get(name)
             output_tensor_info = onnx.helper.make_tensor_value_info(name, data_type, None)
             model.graph.output.append(output_tensor_info)
-    so = onnxruntime.SessionOptions()
+    import onnxruntime as ort
+    so = ort.SessionOptions()
     if disable_optim:
-        so.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_DISABLE_ALL
-    session = onnxruntime.InferenceSession(model.SerializeToString(), sess_options=so, providers=providers)
-    return session, [output.name for output in session.get_outputs()]
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    session = ort.InferenceSession(model.SerializeToString(), sess_options=so, providers=providers)
+    output_names = [output.name for output in session.get_outputs()]
+    return session, output_names
 
 def create_session(model_path, providers, disable_optim=False):
-    so = onnxruntime.SessionOptions()
+    import onnxruntime as ort
+    so = ort.SessionOptions()
     if disable_optim:
-        so.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_DISABLE_ALL
-    return onnxruntime.InferenceSession(str(model_path), sess_options=so, providers=providers)
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    return ort.InferenceSession(str(model_path), sess_options=so, providers=providers)
 
 def list_all_tensors_no_nan_inf(model_path, candidate_image_paths, imgsz, providers):
     session, output_names = create_debug_session(str(model_path), providers)
     input_name = session.get_inputs()[0].name
     good = []
+    total = 0
     loader = LoadImages(candidate_image_paths, img_size=imgsz, auto=False)
     for path, im, _, _, _ in tqdm(loader, desc="Screening images"):
-        x = im.astype(np.float32) / 255.0
+        total += 1
+        x = im
+        if x.dtype != np.float32:
+            x = x.astype(np.float32) / 255.0
         if len(x.shape) == 3:
             x = np.expand_dims(x, 0)
         try:
             outs = session.run(output_names, {input_name: x})
-            if not any(np.isnan(arr).any() or np.isinf(arr).any() for arr in outs):
+            bad = any(np.isnan(arr).any() or np.isinf(arr).any() for arr in outs)
+            if not bad:
                 good.append(path)
         except Exception:
             pass
-    LOGGER.info(f"[Calib screening] {len(good)}/{len(loader)} images passed (no NaN/Inf in any intermediate tensor).")
+    LOGGER.info(f"[Calib screening] {len(good)}/{total} images passed (no NaN/Inf in any intermediate tensor).")
     return good
 
-def force_uint8_outputs(model_path_in, model_path_out, calib_meta=None):
-    model = onnx.load(model_path_in)
-    graph = model.graph
-    output_node = graph.output[0]
-    if output_node.type.tensor_type.elem_type == onnx.TensorProto.UINT8:
-        onnx.save(model, model_path_out)
-        return
-    final_dequant = None
-    for n in reversed(graph.node):
-        if n.output and n.output[0] == output_node.name and n.op_type == "DequantizeLinear":
-            final_dequant = n
-            break
-    if final_dequant is None:
-        raise RuntimeError("Final DequantizeLinear not found")
-    pre_dq_name = final_dequant.input[0]
-    final_concat = None
-    for n in reversed(graph.node):
-        if n.output and n.output[0] == pre_dq_name and n.op_type == "Concat":
-            final_concat = n
-            break
-    if final_concat is None:
-        raise RuntimeError("Concat feeding final DequantizeLinear not found")
-    cls_in_name = None
-    box_in_name = None
-    for inp in final_concat.input:
-        src = None
-        for n in reversed(graph.node):
-            if n.output and n.output[0] == inp:
-                src = n
-                break
-        if src is not None and src.op_type == "Hardsigmoid":
-            cls_in_name = src.input[0]
+def read_calib_from_metadata(fp32_model_path):
+    try:
+        m = onnx.load(fp32_model_path)
+        kv = {p.key: p.value for p in m.metadata_props}
+        if not kv.get("int8_calib_present", "False") in ("True", "true", "1"):
+            return None
+        per_channel = kv.get("int8_per_channel", "True") in ("True", "true", "1")
+        ch = int(kv.get("int8_channels", "0"))
+        head_min = kv.get("int8_head_min", None)
+        head_max = kv.get("int8_head_max", None)
+        if head_min is not None:
+            head_min = ast.literal_eval(head_min)
+        if head_max is not None:
+            head_max = ast.literal_eval(head_max)
+        return {"per_channel": per_channel, "channels": ch, "min": head_min, "max": head_max}
+    except Exception:
+        return None
+
+def _dump_tail_nodes(graph, k=100):
+    n = len(graph.node)
+    start = max(0, n - k)
+    rows = []
+    for i in range(start, n):
+        node = graph.node[i]
+        rows.append((i, node.op_type, node.name if node.name else "-", ",".join(node.input), ",".join(node.output)))
+    print("\nLast {} nodes:".format(min(k, n)))
+    print_side_by_side_table(rows, ["idx", "op", "name", "inputs", "outputs"])
+
+def _build_maps(graph):
+    prod = {}
+    for node in graph.node:
+        for o in node.output:
+            prod[o] = node
+    return prod
+
+def _walk_back_to_concat(graph, start_tensor, max_hops=200):
+    passthrough = {"Reshape", "Transpose", "Identity", "Squeeze", "Unsqueeze", "Cast"}
+    prod = _build_maps(graph)
+    cur_tensors, visited, hops = [start_tensor], set(), 0
+    while cur_tensors and hops < max_hops:
+        nxt = []
+        for t in cur_tensors:
+            if t in visited: 
+                continue
+            visited.add(t)
+            node = prod.get(t)
+            if not node:
+                continue
+            if node.op_type in {"Concat", "QLinearConcat"}:
+                return node
+            if node.op_type in passthrough or node.op_type in {"QuantizeLinear", "DequantizeLinear"}:
+                nxt.extend(node.input)
+        cur_tensors = nxt
+        hops += 1
+    return None
+
+
+def _find_activation_input_for_tensor(graph, tensor_name):
+    prod = _build_maps(graph)
+    node = prod.get(tensor_name, None)
+    passthrough = {"Reshape", "Transpose", "Identity", "Squeeze", "Unsqueeze", "Cast", "QuantizeLinear", "DequantizeLinear"}
+    while node is not None:
+        if node.op_type in {"Sigmoid", "HardSigmoid"}:
+            return node.input[0]
+        if node.op_type in passthrough and len(node.input) > 0:
+            node = _build_maps(graph).get(node.input[0], None)
         else:
-            box_in_name = inp if box_in_name is None else box_in_name
-    if cls_in_name is None:
-        raise RuntimeError("Hardsigmoid feeding class branch not found")
-    new_concat_out = "concat_boxes_logits"
-    new_concat = onnx.helper.make_node(
+            return None
+    return None
+
+def force_uint8_outputs(model_path_in, model_path_out, calib_meta):
+    """
+    Surgery for 'logits' output: replace final prob concat with concat of [boxes..., class_logits],
+    then QuantizeLinear to uint8 using provided calib (min/max). Robust to QLinearConcat tails.
+
+    calib_meta: dict with keys:
+      - "min": scalar or (C,) list/ndarray
+      - "max": scalar or (C,) list/ndarray
+      - optional "axis": int (channel axis for per-channel quant; default=1)
+    """
+    import onnx
+    import numpy as np
+    from onnx import helper, TensorProto, numpy_helper, shape_inference
+
+    if calib_meta is None or "min" not in calib_meta or "max" not in calib_meta:
+        raise ValueError("force_uint8_outputs: calib_meta with 'min' and 'max' is required.")
+
+    def get_attr(node, name, default=None):
+        for a in node.attribute:
+            if a.name == name:
+                return a.i
+        return default
+
+    def producers_map(graph):
+        mp = {}
+        for n in graph.node:
+            for o in n.output:
+                mp[o] = n
+        return mp
+
+    def rank_of_value(graph, name):
+        vis = list(graph.value_info) + list(graph.input) + list(graph.output)
+        for vi in vis:
+            if vi.name == name:
+                tt = vi.type.tensor_type
+                if tt.HasField("shape"):
+                    return len(tt.shape.dim)
+        return None  # unknown
+
+    def mk_scale_zp(mins, maxs):
+        s = (maxs - mins) / 255.0
+        s = np.where(s <= 1e-12, 1.0, s).astype(np.float32)
+        zp = np.round(-mins / s).astype(np.int32)
+        zp = np.clip(zp, 0, 255).astype(np.uint8)
+        return s, zp
+
+    m = onnx.load(model_path_in)
+    m = shape_inference.infer_shapes(m)
+    g = m.graph
+    prod = producers_map(g)
+
+    if not g.output:
+        raise RuntimeError("Model has no outputs.")
+    out_vi = g.output[0]
+    float_out_name = out_vi.name
+    dq = prod.get(float_out_name, None)
+    if not dq or dq.op_type != "DequantizeLinear":
+        raise RuntimeError("Expected final DequantizeLinear feeding the model output.")
+
+    parent = prod.get(dq.input[0], None)
+    if not parent or parent.op_type not in ("Concat", "QLinearConcat"):
+        raise RuntimeError("Tail pattern unsupported: expected (Q)Concat feeding final DequantizeLinear.")
+
+    axis = get_attr(parent, "axis", 1)
+
+    data_inputs = []
+    if parent.op_type == "Concat":
+        data_inputs = list(parent.input)
+    else:  # QLinearConcat: inputs are [y_scale, y_zp, x0, x0_scale, x0_zp, x1, x1_scale, x1_zp, ...]
+        pins = list(parent.input)
+        if len(pins) < 5:
+            raise RuntimeError("QLinearConcat malformed (too few inputs).")
+        if (len(pins) - 2) % 3 != 0:
+            raise RuntimeError("QLinearConcat inputs not in expected triplets after first two.")
+        data_inputs = [pins[i] for i in range(2, len(pins), 3)]
+
+    box_float_inputs = []
+    cls_prob_float = None
+    cls_prob_node = None
+
+    for t in data_inputs:
+        n = prod.get(t, None)
+        t_float = t
+        if n and n.op_type == "QuantizeLinear":
+            t_float = n.input[0]
+            n = prod.get(t_float, None)
+
+        if n and n.op_type in ("HardSigmoid", "Sigmoid"):
+            cls_prob_float = t_float
+            cls_prob_node = n
+        else:
+            box_float_inputs.append(t_float)
+
+    if cls_prob_node is None:
+        raise RuntimeError("Could not find class probability branch (HardSigmoid/Sigmoid) feeding final concat.")
+
+    cls_logits = cls_prob_node.input[0]
+
+    candidate_inputs = box_float_inputs + [cls_logits]
+    known_ranks = [rank_of_value(g, nm) for nm in candidate_inputs]
+    kr = [r for r in known_ranks if r is not None]
+    if kr:
+        r0 = kr[0]
+        if any(r != r0 for r in kr):
+            raise RuntimeError(f"New_Concat_Logits would mix tensors of different ranks: {known_ranks}.")
+        if not (-r0 <= axis <= r0 - 1):
+            raise RuntimeError(f"Concat axis {axis} invalid for rank {r0} tensors.")
+
+    raw_concat_out = float_out_name + "_logits_concat"
+    new_concat = helper.make_node(
         "Concat",
-        inputs=[box_in_name, cls_in_name],
-        outputs=[new_concat_out],
-        name="Concat_Boxes_Logits",
-        axis=1,
+        inputs=candidate_inputs,
+        outputs=[raw_concat_out],
+        name="New_Concat_Logits",
+        axis=axis,
     )
+
+    g.node.remove(parent)
+    g.node.remove(dq)
+
     mins = np.array(calib_meta["min"], dtype=np.float32)
     maxs = np.array(calib_meta["max"], dtype=np.float32)
-    scale = (maxs - mins) / 255.0
-    scale = np.where(scale <= 1e-12, 1.0, scale).astype(np.float32)
-    zp = np.round(-mins / scale).astype(np.uint8)
+    scale, zp = mk_scale_zp(mins, maxs)
+
+    q_axis = int(calib_meta.get("axis", 1))
+    per_channel = scale.ndim > 0 and scale.size > 1
+
     scale_name = "final_out_scale"
     zp_name = "final_out_zp"
-    out_q_name = f"{output_node.name}_uint8"
-    q_node = onnx.helper.make_node(
-        "QuantizeLinear",
-        inputs=[new_concat_out, scale_name, zp_name],
-        outputs=[out_q_name],
-        name="QuantizeLinear_FinalOutput",
-        axis=1,
-    )
-    graph.node.remove(final_dequant)
-    graph.node.remove(final_concat)
-    graph.node.extend([new_concat, q_node])
-    graph.initializer.extend([
+    out_uint8 = float_out_name + "_uint8"
+
+    for i in range(len(g.initializer) - 1, -1, -1):
+        if g.initializer[i].name in (scale_name, zp_name):
+            del g.initializer[i]
+
+    if per_channel:
+        scale_arr = scale.reshape(-1).astype(np.float32)
+        zp_arr = zp.reshape(-1).astype(np.uint8)
+    else:
+        scale_arr = np.array([float(scale)], dtype=np.float32)
+        zp_arr = np.array([int(zp)], dtype=np.uint8)
+
+    g.initializer.extend([
         onnx.helper.make_tensor(scale_name, onnx.TensorProto.FLOAT, scale.shape, scale),
-        onnx.helper.make_tensor(zp_name, onnx.TensorProto.UINT8, zp.shape, zp),
+        onnx.helper.make_tensor(zp_name, onnx.TensorProto.UINT8, zp.shape, zp)
     ])
-    output_node.name = out_q_name
-    output_node.type.tensor_type.elem_type = onnx.TensorProto.UINT8
-    onnx.checker.check_model(model)
-    onnx.save(model, model_path_out)
-    
-def get_nc_and_regmax(session, fallback_nc=80, fallback_regmax=None):
-    nc = None
-    regmax = fallback_regmax
-    try:
-        meta = session.get_modelmeta().custom_metadata_map
-        names = eval(meta.get("names", "None"))
-        if names is not None:
-            nc = len(names)
-    except Exception:
-        pass
-    if nc is None:
-        nc = fallback_nc
-    return nc, regmax
-    
+
+    q_attrs = []
+    if per_channel:
+        q_attrs.append(helper.make_attribute("axis", q_axis))
+
+    q_node = helper.make_node(
+        "QuantizeLinear",
+        inputs=[raw_concat_out, scale_name, zp_name],
+        outputs=[out_uint8],
+        name="QuantizeLinear_FinalOutput",
+    )
+    for a in q_attrs:
+        q_node.attribute.append(a)
+
+    g.node.extend([new_concat, q_node])
+    out_vi.name = out_uint8
+    out_vi.type.tensor_type.elem_type = TensorProto.UINT8
+
+    m = shape_inference.infer_shapes(m)
+    onnx.checker.check_model(m)
+    onnx.save(m, model_path_out)
+    LOGGER.info("Successfully restructured ONNX graph to output quantized logits and saved to %s", model_path_out)
+
+
 def dq_from_pt(pt_path, expect_channels=None):
     try:
         ckpt = torch.load(pt_path, map_location="cpu", weights_only=False)
     except Exception:
         return None
-    calib_root = ckpt.get("int8_calib", {}) if isinstance(ckpt, dict) else {}
-    calib = calib_root.get("head_logits", None)
-    if calib is None:
-        calib = calib_root.get("head", None)
-    if not calib or "min" not in calib or "max" not in calib:
+    calib = None
+    if isinstance(ckpt, dict):
+        calib = ckpt.get("int8_calib", None)
+        if isinstance(calib, dict):
+            calib = calib.get("head", None)
+    if calib is None or ("min" not in calib or "max" not in calib):
         return None
-    mins = np.array(calib["min"], dtype=np.float32).reshape(-1)
-    maxs = np.array(calib["max"], dtype=np.float32).reshape(-1)
-    if expect_channels is not None and mins.shape[0] != expect_channels:
-        return None
-    scale = (maxs - mins) / 255.0
-    scale = np.where(scale <= 1e-12, 1.0, scale).astype(np.float32)
-    zp = np.round(-mins / scale).clip(0, 255).astype(np.uint8)
-    return {"scale": scale, "zero_point": zp, "axis": 1}
+    per_channel = bool(calib.get("per_channel", True))
+    mins = calib.get("min")
+    maxs = calib.get("max")
+    if per_channel:
+        mins = np.array(mins, dtype=np.float32).reshape(-1)
+        maxs = np.array(maxs, dtype=np.float32).reshape(-1)
+        if expect_channels is not None and mins.shape[0] != expect_channels:
+            return None
+        scale = (maxs - mins) / 255.0
+        scale = np.where(scale <= 1e-12, 1.0, scale).astype(np.float32)
+        zp = np.round(-mins / scale).astype(np.int32)
+        zp = np.clip(zp, 0, 255).astype(np.uint8)
+        return {"scale": scale, "zero_point": zp, "axis": 1}
+    else:
+        mins = float(mins if not isinstance(mins, (list, tuple)) else mins[0])
+        maxs = float(maxs if not isinstance(maxs, (list, tuple)) else maxs[0])
+        sc = (maxs - mins) / 255.0 if (maxs - mins) > 1e-12 else 1.0
+        zp = int(np.clip(round(-mins / sc), 0, 255))
+        return {"scale": float(sc), "zero_point": int(zp)}
 
+def print_dq(label, dq):
+    if dq is None:
+        print(f"\n[Dequant] {label}: None")
+        return
+    sc = dq["scale"]
+    zp = dq["zero_point"]
+    ax = dq.get("axis", 1)
+    if isinstance(sc, np.ndarray):
+        print(f"\n[Dequant] {label}: axis={ax}, per-channel={sc.shape[0]} | scale[min={sc.min():.6g}, max={sc.max():.6g}] zp[min={int(zp.min())}, max={int(zp.max())}]")
+    else:
+        print(f"\n[Dequant] {label}: axis={ax}, per-tensor | scale={float(sc):.6g}, zp={int(zp)}")
 
 def quantize_model(opt):
     model_input_path = Path(opt.weights)
@@ -246,42 +437,68 @@ def quantize_model(opt):
     providers = get_providers(opt.device)
     tmp_sess = onnxruntime.InferenceSession(str(model_input_path), providers=providers)
     input_name = tmp_sess.get_inputs()[0].name
-    stride = int(tmp_sess.get_modelmeta().custom_metadata_map.get("stride", 32))
+    model_meta = tmp_sess.get_modelmeta().custom_metadata_map
+    stride = int(model_meta.get("stride", 32))
+    out_shape = tmp_sess.get_outputs()[0].shape
+    expect_c = out_shape[1] if isinstance(out_shape, (list, tuple)) and len(out_shape) >= 2 and isinstance(out_shape[1], int) else None
     del tmp_sess
     good_calib_images = list_all_tensors_no_nan_inf(model_input_path, candidate_image_paths, opt.imgsz, providers)
+    LOGGER.info(f"Calibration images passing NaN/Inf check: {len(good_calib_images)}/{len(candidate_image_paths)}")
     if not good_calib_images:
         raise ValueError("No stable images found for calibration.")
-    
+    model_path_for_quant = model_input_path
+    model = onnx.load(str(model_input_path))
+    if not model_has_pre_process_metadata(model):
+        preprocessed_model_path = model_input_path.with_stem(f"{model_input_path.stem}-preprocessed")
+        quant_pre_process(
+            input_model_path=str(model_input_path),
+            output_model_path=str(preprocessed_model_path),
+            skip_optimization=False,
+            skip_onnx_shape=False,
+            skip_symbolic_shape=True,
+        )
+        model_path_for_quant = preprocessed_model_path
     tmp_q_path = model_input_path.with_stem(f"{model_input_path.stem}_int8_tmp")
     LOGGER.info("Running Quantization (MinMax, QOperator, Act=QUInt8, W=QInt8)...")
     quantize_static(
-        model_input=str(model_input_path),
+        model_input=str(model_path_for_quant),
         model_output=str(tmp_q_path),
         calibration_data_reader=ImageCalibrator(calib_files=good_calib_images, input_name=input_name, imgsz=opt.imgsz, stride=stride),
         quant_format=QuantFormat.QOperator,
         activation_type=QuantType.QUInt8,
         weight_type=QuantType.QInt8,
         per_channel=opt.per_channel,
+        nodes_to_exclude=[],
         calibrate_method=CalibrationMethod.MinMax,
-        extra_options={"ActivationSymmetric": False, "WeightSymmetric": True, "EnableSubgraph": True}
+        extra_options={"ActivationSymmetric": False, "WeightSymmetric": True, "EnableSubgraph": True, "ForceQuantizeNoInputCheck": True},
     )
-    
     pt_path = opt.pt or str(Path(model_input_path).with_suffix(".pt"))
-    calib_meta = None
-    if pt_path and Path(pt_path).exists():
-        ckpt = torch.load(pt_path, map_location="cpu", weights_only=False)
-        if ckpt and 'int8_calib' in ckpt:
-            calib_meta = ckpt['int8_calib'].get('head')
-    if calib_meta:
-        LOGGER.info("Using PT checkpoint calibration for final output quantization.")
+    dq = dq_from_pt(pt_path, expect_channels=expect_c) if pt_path and Path(pt_path).exists() else None
+    if dq is None:
+        raise ValueError("PT checkpoint with int8_calib.head {min,max} is required for output quantization.")
+    sc, zp = dq["scale"], dq["zero_point"]
+    if isinstance(sc, np.ndarray):
+        sc = sc.astype(np.float32).reshape(-1)
+        zp = zp.astype(np.float32).reshape(-1)
+        mins = (-zp * sc).tolist()
+        maxs = ((255.0 - zp) * sc).tolist()
+        calib_meta = {"per_channel": True, "min": mins, "max": maxs}
     else:
-        raise ValueError(f"Could not load valid calibration data from {pt_path}. Please regenerate it.")
-    
+        sc = float(sc)
+        zp = float(zp)
+        minv = -zp * sc
+        maxv = (255.0 - zp) * sc
+        calib_meta = {"per_channel": False, "min": float(minv), "max": float(maxv)}
     LOGGER.info(f"Writing final INT8 model with uint8 outputs -> {model_output_path_uint8}")
     force_uint8_outputs(str(tmp_q_path), str(model_output_path_uint8), calib_meta=calib_meta)
-    
-    if tmp_q_path.exists():
-        os.remove(tmp_q_path)
+    for p in [tmp_q_path, model_path_for_quant if model_path_for_quant != model_input_path else None]:
+        try:
+            if p and Path(p).exists():
+                os.remove(p)
+        except Exception:
+            pass
+    if not Path(model_output_path_uint8).exists():
+        raise RuntimeError(f"Quantization finished but output file not found: {model_output_path_uint8}")
     return str(model_output_path_uint8)
 
 def run_and_collect_outputs(session, input_name, input_image, output_names):
@@ -298,130 +515,335 @@ def session_io_info(session):
 def prepare_input_for_session(session, source, imgsz):
     loader = LoadImages(source, img_size=imgsz, auto=False)
     _, im, _, _, _ = next(iter(loader))
-    x = im.astype(np.float32) / 255.0
-    if len(x.shape) == 3:
-        x = np.expand_dims(x, 0)
-    return x
+    exp = session.get_inputs()[0]
+    dtype = exp.type
+    if "tensor(uint8)" in dtype:
+        if im.dtype != np.uint8:
+            im = im.astype(np.uint8)
+        if len(im.shape) == 3:
+            im = np.expand_dims(im, 0)
+        return im
+    else:
+        x = im.astype(np.float32) / 255.0
+        if len(x.shape) == 3:
+            x = np.expand_dims(x, 0)
+        return x
+
+def preprocess_int8_for_session(session, source, imgsz):
+    loader = LoadImages(source, img_size=imgsz, auto=False)
+    _, im, _, _, _ = next(iter(loader))
+    if im.dtype != np.uint8:
+        im = im.astype(np.uint8)
+    if len(im.shape) == 3:
+        im = np.expand_dims(im, 0)
+    return im
+
+def diag_partition_stats(fp32_head, int8_head_deq, nc):
+    a = fp32_head.astype(np.float32)
+    b = int8_head_deq.astype(np.float32)
+    total_channels = a.shape[1]
+    box_channels = total_channels - nc
+    LOGGER.info(f"Interpreting output tensor with {box_channels} box channels and {nc} class channels.")
+    a_box, a_cls = a[:, :box_channels, :], a[:, box_channels:, :]
+    b_box, b_cls = b[:, :box_channels, :], b[:, box_channels:, :]
+    def stats(x):
+        xf = x.reshape(-1).astype(np.float32)
+        if xf.size == 0:
+            return 0.0, 0.0, 0.0, 0.0
+        return float(xf.min()), float(xf.max()), float(xf.mean()), float(xf.std())
+    ab_min, ab_max, ab_mean, ab_std = stats(a_box)
+    bb_min, bb_max, bb_mean, bb_std = stats(b_box)
+    ac_min, ac_max, ac_mean, ac_std = stats(a_cls)
+    bc_min, bc_max, bc_mean, bc_std = stats(b_cls)
+    ca = safe_cosine(a_box.flatten(), b_box.flatten())
+    cc = safe_cosine(a_cls.flatten(), 1.0/(1.0+np.exp(-b_cls)).flatten())
+    print("\nBox partition stats FP32:", {"min": ab_min, "max": ab_max, "mean": ab_mean, "std": ab_std})
+    print("Box partition stats INT8 deq:", {"min": bb_min, "max": bb_max, "mean": bb_mean, "std": bb_std})
+    print(f"Box partition cosine: {ca:.6f}")
+    print("\nClass partition stats FP32:", {"min": ac_min, "max": ac_max, "mean": ac_mean, "std": ac_std})
+    print("Class partition stats INT8 deq:", {"min": bc_min, "max": bc_max, "mean": bc_mean, "std": bc_std})
+    print(f"Class partition cosine: {cc:.6f}")
+
+def non_max_suppression_int8(output_uint8, scale, zp, axis=1, names_nc=None, conf_thres=0.1, iou_thres=0.45, max_det=300):
+    x = output_uint8.astype(np.float32)
+    s = np.array(scale, dtype=np.float32)
+    z = np.array(zp, dtype=np.float32)
+    if s.ndim == 0 or s.size == 1:
+        s_val = s.item() if s.ndim > 0 else s
+        z_val = z.item() if z.ndim > 0 else z
+        dequantized_x = (x - z_val) * s_val
+    else:
+        shape = [1] * x.ndim
+        if axis < 0:
+            axis += x.ndim
+        if axis >= x.ndim or axis < 0:
+            raise ValueError(f"Invalid axis {axis} for a tensor with {x.ndim} dimensions.")
+        shape[axis] = -1
+        s = s.reshape(shape)
+        z = z.reshape(shape)
+        dequantized_x = (x - z) * s
+    nc = int(names_nc)
+    box_channels = dequantized_x.shape[1] - nc
+    box_part = dequantized_x[:, :box_channels, :]
+    cls_logits = dequantized_x[:, box_channels:, :]
+    cls_probs = 1.0 / (1.0 + np.exp(-cls_logits))
+    final_pred = np.concatenate([box_part, cls_probs], axis=1)
+    dets = non_max_suppression(torch.from_numpy(final_pred).float(), conf_thres, iou_thres, max_det=max_det)
+    return dets
+
+def run_detect_one(session, im, im0, conf_thres, iou_thres, max_det, save_dir, save_name, names, dq=None):
+    input_name = session.get_inputs()[0].name
+    out_meta = session.get_outputs()[0]
+    out_dtype = out_meta.type
+    out_name = out_meta.name
+    output = session.run([out_name], {input_name: im})[0]
+    if out_dtype == "tensor(uint8)":
+        if dq is None:
+            raise RuntimeError("uint8 output requires dq parameters from PT")
+        sc = dq["scale"]
+        zp = dq["zero_point"]
+        axis = dq.get("axis", 1)
+        dets = non_max_suppression_int8(output, sc, zp, axis=axis, names_nc=len(names), conf_thres=conf_thres, iou_thres=iou_thres, max_det=max_det)
+    else:
+        pred = torch.from_numpy(output).float()
+        dets = non_max_suppression(pred, conf_thres, iou_thres, max_det=max_det)
+    im_draw = im0.copy()
+    annotator = Annotator(im_draw, line_width=3, example=str(names))
+    top5 = []
+    for det in dets:
+        if len(det):
+            im_shape = (im.shape[2], im.shape[3]) if im.ndim == 4 else (im.shape[1], im.shape[2])
+            det[:, :4] = scale_boxes(im_shape, det[:, :4], im_draw.shape).round()
+            det_sorted = det[det[:, 4].argsort(descending=True)]
+            for j, (*xyxy, conf, cls) in enumerate(det_sorted[:5]):
+                c = int(cls)
+                label = f"{names[c]} {float(conf):.2f}"
+                annotator.box_label(xyxy, label, color=colors(c, True))
+                top5.append((names[c], float(conf), [float(k) for k in xyxy]))
+    out_img = annotator.result()
+    cv2.imwrite(str(save_dir / save_name), out_img)
+    return top5
 
 def dequantize_array(arr_uint8, scale, zp, axis=1):
     x = arr_uint8.astype(np.float32)
     s = np.array(scale, dtype=np.float32)
     z = np.array(zp, dtype=np.float32)
     if s.ndim == 0 or s.size == 1:
-        return (x - z.item()) * s.item()
+        s_val = s.item() if s.ndim > 0 else s
+        z_val = z.item() if z.ndim > 0 else z
+        return (x - z_val) * s_val
     else:
         shape = [1] * x.ndim
+        if axis < 0:
+            axis += x.ndim
+        if axis >= x.ndim or axis < 0:
+            raise ValueError(f"Invalid axis {axis} for a tensor with {x.ndim} dimensions.")
         shape[axis] = -1
-        return (x - z.reshape(shape)) * s.reshape(shape)
+        s = s.reshape(shape)
+        z = z.reshape(shape)
+        return (x - z) * s
 
-def diag_partition_stats(fp32_head, int8_head_deq, nc):
-    a = fp32_head
-    b = int8_head_deq
-    
-    box_channels = a.shape[1] - nc
-    LOGGER.info(f"Interpreting output tensor with {box_channels} box channels and {nc} class channels.")
-    
-    a_box, a_cls_prob = a[:, :box_channels, :], a[:, box_channels:, :]
-    b_box, b_cls_logits = b[:, :box_channels, :], b[:, box_channels:, :]
-    
-    b_cls_prob = 1 / (1 + np.exp(-b_cls_logits))
+def head_metrics(fp32_head, int8_head_deq, names_nc=None, topk=100):
+    a = fp32_head.reshape(1, fp32_head.shape[1], -1).astype(np.float32)
+    b = int8_head_deq.reshape(1, int8_head_deq.shape[1], -1).astype(np.float32)
+    fa = a.flatten()
+    fb = b.flatten()
+    cs = safe_cosine(fa, fb)
+    mae = float(np.mean(np.abs(fa - fb))) if fa.size else 0.0
+    if names_nc is None:
+        return cs, mae, None, None
+    nc = int(names_nc)
+    if a.shape[1] <= nc:
+        return cs, mae, None, None
+    ac = a[:, -nc:, :]
+    bc = b[:, -nc:, :]
+    acs = 1 / (1 + np.exp(-ac))
+    bcs = 1 / (1 + np.exp(-bc))
+    ai = np.argmax(acs, axis=1).reshape(-1)
+    bi = np.argmax(bcs, axis=1).reshape(-1)
+    agree = float(np.mean((ai == bi).astype(np.float32)))
+    k = min(topk, ai.size)
+    at = np.argpartition(-acs.max(axis=1).reshape(-1), k - 1)[:k]
+    bt = np.argpartition(-bcs.max(axis=1).reshape(-1), k - 1)[:k]
+    topk_jacc = float(len(set(at.tolist()) & set(bt.tolist())) / max(1, len(set(at.tolist()) | set(bt.tolist()))))
+    return cs, mae, agree, topk_jacc
 
-    def stats(x):
-        xf = x.flatten()
-        return {"min": float(xf.min()), "max": float(xf.max()), "mean": float(xf.mean()), "std": float(xf.std())}
-
-    print("\nBox partition stats FP32:", stats(a_box))
-    print("Box partition stats INT8 deq:", stats(b_box))
-    print(f"Box partition cosine: {safe_cosine(a_box.flatten(), b_box.flatten()):.6f}")
-    
-    print("\nClass partition stats FP32 (probs):", stats(a_cls_prob))
-    print("Class partition stats INT8 deq (logits):", stats(b_cls_logits))
-    print("Class partition stats INT8 deq (probs):", stats(b_cls_prob))
-    print(f"Class partition cosine (probs): {safe_cosine(a_cls_prob.flatten(), b_cls_prob.flatten()):.6f}")
-
-def non_max_suppression_int8(output_uint8, dq, names_nc, conf_thres=0.1, iou_thres=0.45, max_det=300):
-    dequantized_logits = dequantize_array(output_uint8, dq["scale"], dq["zero_point"], axis=dq.get("axis", 1))
-    
-    box_channels = dequantized_logits.shape[1] - names_nc
-    box_part = dequantized_logits[:, :box_channels, :]
-    cls_part = dequantized_logits[:, box_channels:, :]
-    
-    cls_probs = 1 / (1 + np.exp(-cls_part))
-    
-    final_pred = np.concatenate([box_part, cls_probs], axis=1)
-    
-    return non_max_suppression(torch.from_numpy(final_pred), conf_thres, iou_thres, max_det=max_det)
-
-def run_detect_one(session, im, im0, conf_thres, iou_thres, max_det, save_dir, save_name, names, dq=None):
-    input_name = session.get_inputs()[0].name
-    out_meta = session.get_outputs()[0]
-    output = session.run([out_meta.name], {input_name: im})[0]
-
-    if out_meta.type == "tensor(uint8)":
-        dets = non_max_suppression_int8(output, dq, len(names), conf_thres, iou_thres, max_det)
+def tensor_stats(x, is_uint8=False):
+    x_flat = x.reshape(-1)
+    mn = float(np.min(x_flat))
+    mx = float(np.max(x_flat))
+    mean = float(np.mean(x_flat))
+    std = float(np.std(x_flat))
+    if is_uint8:
+        z0 = float(np.mean((x_flat == 0).astype(np.float32)))
+        z255 = float(np.mean((x_flat == 255).astype(np.float32)))
     else:
-        dets = non_max_suppression(torch.from_numpy(output), conf_thres, iou_thres, max_det=max_det)
+        z0 = 0.0
+        z255 = 0.0
+    lo = float(np.min(x_flat))
+    hi = float(np.max(x_flat))
+    if is_uint8:
+        hist, _ = np.histogram(x_flat, bins=64, range=(0, 255))
+    else:
+        rng_hi = hi if hi > lo else lo + 1e-6
+        hist, _ = np.histogram(x_flat, bins=64, range=(lo, rng_hi))
+    p = hist.astype(np.float32)
+    p = p / max(1.0, np.sum(p))
+    entropy = float(-np.sum(np.where(p > 0, p * np.log2(p), 0.0)))
+    return {"min": mn, "max": mx, "mean": mean, "std": std, "p0": z0, "p255": z255, "entropy": entropy}
 
-    annotator = Annotator(im0.copy(), line_width=3, example=str(names))
-    top5 = []
-    for det in dets:
-        if len(det):
-            im_shape = im.shape[2:]
-            det[:, :4] = scale_boxes(im_shape, det[:, :4], annotator.im.shape).round()
-            det_sorted = det[det[:, 4].argsort(descending=True)]
-            for *xyxy, conf, cls in det_sorted[:5]:
-                c = int(cls)
-                label = f"{names[c]} {conf:.2f}"
-                annotator.box_label(xyxy, label, color=colors(c, True))
-                top5.append((names[c], float(conf), [float(k) for k in xyxy]))
-    cv2.imwrite(str(save_dir / save_name), annotator.result())
-    return top5
+def threshold_sweep_counts(head_float, names_nc, thresholds):
+    nc = int(names_nc)
+    hf = head_float.reshape(1, head_float.shape[1], -1).astype(np.float32)
+    if hf.shape[1] <= nc:
+        scores = hf.max(axis=1).reshape(-1)
+    else:
+        cls = hf[:, -nc:, :]
+        scores = (1 / (1 + np.exp(-cls))).max(axis=1).reshape(-1)
+    out = []
+    for t in thresholds:
+        out.append((t, int(np.sum(scores >= t)), float(scores[scores >= t].mean() if np.any(scores >= t) else 0.0)))
+    return out
 
-def main(opt):
-    compare_models(opt)
+def quant_dequant_roundtrip(fp32_head, scale, zp, axis=1):
+    x = fp32_head.astype(np.float32)
+    s = np.array(scale, dtype=np.float32)
+    z = np.array(zp, dtype=np.float32)
+    if s.ndim == 0 or s.size == 1:
+        s_val = s.item() if s.ndim > 0 else s
+        z_val = z.item() if z.ndim > 0 else z
+        q = np.clip(np.round(x / s_val) + z_val, 0, 255).astype(np.uint8)
+        x2 = (q.astype(np.float32) - z_val) * s_val
+    else:
+        shape = [1] * x.ndim
+        if axis < 0:
+            axis += x.ndim
+        if axis >= x.ndim or axis < 0:
+            raise ValueError(f"Invalid axis {axis} for a tensor with {x.ndim} dimensions.")
+        shape[axis] = -1
+        s_r = s.reshape(shape)
+        z_r = z.reshape(shape)
+        q = np.clip(np.round(x / s_r) + z_r, 0, 255).astype(np.uint8)
+        x2 = (q.astype(np.float32) - z_r) * s_r
+    mae = float(np.mean(np.abs(x - x2)))
+    cos_val = safe_cosine(x.flatten(), x2.flatten())
+    return mae, cos_val
+
+def get_nc_and_regmax(session, fallback_nc=80, fallback_regmax=None):
+    nc = None
+    regmax = fallback_regmax
+    try:
+        meta = session.get_modelmeta().custom_metadata_map
+        nms = eval(meta.get("names", "None"))
+        if nms is not None:
+            nc = len(nms)
+    except Exception:
+        pass
+    if nc is None:
+        nc = fallback_nc
+    return nc, regmax
 
 def compare_models(opt):
     fp32_path = opt.weights
     int8_path_obj = Path(fp32_path).with_stem(f"{Path(fp32_path).stem}_int8_io_uint8")
-    
-    pt_path = opt.pt or str(Path(fp32_path).with_suffix(".pt"))
-    if not (pt_path and Path(pt_path).exists()):
-        raise FileNotFoundError(f"PT file with calibration data not found at {pt_path}")
-
     if opt.quantize or not int8_path_obj.exists():
+        if not opt.data:
+            raise ValueError("INT8 quantization requires a --data argument for the calibration dataset.")
         int8_path = quantize_model(opt)
     else:
         int8_path = str(int8_path_obj)
         LOGGER.info(f"Found existing INT8 model at {int8_path}, skipping quantization.")
-
     providers = get_providers(opt.device)
+    session_fp32_dbg, fp32_output_names = create_debug_session(fp32_path, providers, disable_optim=opt.disable_optim)
+    session_int8_dbg, int8_output_names = create_debug_session(int8_path, providers, disable_optim=opt.disable_optim)
     runtime_fp32 = create_session(fp32_path, providers, disable_optim=opt.disable_optim)
     runtime_int8 = create_session(int8_path, providers, disable_optim=opt.disable_optim)
-    
+    input_name_fp32 = session_fp32_dbg.get_inputs()[0].name
     im_fp32 = prepare_input_for_session(runtime_fp32, opt.source, opt.imgsz)
-    
+    in_type_int8 = runtime_int8.get_inputs()[0].type
+    if "tensor(uint8)" in in_type_int8:
+        im_int8 = preprocess_int8_for_session(runtime_int8, opt.source, opt.imgsz)
+    else:
+        im_int8 = prepare_input_for_session(runtime_int8, opt.source, opt.imgsz)
     out_shape = runtime_fp32.get_outputs()[0].shape
-    expect_c = out_shape[1] if len(out_shape) >= 2 else None
-    dq = dq_from_pt(pt_path, expect_channels=expect_c)
-    if not dq:
-        raise ValueError("Failed to extract valid dequantization parameters from PT file.")
+    expect_c = None
+    if isinstance(out_shape, (list, tuple)) and len(out_shape) >= 2 and isinstance(out_shape[1], int):
+        expect_c = out_shape[1]
+    pt_path = opt.pt
+    if pt_path is None:
+        candidate = Path(fp32_path).with_suffix(".pt")
+        pt_path = str(candidate) if candidate.exists() else None
+    dq = dq_from_pt(pt_path, expect_channels=expect_c) if pt_path else None
+    if dq is None:
+        raise ValueError("PT file found but no usable calibration stats; please provide a checkpoint containing int8_calib.head.")
     print_dq("Selected from PT", dq)
-
+    outputs_fp32 = run_and_collect_outputs(session_fp32_dbg, input_name_fp32, im_fp32, fp32_output_names)
+    outputs_int8 = run_and_collect_outputs(session_int8_dbg, session_int8_dbg.get_inputs()[0].name, im_int8, int8_output_names)
+    print("\n" + "="*45 + " ONNX LAYER-BY-LAYER COMPARISON " + "="*45)
+    print(f"{'Layer (Tensor Name)':<75} {'Cosine Sim':>15s} {'MAE':>15s}")
+    print('-' * 110)
+    common_names = sorted(list(set(outputs_fp32.keys()) & set(outputs_int8.keys())))
+    for name in common_names:
+        fp32_val, int8_val = outputs_fp32.get(name), outputs_int8.get(name)
+        if fp32_val is None or int8_val is None:
+            continue
+        if fp32_val.shape != int8_val.shape:
+            continue
+        flat_fp32 = fp32_val.ravel().astype(np.float32)
+        flat_int8 = int8_val.ravel().astype(np.float32)
+        if flat_fp32.size == 0 or flat_int8.size == 0:
+            continue
+        cos_sim = safe_cosine(flat_fp32, flat_int8)
+        mae = float(np.mean(np.abs(flat_fp32 - flat_int8)))
+        color_start = "\033[91m" if (not np.isnan(cos_sim) and cos_sim < 0.95) else ""
+        color_end = "\033[0m" if color_start else ""
+        cos_print = f"{cos_sim:15.6f}" if not np.isnan(cos_sim) else f"{'nan':>15s}"
+        print(f"{name:<75} {color_start}{cos_print}{color_end} {mae:15.6f}")
+    print("\n" + "=" * 45 + " LAST 20 LAYER STATS DUMP " + "=" * 45)
+    last_20_names = common_names[-20:]
+    for name in last_20_names:
+        fp32_val = outputs_fp32.get(name)
+        int8_val = outputs_int8.get(name)
+        if fp32_val is None or int8_val is None or fp32_val.size == 0:
+            continue
+        print(f"\n--- Layer: {name} ---")
+        print(f"  Shape: {fp32_val.shape}")
+        print(f"  FP32 Stats: {tensor_stats(fp32_val, is_uint8=False)}")
+        print(f"  INT8 Stats: {tensor_stats(int8_val, is_uint8=False)}")
+    print("\n" + "=" * 100)
     save_dir = increment_path(Path(opt.project) / opt.name, exist_ok=True)
     save_dir.mkdir(parents=True, exist_ok=True)
-    base_name = Path(opt.source).stem
-    
-    names = [str(i) for i in range(80)]
+    base_name = Path(opt.source).stem if not Path(opt.source).is_dir() else "image"
+    in_info_fp32, out_info_fp32 = session_io_info(runtime_fp32)
+    in_info_int8, out_info_int8 = session_io_info(runtime_int8)
+    io_rows = []
+    max_len = max(len(in_info_fp32), len(in_info_int8))
+    for i in range(max_len):
+        l = in_info_fp32[i] if i < len(in_info_fp32) else ("-", "-", "-")
+        r = in_info_int8[i] if i < len(in_info_int8) else ("-", "-", "-")
+        io_rows.append((f"IN{i}", l[0], l[1], str(l[2]), r[0], r[1], str(r[2])))
+    print("\nInput tensors:")
+    print_side_by_side_table(io_rows, ["Slot", "FP32 name", "FP32 type", "FP32 shape", "INT8 name", "INT8 type", "INT8 shape"])
+    oo_rows = []
+    max_len_o = max(len(out_info_fp32), len(out_info_int8))
+    for i in range(max_len_o):
+        l = out_info_fp32[i] if i < len(out_info_fp32) else ("-", "-", "-")
+        r = out_info_int8[i] if i < len(out_info_int8) else ("-", "-", "-")
+        oo_rows.append((f"OUT{i}", l[0], l[1], str(l[2]), r[0], r[1], str(r[2])))
+    print("\nOutput tensors:")
+    print_side_by_side_table(oo_rows, ["Slot", "FP32 name", "FP32 type", "FP32 shape", "INT8 name", "INT8 type", "INT8 shape"])
+    names = None
     try:
         meta = runtime_fp32.get_modelmeta().custom_metadata_map
-        names = eval(meta.get("names", str(names)))
+        names = eval(meta.get("names", "None"))
     except Exception:
-        pass
-
+        names = None
+    if names is None:
+        names = [str(i) for i in range(1000)]
     im0 = cv2.imread(opt.source)
-    fp32_top5 = run_detect_one(runtime_fp32, im_fp32, im0, opt.conf_thres, opt.iou_thres, opt.max_det, save_dir, f"{base_name}_fp32.jpg", names)
-    int8_top5 = run_detect_one(runtime_int8, im_fp32, im0, opt.conf_thres, opt.iou_thres, opt.max_det, save_dir, f"{base_name}_int8.jpg", names, dq=dq)
-    
+    fp32_top5 = run_detect_one(runtime_fp32, im_fp32, im0, opt.conf_thres, opt.iou_thres, opt.max_det, save_dir, f"{base_name}_fp32.jpg", names, dq=None)
+    im0_int8 = im0.copy()
+    int8_top5 = run_detect_one(runtime_int8, im_int8, im0_int8, opt.conf_thres, opt.iou_thres, opt.max_det, save_dir, f"{base_name}_int8.jpg", names, dq=dq)
     det_rows = []
     for i in range(max(len(fp32_top5), len(int8_top5))):
         lf = fp32_top5[i] if i < len(fp32_top5) else ("-", "-", "-")
@@ -430,41 +852,63 @@ def compare_models(opt):
     print("\nTop-5 detections (side-by-side):")
     print_side_by_side_table(det_rows, ["Rank", "FP32 class", "FP32 conf", "FP32 box [xyxy]", "INT8 class", "INT8 conf", "INT8 box [xyxy]"])
     print(f"\nSaved: {save_dir / (base_name + '_fp32.jpg')} and {save_dir / (base_name + '_int8.jpg')}")
-
     if opt.diagnostics:
-        out_fp32_0 = runtime_fp32.run(None, {runtime_fp32.get_inputs()[0].name: im_fp32})[0]
-        out_int8_0_raw = runtime_int8.run(None, {runtime_int8.get_inputs()[0].name: im_fp32})[0]
-        out_int8_0_deq = dequantize_array(out_int8_0_raw, dq["scale"], dq["zero_point"], axis=dq.get("axis", 1))
+        in_fp32_stats = tensor_stats(im_fp32, is_uint8=False)
+        in_int8_stats = tensor_stats(im_int8, is_uint8=False)
+        print("\nInput stats FP32:", in_fp32_stats)
+        print("Input stats INT8:", in_int8_stats)
+        out_fp32_0 = runtime_fp32.run([runtime_fp32.get_outputs()[0].name], {runtime_fp32.get_inputs()[0].name: im_fp32})[0]
+        out_int8_0_raw = runtime_int8.run([runtime_int8.get_outputs()[0].name], {runtime_int8.get_inputs()[0].name: im_int8})[0]
+        sc = dq["scale"]
+        zp = dq["zero_point"]
+        ax = dq.get("axis", 1)
+        out_int8_0 = dequantize_array(out_int8_0_raw, sc, zp, axis=ax)
         nc, _ = get_nc_and_regmax(runtime_fp32, fallback_nc=len(names))
-        diag_partition_stats(out_fp32_0, out_int8_0_deq, nc)
+        diag_partition_stats(out_fp32_0, out_int8_0, nc)
+        cs, mae, agree, topk_j = head_metrics(out_fp32_0, out_int8_0, names_nc=nc, topk=100)
+        print("\nFinal head metrics:")
+        print("cosine:", f"{cs:.6f}" if not np.isnan(cs) else "nan", "mae:", f"{mae:.6f}", "argmax_agree:", "-" if agree is None else f"{agree:.6f}", "topk_jaccard:", "-" if topk_j is None else f"{topk_j:.6f}")
+        print("\nHead stats FP32:", tensor_stats(out_fp32_0, is_uint8=False))
+        print("Head stats INT8 uint8:", tensor_stats(out_int8_0_raw, is_uint8=True))
+        print("Head stats INT8 deq:", tensor_stats(out_int8_0, is_uint8=False))
+        mae_r, cos_r = quant_dequant_roundtrip(out_fp32_0, sc, zp, axis=ax)
+        print("\nFP32 quant-dequant roundtrip:", {"mae": mae_r, "cosine": cos_r})
+        thresholds = [0.01, 0.03, 0.05, 0.1, 0.2, 0.3, 0.5]
+        sweep_fp32 = threshold_sweep_counts(out_fp32_0, nc, thresholds)
+        sweep_int8 = threshold_sweep_counts(out_int8_0, nc, thresholds)
+        sweep_rows = []
+        for i in range(len(thresholds)):
+            tf, cf, mf = sweep_fp32[i]
+            ti, ci, mi = sweep_int8[i]
+            sweep_rows.append((tf, ci, f"{mi:.4f}", cf, f"{mf:.4f}"))
+        print("\nDetection count vs threshold (INT8 vs FP32 on dequantized heads):")
+        print_side_by_side_table(sweep_rows, ["thr", "INT8 count", "INT8 mean", "FP32 count", "FP32 mean"])
+        if opt.ablate_floatize_int8:
+            pred = torch.from_numpy(out_int8_0.astype(np.float32)).float()
+            dets = non_max_suppression(pred, opt.conf_thres, opt.iou_thres, max_det=opt.max_det)
+            have = any([len(d) for d in dets])
+            print("\nAblation floatized-INT8 through float postprocess detections:", int(have))
 
-def print_dq(label, dq):
-    if dq is None:
-        print(f"\n[Dequant] {label}: None")
-        return
-    sc = dq["scale"]
-    zp = dq["zero_point"]
-    ax = dq.get("axis", "N/A")
-    if isinstance(sc, np.ndarray):
-        print(f"\n[Dequant] {label}: axis={ax}, per-channel={sc.shape[0]} | scale[min={sc.min():.6g}, max={sc.max():.6g}] zp[min={int(zp.min())}, max={int(zp.max())}]")
-    else:
-        print(f"\n[Dequant] {label}: axis={ax}, per-tensor | scale={float(sc):.6g}, zp={int(zp)}")
+def main(opt):
+    compare_models(opt)
 
 def parse_opt():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="ONNX FP32 vs. INT8 Layer-By-Layer and Detection Comparison Tool")
     parser.add_argument("--weights", type=str, required=True, help="Path to the FP32 ONNX model.")
     parser.add_argument("--source", type=str, required=True, help="Path to a single image for comparison.")
-    parser.add_argument("--data", type=str, default=str(ROOT / "data/coco.yaml"), help="Path to dataset.yaml for INT8 calibration.")
+    parser.add_argument("--data", type=str, default=str(ROOT / "toolchain/data/coco.yaml"), help="Path to dataset.yaml for INT8 calibration.")
     parser.add_argument("--imgsz", "--img-size", nargs="+", type=int, default=[640], help="Inference size h,w.")
     parser.add_argument("--device", default="cpu", help="CUDA device, i.e., 0 or cpu.")
     parser.add_argument("--quantize", action="store_true", help="Force re-quantization even if an INT8 model exists.")
     parser.add_argument("--per-channel", default=True, action="store_true", help="Enable per-channel quantization for INT8 conversion.")
-    parser.add_argument("--conf-thres", type=float, default=0.25, help="confidence threshold")
+    parser.add_argument("--conf-thres", type=float, default=0.1, help="confidence threshold")
     parser.add_argument("--iou-thres", type=float, default=0.45, help="NMS IoU threshold")
     parser.add_argument("--max-det", type=int, default=300, help="maximum detections per image")
     parser.add_argument("--project", default=ROOT / "runs/compare", help="save results to project/name")
     parser.add_argument("--name", default="exp", help="save to project/name")
     parser.add_argument("--diagnostics", action="store_true", help="Enable diagnostics")
+    parser.add_argument("--ablate-floatize-int8", action="store_true", help="Run float postprocess on dequantized INT8 head")
+    parser.add_argument("--dump-head", action="store_true", help="Dump head tensors to npy")
     parser.add_argument("--disable-optim", action="store_true", help="Disable ORT graph optimizations")
     parser.add_argument("--pt", type=str, default=None, help="Path to training .pt with int8_calib; if not set, will try sibling of --weights")
     opt = parser.parse_args()
