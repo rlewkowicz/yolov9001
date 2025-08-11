@@ -14,6 +14,22 @@ from utils import TryExcept
 from utils.general import LOGGER, colorstr, increment_path, is_notebook, xyxy2xywh
 from utils.plots import Annotator, colors, save_one_box
 
+def _count_relu_like(m, x, y):
+    # Count ~one op per element (same as ReLU heuristic)
+    # thop will have created m.total_ops for us when custom_ops is provided
+    m.total_ops += torch.tensor(y.numel(), device=y.device, dtype=torch.int64)
+
+def profile(input, ops, verbose=False):
+    try:
+        from thop import profile as thop_profile
+    except Exception:
+        return None, None
+
+    # Make sure ReLU6 gets counted
+    custom_ops = {nn.ReLU6: _count_relu_like}
+    macs, params = thop_profile(ops, inputs=(input,), custom_ops=custom_ops, verbose=verbose)
+    return macs, params
+
 class Requant(nn.Module):
     def __init__(self):
         super().__init__()

@@ -13,7 +13,7 @@ optimizer:
     warmup_bias_lr: 0.1
   LION:
     lr_scheduler_type: cosine
-    lr0: 0.001
+    lr0: 0.07
     lrf: 0.01
     b1: 0.9
     b2: 0.999

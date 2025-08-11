@@ -3,7 +3,7 @@
 nc: 80
 depth_multiple: 1
 width_multiple: 1
-activation: nn.Hardswish()
+activation: nn.ReLU6()
 anchors: 3
 
 backbone:

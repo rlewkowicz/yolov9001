@@ -27,6 +27,14 @@ warnings.filterwarnings(
 )
 warnings.filterwarnings("ignore", category=UserWarning)
 
+def _count_relu_like(m, x, y):
+    """THOP custom op for ReLU-like activations (e.g., nn.ReLU6, Hardswish, SiLU)."""
+    out = y if torch.is_tensor(y) else y[0]
+    if not hasattr(m, "total_ops"):
+        m.register_buffer("total_ops", torch.zeros(1, dtype=torch.int64))
+    m.total_ops += torch.as_tensor(out.numel(), device=out.device, dtype=torch.int64)
+
+
 def smart_inference_mode(torch_1_9=check_version(torch.__version__, "1.9.0")):
     def decorate(fn):
         return (torch.inference_mode if torch_1_9 else torch.no_grad)()(fn)

@@ -18,7 +18,7 @@ optimizer:
         lr_scale: 1.0
   LION:
     lr_scheduler_type: cosine
-    lr0: 0.0005
+    lr0: 0.001
     lrf: 0.01
     b1: 0.9
     b2: 0.999
@@ -30,7 +30,7 @@ optimizer:
     warmup_bias_lr: 1
     decoupled_lr:
       backbone: 
-        lr_scale: 0.5
+        lr_scale: 0.8
       head: 
         lr_scale: 1.0
   AdamW:
