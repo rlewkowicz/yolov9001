@@ -428,7 +428,9 @@ def train(hyp, opt, device, callbacks):
         if not d2 or not isinstance(d2, list):
             return None
         shape = d2[0].shape
-        no_autocast = torch.cuda.amp.autocast(enabled=False) if torch.cuda.is_available() else contextlib.nullcontext()
+        no_autocast = torch.cuda.amp.autocast(
+            enabled=False
+        ) if torch.cuda.is_available() else contextlib.nullcontext()
         with torch.no_grad(), no_autocast:
             d2 = [t.float() for t in d2]
             if hasattr(head, "export_like_for_calib"):

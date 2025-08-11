@@ -5,6 +5,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import onnx
+from onnx import numpy_helper  # NEW: for qparam reads
 import onnxruntime
 import torch
 from tqdm import tqdm
@@ -48,6 +49,145 @@ _NUMPY_FROM_ORT = {
     "tensor(int8)": np.int8,
 }
 
+# ---------------------------
+# Output-aware postprocessing
+# ---------------------------
+
+def _get_uint8_output_qparams(model_path: str):
+    """
+    Read scale/zero_point (and axis) for the first output if it is produced by a QuantizeLinear.
+    Returns dict {scale, zero_point, axis} or None.
+    """
+    try:
+        m = onnx.load(model_path)
+    except Exception:
+        return None
+    g = m.graph
+    if not g.output:
+        return None
+    out_name = g.output[0].name
+
+    # Build producer map
+    prod = {}
+    for n in g.node:
+        for o in n.output:
+            prod[o] = n
+
+    # Walk back through simple passthrough ops
+    passthrough = {"Identity", "Reshape", "Transpose", "Squeeze", "Unsqueeze", "Cast"}
+    node = prod.get(out_name, None)
+    hops = 0
+    while node is not None and node.op_type in passthrough and hops < 10:
+        if not node.input:
+            break
+        node = prod.get(node.input[0], None)
+        hops += 1
+
+    if node is None or node.op_type != "QuantizeLinear" or len(node.input) < 3:
+        return None
+
+    scale_name, zp_name = node.input[1], node.input[2]
+
+    def find_init(name):
+        for ini in g.initializer:
+            if ini.name == name:
+                return numpy_helper.to_array(ini)
+        return None
+
+    scale = find_init(scale_name)
+    zp = find_init(zp_name)
+    if scale is None or zp is None:
+        return None
+
+    axis = 1
+    for a in node.attribute:
+        if a.name == "axis":
+            axis = int(a.i)
+
+    if scale.size == 1 and zp.size == 1:
+        return {
+            "scale": float(scale.reshape(())),
+            "zero_point": int(np.uint8(zp.reshape(()))),
+            "axis": axis,
+        }
+    else:
+        return {
+            "scale": scale.astype(np.float32).reshape(-1),
+            "zero_point": zp.astype(np.uint8).reshape(-1),
+            "axis": axis,
+        }
+
+def _floatize_uint8_head(y_uint8: np.ndarray, qparams: dict, nc: int) -> np.ndarray:
+    """
+    Dequantize uint8 head -> float; apply sigmoid to class slice.
+    Keeps original layout, e.g. (N, C, A).
+    """
+    x = y_uint8.astype(np.float32)
+    s = np.array(qparams["scale"], dtype=np.float32)
+    z = np.array(qparams["zero_point"], dtype=np.float32)
+    axis = int(qparams.get("axis", 1))
+
+    if s.ndim <= 0 or s.size == 1:
+        s_val = s.item() if s.ndim > 0 else float(s)
+        z_val = z.item() if z.ndim > 0 else float(z)
+        x = (x - z_val) * s_val
+    else:
+        if axis < 0:
+            axis += x.ndim
+        shape = [1] * x.ndim
+        shape[axis] = -1
+        s = s.reshape(shape)
+        z = z.reshape(shape)
+        x = (x - z) * s
+
+    # YOLO head = [4 box channels, nc class logits] along channel axis (=1)
+    box_ch = x.shape[1] - nc
+    x[:, box_ch:, :] = 1.0 / (1.0 + np.exp(-x[:, box_ch:, :]))
+    return x
+
+def _infer_io(session: onnxruntime.InferenceSession, model_path: str, names) -> tuple:
+    """
+    Returns:
+      input_name, input_np_dtype, input_mode ('float'|'uint8'),
+      output_name, out_type_str, qparams_or_None
+    """
+    # ------- input side (unchanged) -------
+    inp = session.get_inputs()[0]
+    input_name = inp.name
+    in_ort_type = inp.type
+    in_np_dtype = _NUMPY_FROM_ORT.get(in_ort_type, np.float32)
+    if in_np_dtype in (np.float32, np.float16):
+        in_mode = "float"
+    elif in_np_dtype == np.uint8:
+        in_mode = "uint8"
+    else:
+        in_mode = "float"
+
+    # ------- output side (NEW) -------
+    out = session.get_outputs()[0]
+    output_name = out.name
+    out_type = out.type  # e.g., 'tensor(float)' or 'tensor(uint8)'
+
+    qparams = None
+    if out_type == "tensor(uint8)":
+        qparams = _get_uint8_output_qparams(model_path)
+        if qparams is None:
+            raise RuntimeError(
+                "Output is uint8 but no QuantizeLinear qparams found in graph. "
+                "Cannot dequantize head for post-processing."
+            )
+
+    kind = "uint8 (quantized head)" if qparams is not None else out_type
+    LOGGER.info(
+        f"Model I/O: input '{input_name}' expects {in_ort_type} (preproc='{in_mode}'), "
+        f"output '{output_name}' is {kind}."
+    )
+    return input_name, in_np_dtype, in_mode, output_name, out_type, qparams
+
+# ---------------------------
+# Existing helpers (input)
+# ---------------------------
+
 def _is_quantized_graph(model_path: str) -> bool:
     try:
         m = onnx.load(model_path)
@@ -61,31 +201,25 @@ def _is_quantized_graph(model_path: str) -> bool:
         return False
 
 def _infer_preproc(session: onnxruntime.InferenceSession, model_path: str):
-    """Return (input_name, np_dtype, mode), where mode is 'float' or 'uint8'."""
+    """(kept for backwards compat; now using _infer_io)"""
     inp = session.get_inputs()[0]
     input_name = inp.name
-    ort_type = inp.type  # e.g. 'tensor(float)'
+    ort_type = inp.type
     np_dtype = _NUMPY_FROM_ORT.get(ort_type, np.float32)
-
     is_quant = _is_quantized_graph(model_path)
     if np_dtype in (np.float32, np.float16):
-        mode = "float"  # normalized [0,1]
+        mode = "float"
     elif np_dtype == np.uint8:
-        mode = "uint8"  # raw [0,255]
+        mode = "uint8"
     else:
         mode = "float"
-
     qhint = "quantized" if is_quant else "fp32"
-    LOGGER.info(
-        f"Model I/O: input '{input_name}' expects {ort_type} ({qhint}); preprocessing='{mode}'."
-    )
+    LOGGER.info(f"Model I/O: input '{input_name}' expects {ort_type} ({qhint}); preprocessing='{mode}'.")
     return input_name, np_dtype, mode
 
 def _prep_input_numpy(im_chw: np.ndarray, np_dtype, mode: str) -> np.ndarray:
-    """im_chw shape: (N,C,H,W) or (C,H,W). Return np array with dtype matching model input."""
     if im_chw.ndim == 3:
         im_chw = np.expand_dims(im_chw, 0)
-
     if mode == "float":
         out = im_chw.astype(np.float32) / 255.0
         if np_dtype == np.float16:
@@ -97,6 +231,10 @@ def _prep_input_numpy(im_chw: np.ndarray, np_dtype, mode: str) -> np.ndarray:
         return im_chw.astype(np.uint8)
     else:
         return im_chw.astype(np.float32) / 255.0
+
+# ---------------------------
+# detect()
+# ---------------------------
 
 def detect(opt):
     source = str(opt.source)
@@ -110,22 +248,23 @@ def detect(opt):
     session = onnxruntime.InferenceSession(opt.weights, providers=providers)
 
     model_meta = session.get_modelmeta().custom_metadata_map or {}
-    names = eval(model_meta["names"]
-                ) if "names" in model_meta else {i: f"class{i}"
-                                                 for i in range(1000)}
+    names = eval(model_meta["names"]) if "names" in model_meta else {i: f"class{i}" for i in range(1000)}
     stride = int(model_meta["stride"]) if "stride" in model_meta else 32
-
     imgsz = check_img_size(opt.imgsz, s=stride)
 
-    input_name, np_dtype, mode = _infer_preproc(session, opt.weights)
-    output_name = session.get_outputs()[0].name
+    # NEW: infer both input and output handling
+    input_name, np_dtype, mode, output_name, out_type, qparams = _infer_io(session, opt.weights, names)
 
     is_file = Path(source).suffix[1:] in (IMG_FORMATS + VID_FORMATS)
     is_url = source.lower().startswith(("rtsp://", "rtmp://", "http://", "https://"))
     webcam = source.isnumeric() or source.endswith(".txt") or (is_url and not is_file)
-    dataset = LoadStreams(
+    dataset = LoadStreams(source, img_size=imgsz, stride=stride, auto=False) if webcam else LoadImages(
         source, img_size=imgsz, stride=stride, auto=False
-    ) if webcam else LoadImages(source, img_size=imgsz, stride=stride, auto=False)
+    )
+
+    nc = len(names) if isinstance(names, (list, tuple, dict)) else 80
+    if isinstance(names, dict):
+        nc = len(names)
 
     dt = (Profile(), Profile(), Profile())
     for path, im, im0s, vid_cap, s in dataset:
@@ -133,8 +272,11 @@ def detect(opt):
             ort_input = _prep_input_numpy(im, np_dtype, mode)
 
         with dt[1]:
-            pred = session.run([output_name], {input_name: ort_input})[0]
-            pred = torch.from_numpy(pred)  # keep float path for NMS
+            y = session.run([output_name], {input_name: ort_input})[0]
+            # NEW: output-type-aware floatization
+            if out_type == "tensor(uint8)":
+                y = _floatize_uint8_head(y, qparams, nc)
+            pred = torch.from_numpy(y)  # float for NMS
 
         with dt[2]:
             pred = non_max_suppression(pred, opt.conf_thres, opt.iou_thres, max_det=opt.max_det)
@@ -177,6 +319,10 @@ def detect(opt):
         s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if opt.save_txt else ""
         LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s}")
 
+# ---------------------------
+# val()
+# ---------------------------
+
 def process_batch(detections, labels, iouv):
     correct = torch.zeros(detections.shape[0], iouv.shape[0], dtype=torch.bool, device=iouv.device)
     iou = box_iou(labels[:, 1:], detections[:, :4])
@@ -218,14 +364,12 @@ def val(opt):
     session = onnxruntime.InferenceSession(weights, providers=providers)
 
     model_meta = session.get_modelmeta().custom_metadata_map or {}
-    names = eval(model_meta["names"]
-                ) if "names" in model_meta else {i: f"class{i}"
-                                                 for i in range(1000)}
+    names = eval(model_meta["names"]) if "names" in model_meta else {i: f"class{i}" for i in range(1000)}
     stride = int(model_meta["stride"]) if "stride" in model_meta else 32
     imgsz = check_img_size(imgsz, s=stride)
 
-    input_name, np_dtype, mode = _infer_preproc(session, weights)
-    output_name = session.get_outputs()[0].name
+    # NEW: infer both input and output handling
+    input_name, np_dtype, mode, output_name, out_type, qparams = _infer_io(session, weights, names)
 
     data = check_dataset(data)
     nc = int(data["nc"])
@@ -250,6 +394,9 @@ def val(opt):
     preprocess_times, inference_times, postprocess_times = [], [], []
     pbar = tqdm(dataloader, desc=s, bar_format=TQDM_BAR_FORMAT)
 
+    # Deduce nc for floatization of uint8 (names may be dict or list)
+    names_nc = len(names) if not isinstance(names, dict) else len(names.keys())
+
     for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
         _cuda_sync(device)
         t_start_pre = time.time()
@@ -271,7 +418,7 @@ def val(opt):
 
         _cuda_sync(device)
         t_start_inf = time.time()
-        pred = session.run([output_name], {input_name: im_for_ort})[0]
+        y = session.run([output_name], {input_name: im_for_ort})[0]
         _cuda_sync(device)
         t_end_inf = time.time()
         if batch_i >= warmup_batches:
@@ -279,7 +426,12 @@ def val(opt):
 
         _cuda_sync(device)
         t_start_post = time.time()
-        pred = torch.from_numpy(pred).to(device)
+
+        # NEW: output-type-aware floatization for validation
+        if out_type == "tensor(uint8)":
+            y = _floatize_uint8_head(y, qparams, names_nc)
+
+        pred = torch.from_numpy(y).to(device)
         pred = non_max_suppression(pred, conf_thres, iou_thres, max_det=max_det)
 
         targets[:, 2:] *= torch.tensor((width, height, width, height), device=device)
@@ -345,6 +497,10 @@ def val(opt):
             f"Not enough batches ({len(dataloader)}) to calculate average speed after warm-up ({warmup_batches} batches)."
         )
 
+# ---------------------------
+# main/argparse (unchanged)
+# ---------------------------
+
 def main(opt):
     if opt.val and opt.data is None:
         raise ValueError("Validation requires a --data argument.")
@@ -382,31 +538,21 @@ def main(opt):
 
 def parse_opt():
     parser = argparse.ArgumentParser(
-        description="ONNX Model Inference and Validation Script (auto-preproc)"
+        description="ONNX Model Inference and Validation Script (auto-preproc, output-aware postproc)"
     )
     parser.add_argument("--weights", type=str, default=ROOT / "best.onnx", help="ONNX model path")
-    parser.add_argument(
-        "--imgsz", "--img-size", nargs="+", type=int, default=[640], help="inference size h,w"
-    )
+    parser.add_argument("--imgsz", "--img-size", nargs="+", type=int, default=[640], help="inference size h,w")
     parser.add_argument("--conf-thres", type=float, default=None, help="confidence threshold")
     parser.add_argument("--iou-thres", type=float, default=None, help="NMS IoU threshold")
     parser.add_argument("--max-det", type=int, default=1000, help="maximum detections per image")
     parser.add_argument("--device", default="0", help="cuda device, i.e. 0 or cpu")
-    parser.add_argument(
-        "--project", default=ROOT / "runs/onnx", help="save results to project/name"
-    )
+    parser.add_argument("--project", default=ROOT / "runs/onnx", help="save results to project/name")
     parser.add_argument("--name", default="exp", help="save to project/name")
-    parser.add_argument(
-        "--exist-ok", action="store_true", help="existing project/name ok, do not increment"
-    )
-    parser.add_argument(
-        "--source", type=str, default=None, help="file/dir/URL/glob/screen/0(webcam) for detection"
-    )
+    parser.add_argument("--exist-ok", action="store_true", help="existing project/name ok, do not increment")
+    parser.add_argument("--source", type=str, default=None, help="file/dir/URL/glob/screen/0(webcam) for detection")
     parser.add_argument("--save-img", action="store_true", help="save annotated images")
     parser.add_argument("--save-txt", action="store_true", help="save results to *.txt")
-    parser.add_argument(
-        "--line-thickness", default=3, type=int, help="bounding box thickness (pixels)"
-    )
+    parser.add_argument("--line-thickness", default=3, type=int, help="bounding box thickness (pixels)")
     parser.add_argument("--data", type=str, default=None, help="dataset.yaml path for validation")
     parser.add_argument("--workers", type=int, default=8, help="max dataloader workers")
     parser.add_argument("--batch-size", type=int, default=None, help="batch size for validation")
