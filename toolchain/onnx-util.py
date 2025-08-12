@@ -42,6 +42,17 @@ from utils.metrics import ap_per_class, box_iou
 from utils.plots import Annotator, colors
 from utils.torch_utils import select_device
 
+
+def _apply_head_activation_float(y: np.ndarray, nc: int, head_act: str) -> np.ndarray:
+    act = (head_act or "").lower()
+    if act == "logits":
+        if y.dtype != np.float32:
+            y = y.astype(np.float32)
+        box_ch = y.shape[1] - nc
+        y[:, box_ch:, :] = 1.0 / (1.0 + np.exp(-y[:, box_ch:, :]))
+    return y
+
+
 _NUMPY_FROM_ORT = {
     "tensor(float)": np.float32,
     "tensor(float16)": np.float16,
@@ -250,9 +261,9 @@ def detect(opt):
     model_meta = session.get_modelmeta().custom_metadata_map or {}
     names = eval(model_meta["names"]) if "names" in model_meta else {i: f"class{i}" for i in range(1000)}
     stride = int(model_meta["stride"]) if "stride" in model_meta else 32
+    head_act = (model_meta.get("head_activation", "") or "").strip().lower()
     imgsz = check_img_size(opt.imgsz, s=stride)
 
-    # NEW: infer both input and output handling
     input_name, np_dtype, mode, output_name, out_type, qparams = _infer_io(session, opt.weights, names)
 
     is_file = Path(source).suffix[1:] in (IMG_FORMATS + VID_FORMATS)
@@ -273,10 +284,11 @@ def detect(opt):
 
         with dt[1]:
             y = session.run([output_name], {input_name: ort_input})[0]
-            # NEW: output-type-aware floatization
             if out_type == "tensor(uint8)":
                 y = _floatize_uint8_head(y, qparams, nc)
-            pred = torch.from_numpy(y)  # float for NMS
+            elif out_type.startswith("tensor(float"):
+                y = _apply_head_activation_float(y, nc, head_act)
+            pred = torch.from_numpy(y)
 
         with dt[2]:
             pred = non_max_suppression(pred, opt.conf_thres, opt.iou_thres, max_det=opt.max_det)
@@ -366,9 +378,9 @@ def val(opt):
     model_meta = session.get_modelmeta().custom_metadata_map or {}
     names = eval(model_meta["names"]) if "names" in model_meta else {i: f"class{i}" for i in range(1000)}
     stride = int(model_meta["stride"]) if "stride" in model_meta else 32
+    head_act = (model_meta.get("head_activation", "") or "").strip().lower()
     imgsz = check_img_size(imgsz, s=stride)
 
-    # NEW: infer both input and output handling
     input_name, np_dtype, mode, output_name, out_type, qparams = _infer_io(session, weights, names)
 
     data = check_dataset(data)
@@ -394,7 +406,6 @@ def val(opt):
     preprocess_times, inference_times, postprocess_times = [], [], []
     pbar = tqdm(dataloader, desc=s, bar_format=TQDM_BAR_FORMAT)
 
-    # Deduce nc for floatization of uint8 (names may be dict or list)
     names_nc = len(names) if not isinstance(names, dict) else len(names.keys())
 
     for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
@@ -407,7 +418,7 @@ def val(opt):
             im_for_ort = (im.float() / 255.0).cpu().numpy()
             if np_dtype == np.float16:
                 im_for_ort = im_for_ort.astype(np.float16)
-        else:  # uint8
+        else:
             im_for_ort = im.to(torch.uint8).cpu().numpy()
 
         targets = targets.to(device)
@@ -427,9 +438,10 @@ def val(opt):
         _cuda_sync(device)
         t_start_post = time.time()
 
-        # NEW: output-type-aware floatization for validation
         if out_type == "tensor(uint8)":
             y = _floatize_uint8_head(y, qparams, names_nc)
+        elif out_type.startswith("tensor(float"):
+            y = _apply_head_activation_float(y, names_nc, head_act)
 
         pred = torch.from_numpy(y).to(device)
         pred = non_max_suppression(pred, conf_thres, iou_thres, max_det=max_det)

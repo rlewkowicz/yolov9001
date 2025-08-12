@@ -14,21 +14,20 @@ from utils import TryExcept
 from utils.general import LOGGER, colorstr, increment_path, is_notebook, xyxy2xywh
 from utils.plots import Annotator, colors, save_one_box
 
-def _count_relu_like(m, x, y):
-    # Count ~one op per element (same as ReLU heuristic)
-    # thop will have created m.total_ops for us when custom_ops is provided
-    m.total_ops += torch.tensor(y.numel(), device=y.device, dtype=torch.int64)
+from copy import copy
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from IPython.display import display
+from PIL import Image
 
-def profile(input, ops, verbose=False):
-    try:
-        from thop import profile as thop_profile
-    except Exception:
-        return None, None
+from utils import TryExcept
+from utils.general import LOGGER, colorstr, increment_path, is_notebook, xyxy2xywh
+from utils.plots import Annotator, colors, save_one_box
+from torch.nn import Parameter
 
-    # Make sure ReLU6 gets counted
-    custom_ops = {nn.ReLU6: _count_relu_like}
-    macs, params = thop_profile(ops, inputs=(input,), custom_ops=custom_ops, verbose=verbose)
-    return macs, params
 
 class Requant(nn.Module):
     def __init__(self):
@@ -39,12 +38,14 @@ class Requant(nn.Module):
             return x.clone()
         return x
 
+
 class Silence(nn.Module):
     def __init__(self):
         super(Silence, self).__init__()
 
     def forward(self, x):
         return x
+
 
 def autopad(k, p=None, d=1):
     if d > 1:
@@ -53,21 +54,22 @@ def autopad(k, p=None, d=1):
         p = k // 2 if isinstance(k, int) else [x // 2 for x in k]
     return p
 
+
 class Conv(nn.Module):
-    default_act = nn.Hardswish()
+    default_act = nn.ReLU6()
 
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
         super().__init__()
         self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
         self.bn = nn.BatchNorm2d(c2)
-        self.act = self.default_act if act is True else act if isinstance(act, nn.Module
-                                                                         ) else nn.Identity()
+        self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
 
     def forward(self, x):
         return self.act(self.bn(self.conv(x)))
 
     def forward_fuse(self, x):
         return self.act(self.conv(x))
+
 
 class AConv(nn.Module):
     def __init__(self, c1, c2):
@@ -78,9 +80,9 @@ class AConv(nn.Module):
         x = torch.nn.functional.avg_pool2d(x, 2, 1, 0, False, True)
         return self.cv1(x)
 
+
 class RepConvN(nn.Module):
-    """RepConv is a basic rep-style block, including training and deploy status."""
-    default_act = nn.Hardswish()
+    default_act = nn.ReLU6()
 
     def __init__(self, c1, c2, k=3, s=1, p=1, g=1, d=1, act=True, bn=False, deploy=False):
         super().__init__()
@@ -88,8 +90,7 @@ class RepConvN(nn.Module):
         self.g = g
         self.c1 = c1
         self.c2 = c2
-        self.act = self.default_act if act is True else act if isinstance(act, nn.Module
-                                                                         ) else nn.Identity()
+        self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
         self.bn = None
         self.conv1 = Conv(c1, c2, k, s, p=p, g=g, act=False)
         self.conv2 = Conv(c1, c2, 1, s, p=p - k // 2, g=g, act=False)
@@ -179,6 +180,7 @@ class RepConvN(nn.Module):
         if hasattr(self, 'id_tensor'):
             self.__delattr__('id_tensor')
 
+
 class DFL(nn.Module):
     def __init__(self, c1=17):
         super().__init__()
@@ -194,6 +196,7 @@ class DFL(nn.Module):
         x = rq(x.softmax(1))
         return self.conv(x).view(b, 4, a)
 
+
 class GatedPool(nn.Module):
     def __init__(self, kernel_size=5, stride=1):
         super(GatedPool, self).__init__()
@@ -202,7 +205,6 @@ class GatedPool(nn.Module):
         self.gate_act = nn.Hardsigmoid()
         self.max_pool = nn.MaxPool2d(kernel_size, stride, padding)
         self.avg_pool = nn.AvgPool2d(kernel_size, stride, padding)
-
         self.requant_gate_in = Requant()
         self.requant_mp_in = Requant()
         self.requant_ap_in = Requant()
@@ -216,38 +218,34 @@ class GatedPool(nn.Module):
         out = ap + g * (mp - ap)
         return self.requant_out(out)
 
+
 class GatedSPPF(nn.Module):
     def __init__(self, c1, c2, k=5):
         super().__init__()
         c_ = c1 // 2
         self.cv1 = Conv(c1, c_, 1, 1)
         self.cv2 = Conv(c_ * 4, c2, 1, 1)
-
         self.m1 = GatedPool(kernel_size=k, stride=1)
         self.m2 = GatedPool(kernel_size=k, stride=1)
         self.m3 = GatedPool(kernel_size=k, stride=1)
-
         self.norm_x = Conv(c_, c_, 1, 1)
         self.norm_y1 = Conv(c_, c_, 1, 1)
         self.norm_y2 = Conv(c_, c_, 1, 1)
         self.norm_y3 = Conv(c_, c_, 1, 1)
-
         self.requant_cat = Requant()
 
     def forward(self, x):
         x_hidden = self.cv1(x)
-
         y1 = self.m1(x_hidden)
         y2 = self.m2(y1)
         y3 = self.m3(y2)
-
         norm_x = self.norm_x(x_hidden)
         norm_y1 = self.norm_y1(y1)
         norm_y2 = self.norm_y2(y2)
         norm_y3 = self.norm_y3(y3)
-
         cat = torch.cat([norm_x, norm_y1, norm_y2, norm_y3], 1)
         return self.cv2(self.requant_cat(cat))
+
 
 class QuantAdd(nn.Module):
     def __init__(self, c1, c2):
@@ -259,6 +257,7 @@ class QuantAdd(nn.Module):
     def forward(self, x):
         rq = getattr(self, "requant", nn.Identity())
         return rq(self.cv1(x[0]) + self.cv2(x[1]))
+
 
 class QARepNBottleneck(nn.Module):
     def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5):
@@ -276,6 +275,7 @@ class QARepNBottleneck(nn.Module):
         else:
             return self.cv2(self.cv1(x))
 
+
 class QARepNCSP(nn.Module):
     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
         super().__init__()
@@ -284,9 +284,14 @@ class QARepNCSP(nn.Module):
         self.cv2 = Conv(c1, c_, 1, 1)
         self.cv3 = Conv(2 * c_, c2, 1)
         self.m = nn.Sequential(*(QARepNBottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
+        self.requant_cat = Requant()
 
     def forward(self, x):
-        return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
+        left = self.m(self.cv1(x))
+        right = self.cv2(x)
+        cat = torch.cat((left, right), 1)
+        return self.cv3(self.requant_cat(cat))
+
 
 class QARepNCSPELAN(nn.Module):
     def __init__(self, c1, c2, c3, c4, c5=1):
@@ -311,8 +316,9 @@ class QARepNCSPELAN(nn.Module):
         rq = getattr(self, "requant", nn.Identity())
         return rq(p1 + p2 + p3 + p4)
 
+
 class QARepVGGBlockV2(nn.Module):
-    default_act = nn.Hardswish()
+    default_act = nn.ReLU6()
 
     def __init__(
         self,
@@ -362,8 +368,7 @@ class QARepVGGBlockV2(nn.Module):
             self.rbr_1x1 = nn.Conv2d(
                 in_channels, out_channels, kernel_size=1, stride=stride, groups=groups, bias=False
             )
-            self.rbr_identity = nn.Identity(
-            ) if out_channels == in_channels and stride == 1 else None
+            self.rbr_identity = nn.Identity() if out_channels == in_channels and stride == 1 else None
             self.rbr_avg = nn.AvgPool2d(kernel_size=kernel_size, stride=stride, padding=padding) \
                 if out_channels == in_channels and stride == 1 else None
             self.bn = nn.BatchNorm2d(out_channels)
@@ -466,25 +471,17 @@ class QARepVGGBlockV2(nn.Module):
             self.__delattr__('_id_tensor')
         self.deploy = True
 
+
 class RepBlockAdd(nn.Module):
-    def __init__(
-        self, in_channels, out_channels, n=1, block=QARepVGGBlockV2, basic_block=QARepVGGBlockV2
-    ):
+    def __init__(self, in_channels, out_channels, n=1, block=QARepVGGBlockV2, basic_block=QARepVGGBlockV2):
         super().__init__()
         self.add = in_channels == out_channels
         self.conv1 = block(in_channels, out_channels)
-        self.block = nn.Sequential(
-            *(block(out_channels, out_channels) for _ in range(n - 1))
-        ) if n > 1 else None
+        self.block = nn.Sequential(*(block(out_channels, out_channels) for _ in range(n - 1))) if n > 1 else None
         if block == BottleRep:
             self.conv1 = BottleRep(in_channels, out_channels, basic_block=basic_block, weight=True)
             n = n // 2
-            self.block = nn.Sequential(
-                *(
-                    BottleRep(out_channels, out_channels, basic_block=basic_block, weight=True)
-                    for _ in range(n - 1)
-                )
-            ) if n > 1 else None
+            self.block = nn.Sequential(*(BottleRep(out_channels, out_channels, basic_block=basic_block, weight=True) for _ in range(n - 1))) if n > 1 else None
         self.requant = Requant() if self.add else nn.Identity()
 
     def forward(self, x):
@@ -496,24 +493,21 @@ class RepBlockAdd(nn.Module):
         rq = getattr(self, "requant", nn.Identity())
         return rq(out)
 
+
 class BottleRep(nn.Module):
     def __init__(self, in_channels, out_channels, basic_block=QARepVGGBlockV2, weight=False):
         super().__init__()
         self.conv1 = basic_block(in_channels, out_channels)
         self.conv2 = basic_block(out_channels, out_channels)
-        if in_channels != out_channels:
-            self.shortcut = False
-        else:
-            self.shortcut = True
-        if weight:
-            self.alpha = Parameter(torch.ones(1))
-        else:
-            self.alpha = 1.0
+        self.shortcut = in_channels == out_channels
+        self.alpha = Parameter(torch.ones(1)) if weight else 1.0
+        self.requant = Requant() if self.shortcut else nn.Identity()
 
     def forward(self, x):
         outputs = self.conv1(x)
         outputs = self.conv2(outputs)
-        return outputs + self.alpha * x if self.shortcut else outputs
+        out = outputs + self.alpha * x if self.shortcut else outputs
+        return self.requant(out)
 
 class DetectMultiBackend(nn.Module):
     def __init__(

@@ -40,7 +40,6 @@ def export_formats():
 
 def try_export(inner_func):
     inner_args = get_default_args(inner_func)
-
     def outer_func(*args, **kwargs):
         prefix = inner_args["prefix"]
         try:
@@ -53,7 +52,6 @@ def try_export(inner_func):
         except Exception as e:
             LOGGER.info(f"{prefix} export failure {dt.t:.1f}s: {e}")
             return None, None
-
     return outer_func
 
 def _replace_modules_recursively(m):
@@ -71,7 +69,6 @@ def _prepare_model_for_onnx_export(src_model):
         tq.convert(m, inplace=True)
     except Exception:
         pass
-
     for mod in m.modules():
         try:
             if hasattr(mod, "set_observer_enabled"):
@@ -83,7 +80,6 @@ def _prepare_model_for_onnx_export(src_model):
                 mod.set_fake_quant_enabled(False)
         except Exception:
             pass
-
         try:
             if hasattr(mod, "observer_enabled"):
                 setattr(mod, "observer_enabled", False)
@@ -94,7 +90,6 @@ def _prepare_model_for_onnx_export(src_model):
                 setattr(mod, "fake_quant_enabled", False)
         except Exception:
             pass
-
     _replace_modules_recursively(m)
     return m
 
@@ -106,6 +101,11 @@ def export_onnx(model, im, file, opset, dynamic, simplify, prefix=colorstr("ONNX
     f = file.with_suffix(".onnx")
 
     export_model = _prepare_model_for_onnx_export(model)
+    for _, m in export_model.named_modules():
+        if isinstance(m, RN_DualDDetect):
+            m.export = True
+            if not hasattr(m, "export_logits") or not m.export_logits:
+                setattr(m, "export_logits", True)
 
     output_names = ["output0"]
     if dynamic:
@@ -131,7 +131,7 @@ def export_onnx(model, im, file, opset, dynamic, simplify, prefix=colorstr("ONNX
     model_onnx = onnx.load(f)
     onnx.checker.check_model(model_onnx)
 
-    d = {"stride": int(max(model.stride)), "names": model.names}
+    d = {"stride": int(max(model.stride)), "names": model.names, "head_activation": "logits"}
     for k, v in d.items():
         meta = model_onnx.metadata_props.add()
         meta.key, meta.value = k, str(v)
@@ -182,11 +182,13 @@ def run(
     im = torch.zeros(batch_size, 3, *imgsz).to(device)
 
     model.eval()
-    for k, m in model.named_modules():
+    for _, m in model.named_modules():
         if isinstance(m, RN_DualDDetect):
             m.inplace = inplace
             m.dynamic = dynamic
             m.export = True
+            if not hasattr(m, "export_logits") or not m.export_logits:
+                setattr(m, "export_logits", True)
 
     for _ in range(2):
         y = model(im)

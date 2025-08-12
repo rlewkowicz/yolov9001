@@ -139,7 +139,6 @@ def train(hyp, opt, device, callbacks):
     w = save_dir / "weights"
     (w.parent if evolve else w).mkdir(parents=True, exist_ok=True)
     last, best = w / "last.pt", w / "best.pt"
-
     if isinstance(hyp, str):
         with open(hyp, errors="ignore") as f:
             hyp = yaml.safe_load(f)
@@ -153,7 +152,6 @@ def train(hyp, opt, device, callbacks):
     if not evolve:
         yaml_save(save_dir / "hyp.yaml", hyp)
         yaml_save(save_dir / "opt.yaml", vars(opt))
-
     data_dict = None
     if RANK in {-1, 0}:
         loggers = Loggers(save_dir, weights, opt, hyp, LOGGER)
@@ -163,18 +161,15 @@ def train(hyp, opt, device, callbacks):
         if resume:
             weights, epochs, hyp, batch_size = opt.weights, opt.epochs, opt.hyp, opt.batch_size
             optimizer_settings = hyp["optimizer"][opt.optimizer]
-
     plots = not evolve and not opt.noplots
     cuda = device.type != "cpu"
     init_seeds(opt.seed + 1 + RANK, deterministic=True)
-
     with torch_distributed_zero_first(LOCAL_RANK):
         data_dict = data_dict or check_dataset(data)
     train_path, val_path = data_dict["train"], data_dict["val"]
     nc = 1 if single_cls else int(data_dict["nc"])
     names = {0: "item"} if single_cls and len(data_dict["names"]) != 1 else data_dict["names"]
     is_coco = isinstance(val_path, str) and val_path.endswith('val2017.txt')
-
     check_suffix(weights, ".pt")
     pretrained = weights.endswith(".pt")
     if pretrained:
@@ -205,34 +200,27 @@ def train(hyp, opt, device, callbacks):
             qat=opt.qat,
             qat_per_channel=opt.int8_per_channel
         ).to(device)
-
     amp = bool(opt.amp and not opt.qat)
-
     freeze = [f"model.{x}." for x in (freeze if len(freeze) > 1 else range(freeze[0]))]
     for k, v in model.named_parameters():
         if any(x in k for x in freeze):
             LOGGER.info(f"freezing {k}")
             v.requires_grad = False
-
     gs = max(int(model.stride.max()), 32)
     imgsz = check_img_size(opt.imgsz, gs, floor=gs * 2)
-
     if RANK == -1 and batch_size == -1:
         batch_size = check_train_batch_size(model, imgsz, amp)
         loggers.on_params_update({"batch_size": batch_size})
-
     nbs = 64
     accumulate = max(round(nbs / batch_size), 1)
     lambda_target = optimizer_settings.get("weight_decay", 0.0)
     scaled_weight_decay = lambda_target
-
     decoupled_settings = optimizer_settings.get("decoupled_lr", {})
     lr_scale_backbone = decoupled_settings.get("backbone", {}).get("lr_scale", 1.0)
     lr_scale_head = decoupled_settings.get("head", {}).get("lr_scale", 1.0)
     lr_scale_sppf = decoupled_settings.get("sppf", {}).get(
         "lr_scale", (lr_scale_backbone + lr_scale_head) / 2.0
     )
-
     if hasattr(model, 'yaml') and 'backbone' in model.yaml:
         backbone_full_len = len(model.yaml['backbone'])
         sppf_index = backbone_full_len - 1
@@ -245,7 +233,6 @@ def train(hyp, opt, device, callbacks):
             "Could not find model.yaml['backbone']. Falling back to default backbone length of %d.",
             backbone_len
         )
-
     backbone_indices = range(backbone_len)
     param_groups = {
         "backbone_weights": {
@@ -276,7 +263,6 @@ def train(hyp, opt, device, callbacks):
             target_group_prefix = "backbone" if is_backbone else "head"
         target_group_suffix = "weights" if p.ndim > 1 and '.bias' not in name else "others"
         param_groups[f"{target_group_prefix}_{target_group_suffix}"]["params"].append(p)
-
     optimizer_param_groups = []
     base_lr = optimizer_settings["lr0"]
     for group_name, group_data in param_groups.items():
@@ -286,7 +272,6 @@ def train(hyp, opt, device, callbacks):
                 "params": group_data["params"], "lr": group_lr, "initial_lr": group_lr,
                 "weight_decay": group_data["weight_decay"], "name": group_name
             })
-
     if opt.optimizer == "SGD":
         optimizer = torch.optim.SGD(
             optimizer_param_groups, momentum=optimizer_settings["momentum"], nesterov=True
@@ -306,10 +291,8 @@ def train(hyp, opt, device, callbacks):
         )
     else:
         raise NotImplementedError(f"Unknown optimizer {opt.optimizer}")
-
     lr_scheduler_type = optimizer_settings.get("lr_scheduler_type", "cosine")
     lrf = optimizer_settings["lrf"]
-
     if lr_scheduler_type == "cosine":
         lf_original = one_cycle(1, lrf, epochs)
     elif lr_scheduler_type == "flat_cosine":
@@ -318,7 +301,6 @@ def train(hyp, opt, device, callbacks):
         lf_original = lambda x: 1.0
     else:
         lf_original = lambda x: (1 - x / epochs) * (1.0 - lrf) + lrf
-
     def lf(epoch):
         factor = lf_original(epoch)
         ddp_warmup_epochs = 0
@@ -328,25 +310,20 @@ def train(hyp, opt, device, callbacks):
             damp = min_lr_mul + (1.0 - min_lr_mul) * (1.0 - cosine)
             factor *= damp
         return factor
-
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
-
     ema = None
     if opt.sync_bn and cuda and RANK != -1:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
     if RANK in {-1, 0}:
         ema = ModelEMA(model)
-
     best_fitness, start_epoch = 0.0, 0
     if pretrained and resume:
         best_fitness, start_epoch, epochs = smart_resume(
             ckpt, optimizer, ema, weights, epochs, resume
         )
         del ckpt, csd
-
     if cuda and RANK == -1 and torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
-
     train_loader, dataset = create_dataloader(
         train_path,
         imgsz,
@@ -368,7 +345,6 @@ def train(hyp, opt, device, callbacks):
     )
     mlc = int(np.concatenate(dataset.labels, 0)[:, 0].max()) if len(dataset.labels) else 0
     assert mlc < nc, f'Label class {mlc} exceeds nc={nc} in {data}.'
-
     if RANK in {-1, 0}:
         val_loader = create_dataloader(
             val_path,
@@ -387,15 +363,12 @@ def train(hyp, opt, device, callbacks):
         if not resume:
             labels = np.concatenate(dataset.labels, 0)
             callbacks.run("on_pretrain_routine_end", labels, names)
-
     if cuda and RANK != -1:
         model = smart_DDP(model)
-
     model.nc = nc
     model.hyp = hyp
     model.names = names
     model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc
-
     t0 = time.time()
     nb = len(train_loader)
     nw = max(round(optimizer_settings["warmup_epochs"] * nb), 100)
@@ -405,11 +378,9 @@ def train(hyp, opt, device, callbacks):
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
     stopper, stop = EarlyStopping(patience=opt.patience), False
     compute_loss = RN_ComputeLoss(model)
-
     head_observer = EMAMinMax(
         channels=None, momentum=opt.int8_calib_momentum, per_channel=opt.int8_per_channel
     ) if opt.record_int8_calib else None
-
     def _export_like_from_training(pred, model_ref):
         base = de_parallel(model_ref)
         if not hasattr(base, "model") or not base.model:
@@ -436,7 +407,6 @@ def train(hyp, opt, device, callbacks):
             if hasattr(head, "export_like_for_calib"):
                 return head.export_like_for_calib(d2, shape)
             return head._export_like_from_d2(d2, shape)
-
     callbacks.run("on_train_start")
     LOGGER.info(
         f"Image sizes {imgsz} train, {imgsz} val\nUsing {train_loader.num_workers * WORLD_SIZE} dataloader workers\n"
@@ -445,34 +415,27 @@ def train(hyp, opt, device, callbacks):
     for epoch in range(start_epoch, epochs):
         callbacks.run("on_train_epoch_start")
         model.train()
-
         if opt.image_weights:
             cw = model.class_weights.cpu().numpy() * (1 - maps)**2 / nc
             iw = labels_to_image_weights(dataset.labels, nc=nc, class_weights=cw)
             dataset.indices = random.choices(range(dataset.n), weights=iw, k=dataset.n)
-
         if epoch == (epochs - opt.close_mosaic):
             if RANK in {-1, 0}:
                 LOGGER.info("Closing dataloader mosaic")
             dataset.mosaic = False
-
         mloss = torch.zeros(3, device=device)
         if RANK != -1:
             train_loader.sampler.set_epoch(epoch)
-
         pbar = enumerate(train_loader)
         LOGGER.info(("\n" + "%11s" * 7) %
                     ("Epoch", "GPU_mem", "box_loss", "cls_loss", "dfl_loss", "Instances", "Size"))
         if RANK in {-1, 0}:
             pbar = tqdm(pbar, total=nb, bar_format=TQDM_BAR_FORMAT)
-
         optimizer.zero_grad()
         for i, (imgs, targets, paths, _) in pbar:
             callbacks.run("on_train_batch_start")
             ni = i + nb * epoch
-
             imgs = imgs.to(device, non_blocking=True).float() / 255
-
             if ni <= nw:
                 xi = [0, nw]
                 accumulate = max(1, np.interp(ni, xi, [1, nbs / batch_size]).round())
@@ -495,7 +458,6 @@ def train(hyp, opt, device, callbacks):
                             [optimizer_settings['warmup_momentum'], optimizer_settings['b1']]
                         )
                         x['betas'] = (new_beta1, x['betas'][1])
-
             if opt.multi_scale:
                 sz = random.randrange(int(imgsz * 0.5), int(imgsz * 1.5) + gs) // gs * gs
                 sf = sz / max(imgs.shape[2:])
@@ -504,7 +466,6 @@ def train(hyp, opt, device, callbacks):
                     imgs = nn.functional.interpolate(
                         imgs, size=ns, mode="bilinear", align_corners=False
                     )
-
             with torch.cuda.amp.autocast(enabled=amp):
                 pred = model(imgs)
                 loss, loss_items = compute_loss(pred, targets.to(device))
@@ -512,14 +473,11 @@ def train(hyp, opt, device, callbacks):
                     loss *= WORLD_SIZE
                 if opt.quad:
                     loss *= 4.0
-
             if head_observer is not None:
                 y_main = _export_like_from_training(pred, model)
                 if isinstance(y_main, torch.Tensor) and y_main.dim() >= 2:
                     head_observer.update(y_main.detach())
-
             scaler.scale(loss).backward()
-
             if ni - last_opt_step >= accumulate:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
@@ -529,7 +487,6 @@ def train(hyp, opt, device, callbacks):
                 if ema:
                     ema.update(model)
                 last_opt_step = ni
-
             if RANK in {-1, 0}:
                 mloss = (mloss * i + loss_items) / (i + 1)
                 mem = f"{torch.cuda.memory_reserved() / 1e9 if torch.cuda.is_available() else 0:.3g}G"
@@ -540,10 +497,8 @@ def train(hyp, opt, device, callbacks):
                 callbacks.run("on_train_batch_end", model, ni, imgs, targets, paths, list(mloss))
                 if callbacks.stop_training:
                     return
-
         lr = [x["lr"] for x in optimizer.param_groups]
         scheduler.step()
-
         if RANK in {-1, 0}:
             callbacks.run("on_train_epoch_end", epoch=epoch)
             if ema:
@@ -568,17 +523,13 @@ def train(hyp, opt, device, callbacks):
                     compute_loss=compute_loss
                 )
                 compute_loss.ddp_reduce = prev
-
             fi = fitness(np.array(results).reshape(1, -1))
             stop = stopper(epoch=epoch, fitness=fi)
             if fi > best_fitness:
                 best_fitness = fi
-
             log_vals = list(mloss) + list(results) + lr
             callbacks.run("on_fit_epoch_end", log_vals, epoch, best_fitness, fi)
-
             if (not nosave) or (final_epoch and not evolve):
-
                 def _clone_for_save(mm):
                     m2 = deepcopy(de_parallel(mm)).float()
                     for _m in m2.modules():
@@ -588,10 +539,8 @@ def train(hyp, opt, device, callbacks):
                             except Exception:
                                 pass
                     return m2
-
                 ckpt_model = _clone_for_save(model)
                 ckpt_ema = _clone_for_save(ema.ema) if ema else None
-
                 quant_meta = None
                 if head_observer is not None:
                     head_state = head_observer.state_dict()
@@ -607,9 +556,8 @@ def train(hyp, opt, device, callbacks):
                             ],
                             "per_channel": bool(opt.int8_per_channel),
                             "momentum": float(opt.int8_calib_momentum),
-                            "note": "export-like tensor is [xywh(px), sigmoid(cls)]",
+                            "note": "export-like tensor is [xywh(px), cls_logits]",
                         }
-
                 ckpt = {
                     "epoch": epoch,
                     "best_fitness": best_fitness,
@@ -629,7 +577,6 @@ def train(hyp, opt, device, callbacks):
                     torch.save(ckpt, w / f"epoch{epoch}.pt")
                 del ckpt
                 callbacks.run("on_model_save", last, epoch, final_epoch, best_fitness, fi)
-
         if RANK != -1:
             broadcast_list = [stop if RANK == 0 else None]
             dist.broadcast_object_list(broadcast_list, 0)
@@ -637,7 +584,6 @@ def train(hyp, opt, device, callbacks):
                 stop = broadcast_list[0]
         if stop:
             break
-
     if RANK in {-1, 0}:
         LOGGER.info(
             f"\n{epoch - start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours."
@@ -665,7 +611,6 @@ def train(hyp, opt, device, callbacks):
                     )
                     compute_loss.ddp_reduce = prev
         callbacks.run("on_train_end", last, best, epoch, results)
-
     torch.cuda.empty_cache()
     return results
 

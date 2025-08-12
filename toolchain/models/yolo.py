@@ -48,6 +48,7 @@ class RN_DualDDetect(nn.Module):
         self.no = nc + self.reg_max * 4
         self.inplace = inplace
         self.stride = torch.zeros(self.nl)
+        self.export_logits = False
         (c2, c3) = (
             make_divisible(max((ch[0] // 4, self.reg_max * 4, 16)), 4),
             max((ch[0], min((self.nc * 2, 128)))),
@@ -80,7 +81,6 @@ class RN_DualDDetect(nn.Module):
             for x in ch[self.nl:]
         ))
         self.dfl2 = DFL(self.reg_max)
-
         self.requant1 = Requant()
         self.requant2 = Requant()
 
@@ -96,7 +96,8 @@ class RN_DualDDetect(nn.Module):
         pixel_anchor_points2 = anc.unsqueeze(0) * strd
         pixel_pred_dist2 = self.dfl2(box2) * strd
         dbox2 = dist2bbox(pixel_pred_dist2, pixel_anchor_points2, xywh=True, dim=1)
-        return torch.cat((dbox2, F.hardsigmoid(cls2)), 1)
+        cls_out = cls2 if self.export_logits else F.hardsigmoid(cls2)
+        return torch.cat((dbox2, cls_out), 1)
 
     def export_like_for_calib(self, d2, shape, anchors=None, strides=None):
         (box2, cls2) = torch.cat([di.view(shape[0], self.no, -1) for di in d2],
@@ -126,27 +127,23 @@ class RN_DualDDetect(nn.Module):
         else:
             for i in range(self.nl):
                 d2.append(rq2(torch.cat((self.cv4[i](x[i]), self.cv5[i](x[i])), 1)))
-
         if self.training:
             return [d1, d2]
-
         if self.dynamic or self.shape != shape:
             (self.anchors,
              self.strides) = (x.transpose(0, 1) for x in make_anchors(d2, self.stride, 0.5))
             self.shape = shape
-
         y_main = self._export_like_from_d2(d2, shape, self.anchors, self.strides)
-
         if not has_aux_branch:
             return y_main if self.export else (y_main, d2)
-
         (box, cls) = torch.cat([di.view(shape[0], self.no, -1) for di in d1],
                                2).split((self.reg_max * 4, self.nc), 1)
         (aux_anchors, aux_strides) = (x.transpose(0, 1) for x in make_anchors(d1, self.stride, 0.5))
         pixel_anchor_points1 = aux_anchors.unsqueeze(0) * aux_strides
         pixel_pred_dist1 = self.dfl(box) * aux_strides
         dbox = dist2bbox(pixel_pred_dist1, pixel_anchor_points1, xywh=True, dim=1)
-        y_aux = torch.cat((dbox, F.hardsigmoid(cls)), 1)
+        cls_out = cls if self.export_logits else F.hardsigmoid(cls)
+        y_aux = torch.cat((dbox, cls_out), 1)
         return [y_aux, y_main] if self.export else ([y_aux, y_main], [d1, d2])
 
     def bias_init(self):
