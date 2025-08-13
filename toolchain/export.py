@@ -62,8 +62,14 @@ def _replace_modules_recursively(m):
         else:
             _replace_modules_recursively(c)
 
-def _prepare_model_for_onnx_export(src_model):
+def _prepare_model_for_onnx_export(src_model, int8=False, quant_backend="fbgemm"):
     m = deepcopy(src_model).eval()
+    if int8:
+        import torch.ao.quantization as tq
+        torch.backends.quantized.engine = quant_backend
+        m = m.cpu()
+        tq.convert(m, inplace=True)
+        return m
     try:
         import torch.ao.quantization as tq
         tq.convert(m, inplace=True)
@@ -94,28 +100,75 @@ def _prepare_model_for_onnx_export(src_model):
     return m
 
 @try_export
-def export_onnx(model, im, file, opset, dynamic, simplify, prefix=colorstr("ONNX:")):
+def export_onnx(model, im, file, opset, dynamic, simplify, int8=False, quant_backend="fbgemm", prefix=colorstr("ONNX:")):
+    """
+    Exports ONNX with 1 or 2 outputs.
+
+    If RN_DualDDetect.export_split is True (and export=True), the model returns:
+        (boxes_xywh_px, class_logits)  -> 2 ONNX outputs: "boxes", "logits"
+    Otherwise it returns a single concatenated tensor -> 1 ONNX output: "output0".
+    """
     check_requirements("onnx")
     import onnx
+
     LOGGER.info(f"\n{prefix} starting export with onnx {onnx.__version__}...")
     f = file.with_suffix(".onnx")
 
-    export_model = _prepare_model_for_onnx_export(model)
+    # Clone & (optionally) convert QAT graph -> quantized
+    export_model = _prepare_model_for_onnx_export(model, int8=int8, quant_backend=quant_backend)
+
+    # Ensure the head is configured for export (logits + split if present)
     for _, m in export_model.named_modules():
         if isinstance(m, RN_DualDDetect):
             m.export = True
+            # always export logits (your compare expects raw logits -> sigmoid later)
             if not hasattr(m, "export_logits") or not m.export_logits:
                 setattr(m, "export_logits", True)
+            # make sure split mode is ON so we actually get 2 outputs
+            if not hasattr(m, "export_split") or not m.export_split:
+                setattr(m, "export_split", True)
 
-    output_names = ["output0"]
-    if dynamic:
-        dynamic = {"images": {0: "batch", 2: "height", 3: "width"}}
-        if isinstance(export_model, DetectionModel):
-            dynamic["output0"] = {0: "batch", 1: "anchors"}
+    # Decide output count via a dry run
+    use_model = export_model.cpu().eval()
+    use_im = im.cpu()
+    with torch.no_grad():
+        y = use_model(use_im)
 
-    use_model = export_model.cpu() if dynamic else export_model
-    use_im = im.cpu() if dynamic else im
+    # Flatten nested outputs to a simple list of tensors
+    def _flatten(o):
+        if isinstance(o, (list, tuple)):
+            out = []
+            for t in o:
+                out.extend(_flatten(t))
+            return out
+        elif torch.is_tensor(o):
+            return [o]
+        else:
+            raise TypeError(f"Unexpected output type during export: {type(o)}")
 
+    outs = _flatten(y)
+    if len(outs) == 0:
+        raise RuntimeError("Model produced no tensors on the dry run; cannot export.")
+
+    # Build output names and dynamic axes
+    if len(outs) == 2:
+        # Expect (boxes[N,4,S], logits[N,nc,S])
+        output_names = ["boxes", "logits"]
+    else:
+        output_names = ["output0"]
+
+    if int8:
+        # ORT quantizer can be picky about dynamic axes
+        dynamic_axes = None
+    else:
+        dynamic_axes = {"images": {0: "batch", 2: "height", 3: "width"}}
+        if dynamic:
+            # Set sensible dynamic axes for outputs
+            # boxes/logits: [N, C, S] -> batch dim=0; anchors/positions dim=2
+            for name in output_names:
+                dynamic_axes[name] = {0: "batch", 2: "anchors"}
+
+    # Export
     torch.onnx.export(
         use_model,
         use_im,
@@ -125,32 +178,42 @@ def export_onnx(model, im, file, opset, dynamic, simplify, prefix=colorstr("ONNX
         do_constant_folding=True,
         input_names=["images"],
         output_names=output_names,
-        dynamic_axes=dynamic or None,
+        dynamic_axes=dynamic_axes if dynamic else None,
     )
 
     model_onnx = onnx.load(f)
     onnx.checker.check_model(model_onnx)
 
-    d = {"stride": int(max(model.stride)), "names": model.names, "head_activation": "logits"}
+    # Metadata: tell downstream tools this head emits logits and xywh pixel boxes
+    # (matches your RN_DualDDetect decode path which returns xywh(px) + logits)
+    d = {
+        "stride": int(max(model.stride)),
+        "names": model.names,
+        "head_activation": "logits",
+        "boxes_format": "xywh",
+        "outputs": len(output_names),
+    }
     for k, v in d.items():
         meta = model_onnx.metadata_props.add()
         meta.key, meta.value = k, str(v)
     onnx.save(model_onnx, f)
 
+    # Optional simplification
     if simplify:
         try:
             cuda = torch.cuda.is_available()
-            check_requirements(
-                ("onnxruntime-gpu" if cuda else "onnxruntime", "onnx-simplifier>=0.4.1")
-            )
+            check_requirements(("onnxruntime-gpu" if cuda else "onnxruntime", "onnx-simplifier>=0.4.1"))
             import onnxsim
             LOGGER.info(f"{prefix} simplifying with onnx-simplifier {onnxsim.__version__}...")
             model_onnx, check = onnxsim.simplify(model_onnx)
-            assert check, "assert check failed"
+            assert check, "onnx-simplifier check failed"
             onnx.save(model_onnx, f)
         except Exception as e:
             LOGGER.info(f"{prefix} simplifier failure: {e}")
+
     return f, model_onnx
+
+
 
 @smart_inference_mode()
 def run(
@@ -163,15 +226,20 @@ def run(
     half=False,
     inplace=False,
     dynamic=False,
-    simplify=False,
+    simplify=True,
     opset=19,
+    int8=False,
+    quant_backend="fbgemm",
 ):
     t = time.time()
     include = [x.lower() for x in include]
     file = Path(url2file(weights) if str(weights).startswith(("http:/", "https:/")) else weights)
 
+    if int8:
+        device = "cpu"
     device = select_device(device)
     if half:
+        assert not int8, "--half is not compatible with --int8"
         assert device.type != "cpu", ("--half only compatible with GPU export, i.e. use --device 0")
         assert not dynamic, "--half not compatible with --dynamic"
 
@@ -201,7 +269,7 @@ def run(
     )
 
     if "onnx" in include:
-        export_onnx(model, im, file, opset, dynamic, simplify)
+        export_onnx(model, im, file, opset, dynamic, simplify, int8=int8, quant_backend=quant_backend)
 
     LOGGER.info(f"\nExport complete ({time.time() - t:.1f}s)")
     LOGGER.info(f"Results saved to {colorstr('bold', file.parent.resolve())}")
@@ -232,6 +300,8 @@ def parse_opt():
     )
     parser.add_argument("--opset", type=int, default=19, help="ONNX: opset version")
     parser.add_argument("--include", nargs="+", default=["onnx"], help="Export format")
+    parser.add_argument("--int8", action="store_true", help="Enable INT8 export via PyTorch QAT convert (CPU only)")
+    parser.add_argument("--quant-backend", type=str, default="fbgemm", choices=["fbgemm", "qnnpack"], help="Quantized backend for INT8 export")
     opt = parser.parse_args()
     print_args(vars(opt))
     return opt

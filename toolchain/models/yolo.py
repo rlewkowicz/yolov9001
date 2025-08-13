@@ -34,6 +34,23 @@ except ImportError:
     thop = None
 
 class RN_DualDDetect(nn.Module):
+    """
+    Dual-branch detection head.
+
+    Preserved:
+      - Aux branch: cv2/cv3 + dfl  (first half of inputs)
+      - Main branch: cv4/cv5 + dfl2 (second half of inputs)
+      - All decoding math, shapes, and training-time returns
+
+    New (non-breaking) knobs:
+      - self.export_logits (bool, default True): export class logits instead of probs
+      - self.export_split  (bool, default False): if True AND export=True, return a tuple
+            (boxes_xywh_px, class_logits_or_probs) instead of a single concatenated tensor
+
+    Notes:
+      - Forward tolerates pruned aux branch (after fuse()).
+      - Safe guards ensure old objects/checkpoints that lack `export_split` won't crash.
+    """
     dynamic = False
     export = False
     shape = None
@@ -48,7 +65,12 @@ class RN_DualDDetect(nn.Module):
         self.no = nc + self.reg_max * 4
         self.inplace = inplace
         self.stride = torch.zeros(self.nl)
-        self.export_logits = False
+
+        # Export controls
+        self.export_logits = True
+        self.export_split = True
+
+        # ----- Aux branch (kept; may be pruned later) -----
         (c2, c3) = (
             make_divisible(max((ch[0] // 4, self.reg_max * 4, 16)), 4),
             max((ch[0], min((self.nc * 2, 128)))),
@@ -65,6 +87,8 @@ class RN_DualDDetect(nn.Module):
             for x in ch[:self.nl]
         ))
         self.dfl = DFL(self.reg_max)
+
+        # ----- Main branch -----
         (c4, c5) = (
             make_divisible(max((ch[self.nl] // 4, self.reg_max * 4, 16)), 4),
             max((ch[self.nl], min((self.nc * 2, 128)))),
@@ -81,27 +105,46 @@ class RN_DualDDetect(nn.Module):
             for x in ch[self.nl:]
         ))
         self.dfl2 = DFL(self.reg_max)
+
+        # Requant stubs (kept for your fuse/prune flow)
         self.requant1 = Requant()
         self.requant2 = Requant()
 
+    # ----------------- helpers -----------------
     def _export_like_from_d2(self, d2, shape, anchors=None, strides=None):
-        (box2, cls2) = torch.cat([di.view(shape[0], self.no, -1) for di in d2],
-                                 2).split((self.reg_max * 4, self.nc), 1)
+        # [B, no, S] -> split to box/class channels (no = reg_max*4 + nc)
+        box2, cls2 = torch.cat([di.view(shape[0], self.no, -1) for di in d2], 2).split(
+            (self.reg_max * 4, self.nc), 1
+        )
+
+        # Training-time short path (unchanged)
         if self.training and not torch.onnx.is_in_onnx_export():
             return torch.cat((box2, cls2), 1)
+
+        # Anchors/strides
         if anchors is None or strides is None:
             anc, strd = (x.transpose(0, 1) for x in make_anchors(d2, self.stride, 0.5))
         else:
             anc, strd = anchors, strides
+
+        # Decode distribution to pixel boxes (identical math)
         pixel_anchor_points2 = anc.unsqueeze(0) * strd
         pixel_pred_dist2 = self.dfl2(box2) * strd
         dbox2 = dist2bbox(pixel_pred_dist2, pixel_anchor_points2, xywh=True, dim=1)
+
+        # Class branch: logits if export_logits else hardsigmoid
         cls_out = cls2 if self.export_logits else F.hardsigmoid(cls2)
+
+        # Optional split for export (defaults to concat for backward compat)
+        if self.export and getattr(self, "export_split", False):
+            return dbox2, cls_out
         return torch.cat((dbox2, cls_out), 1)
 
     def export_like_for_calib(self, d2, shape, anchors=None, strides=None):
-        (box2, cls2) = torch.cat([di.view(shape[0], self.no, -1) for di in d2],
-                                 2).split((self.reg_max * 4, self.nc), 1)
+        # For EMAMinMax: return [xywh(px), cls_logits]
+        box2, cls2 = torch.cat([di.view(shape[0], self.no, -1) for di in d2], 2).split(
+            (self.reg_max * 4, self.nc), 1
+        )
         if anchors is None or strides is None:
             anc, strd = (x.transpose(0, 1) for x in make_anchors(d2, self.stride, 0.5))
         else:
@@ -109,43 +152,68 @@ class RN_DualDDetect(nn.Module):
         pixel_anchor_points2 = anc.unsqueeze(0) * strd
         pixel_pred_dist2 = self.dfl2(box2) * strd
         dbox2 = dist2bbox(pixel_pred_dist2, pixel_anchor_points2, xywh=True, dim=1)
-        return torch.cat((dbox2, cls2), 1)
+        return torch.cat((dbox2, cls2), 1)  # logits for calibration
 
+    # ----------------- forward -----------------
     def forward(self, x):
         shape = x[0].shape
-        has_aux_branch = hasattr(self, "cv2")
+
+        # Backward-compat: if older objects lack export_split, create it
+        if not hasattr(self, "export_split"):
+            self.export_split = False
+
+        # Handle pruned aux branch safely
+        has_aux_branch = (
+            hasattr(self, "cv2") and hasattr(self, "cv3") and
+            isinstance(getattr(self, "cv2"), nn.ModuleList) and
+            isinstance(getattr(self, "cv3"), nn.ModuleList)
+        )
+
         rq1 = getattr(self, "requant1", nn.Identity())
         rq2 = getattr(self, "requant2", nn.Identity())
-        d1 = []
-        d2 = []
+        d1, d2 = [], []
+
         if has_aux_branch:
             for i in range(self.nl):
                 d1.append(rq1(torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)))
-                d2.append(
-                    rq2(torch.cat((self.cv4[i](x[self.nl + i]), self.cv5[i](x[self.nl + i])), 1))
-                )
+                d2.append(rq2(torch.cat((self.cv4[i](x[self.nl + i]), self.cv5[i](x[self.nl + i])), 1)))
         else:
             for i in range(self.nl):
                 d2.append(rq2(torch.cat((self.cv4[i](x[i]), self.cv5[i](x[i])), 1)))
+
         if self.training:
             return [d1, d2]
+
+        # Cache anchors/strides as before
         if self.dynamic or self.shape != shape:
-            (self.anchors,
-             self.strides) = (x.transpose(0, 1) for x in make_anchors(d2, self.stride, 0.5))
+            (self.anchors, self.strides) = (x.transpose(0, 1) for x in make_anchors(d2, self.stride, 0.5))
             self.shape = shape
+
+        # Main branch decode
         y_main = self._export_like_from_d2(d2, shape, self.anchors, self.strides)
+
+        # If aux branch pruned, return main only (unchanged API)
         if not has_aux_branch:
             return y_main if self.export else (y_main, d2)
-        (box, cls) = torch.cat([di.view(shape[0], self.no, -1) for di in d1],
-                               2).split((self.reg_max * 4, self.nc), 1)
-        (aux_anchors, aux_strides) = (x.transpose(0, 1) for x in make_anchors(d1, self.stride, 0.5))
+
+        # Aux branch decode (identical math)
+        box, cls = torch.cat([di.view(shape[0], self.no, -1) for di in d1], 2).split(
+            (self.reg_max * 4, self.nc), 1
+        )
+        aux_anchors, aux_strides = (x.transpose(0, 1) for x in make_anchors(d1, self.stride, 0.5))
         pixel_anchor_points1 = aux_anchors.unsqueeze(0) * aux_strides
         pixel_pred_dist1 = self.dfl(box) * aux_strides
         dbox = dist2bbox(pixel_pred_dist1, pixel_anchor_points1, xywh=True, dim=1)
         cls_out = cls if self.export_logits else F.hardsigmoid(cls)
-        y_aux = torch.cat((dbox, cls_out), 1)
+
+        if self.export and getattr(self, "export_split", False):
+            y_aux = (dbox, cls_out)
+        else:
+            y_aux = torch.cat((dbox, cls_out), 1)
+
         return [y_aux, y_main] if self.export else ([y_aux, y_main], [d1, d2])
 
+    # ----------------- init -----------------
     def bias_init(self):
         if hasattr(self, "cv2"):
             for a, b, s in zip(self.cv2, self.cv3, self.stride):
@@ -154,6 +222,7 @@ class RN_DualDDetect(nn.Module):
         for a, b, s in zip(self.cv4, self.cv5, self.stride):
             a[-1].bias.data[:] = 1.0
             b[-1].bias.data[:self.nc] = math.log(5 / self.nc / (640 / s)**2)
+
 
 class BaseModel(nn.Module):
     def __init__(self):
