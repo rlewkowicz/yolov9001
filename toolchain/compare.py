@@ -379,12 +379,23 @@ def print_pt_vs_qdq_qparams(pt_dq, qdq_params, names, max_classes_to_show=10):
 # ========================= IO & postprocess =========================
 
 def prepare_input_for_session(session, source, imgsz):
+    # Load one sample from the same Ultralytics loader used in detect.py
     loader = LoadImages(source, img_size=imgsz, auto=False)
-    _, im, _, _, _ = next(iter(loader))
-    x = im.astype(np.float32) / 255.0
+
+    # NOTE: LoadImages yields (path, im, im0, vid_cap, s)
+    #   - im  = letterboxed, CHW, RGB (for model input)
+    #   - im0 = original image, HWC, BGR (for drawing/saving)
+    _, im, im0, _, _ = next(iter(loader))
+
+    # Build model input (NCHW, float32 in [0,1])
+    x = im.astype(np.float32)
+    if x.max() > 1.0:
+        x = x / 255.0
     if x.ndim == 3:
         x = x[None]
-    return x, im
+
+    # Return the network input AND the original BGR image for Annotator/cv2
+    return x, im0
 
 
 def _to_cfirst(a: np.ndarray) -> np.ndarray:
@@ -533,20 +544,89 @@ def custom_non_max_suppression(boxes_cfirst, logits_cfirst, conf_thres, iou_thre
     return [torch.from_numpy(final_detections)]
 
 
+# --------- robust saver (added) ---------
+def safe_save_image(img_like, save_path: Path, ref_shape=None):
+    """
+    Robustly save an image using cv2 or PIL fallback.
+    Accepts numpy arrays (HWC, uint8 BGR expected). Tries to correct common shape/dtype issues.
+    """
+    try:
+        arr = img_like
+        # Convert PIL -> np if needed
+        try:
+            from PIL import Image
+            if isinstance(arr, Image.Image):
+                arr = np.array(arr)
+        except Exception:
+            pass
+
+        arr = np.asarray(arr)
+
+        # If CHW -> HWC
+        if arr.ndim == 3 and arr.shape[0] in (1, 3) and arr.shape[0] < arr.shape[-1] and arr.shape[1] != 1:
+            arr = np.transpose(arr, (1, 2, 0))
+
+        # If single-channel expand to BGR
+        if arr.ndim == 2:
+            arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
+        elif arr.ndim == 3 and arr.shape[2] == 1:
+            arr = cv2.cvtColor(arr.squeeze(-1), cv2.COLOR_GRAY2BGR)
+
+        # If weird shapes (e.g., (1,1,W) etc.), try to rebuild from ref_shape
+        if arr.ndim != 3 or arr.shape[2] != 3:
+            if ref_shape is not None and len(ref_shape) >= 3:
+                H, W, C = ref_shape[:3]
+                if arr.size == H * W * C:
+                    arr = arr.reshape(H, W, C)
+            # If still not valid, raise to fallback
+            if arr.ndim != 3 or arr.shape[2] != 3:
+                raise ValueError(f"Unexpected image shape {arr.shape}")
+
+        # Ensure uint8 0..255
+        if arr.dtype != np.uint8:
+            if arr.dtype in (np.float32, np.float64):
+                if arr.max() <= 1.0 + 1e-6:
+                    arr = (arr * 255.0).clip(0, 255)
+            arr = arr.astype(np.uint8)
+
+        arr = np.ascontiguousarray(arr)
+
+        # Try OpenCV first
+        ok = cv2.imwrite(str(save_path), arr)
+        if not ok:
+            raise RuntimeError("cv2.imwrite returned False")
+
+    except Exception as e:
+        # Fallback to PIL
+        try:
+            from PIL import Image
+            img = Image.fromarray(arr[..., ::-1]) if arr.ndim == 3 and arr.shape[2] == 3 else Image.fromarray(arr)
+            img.save(str(save_path))
+        except Exception as e2:
+            # Final fallback: save .npy
+            npy_path = str(save_path.with_suffix(".npy"))
+            np.save(npy_path, arr)
+            LOGGER.warning(
+                f"Could not save annotated image to {save_path}; "
+                f"saved raw array to {npy_path} instead. Error: {e2}"
+            )
+
+
 def run_one(session, im_in, im0, names, mode, boxes_format, conf_thres, iou_thres, max_det, save_path):
     """
     Runs end-to-end inference on one image using the custom NMS.
+    Uses YOLO's Annotator + scale_boxes + cv2.imwrite like detect.py.
     """
-    # Get raw box and logit outputs from the model
+    # Get raw box and logit outputs from the model (YOLO-style split heads)
     boxes, logits = run_head(session, im_in, names)
 
-    # For cosine similarity, concatenate the raw outputs
+    # For cosine similarity, concatenate along channel dimension: [N, 4+nc, S]
     head_flat_for_cosine = np.concatenate([boxes, logits], axis=1)
 
-    # Run our custom Non-Maximum Suppression
+    # Custom NMS on raw heads
     dets = custom_non_max_suppression(boxes, logits, conf_thres, iou_thres, max_det)
 
-    # Annotate and save the top 5 detections
+    # Prepare drawing canvas (BGR, HWC, uint8) exactly like detect.py
     im_draw = im0.copy()
     annotator = Annotator(im_draw, line_width=3, example=str(names))
     top5 = []
@@ -559,30 +639,31 @@ def run_one(session, im_in, im0, names, mode, boxes_format, conf_thres, iou_thre
         return f"cls_{cls_index}"
 
     if dets and len(dets[0]):
-        model_shape = (im_in.shape[2], im_in.shape[3])  # H, W of network input
-        det_batch = dets[0]  # Detections for the first image, is a torch.Tensor
+        # Work in torch like detect.py, then call scale_boxes and round
+        det = dets[0]
+        if not isinstance(det, torch.Tensor):
+            det = torch.from_numpy(det)
+        det = det.float().cpu()
 
-        # IMPORTANT FIX: Convert tensor to numpy and scale a *copy* of the boxes
-        # to avoid memory corruption issues when assigning numpy array back to tensor slice.
-        det_np = det_batch.cpu().numpy()
-        scaled_boxes = scale_boxes(model_shape, np.copy(det_np[:, :4]), im_draw.shape)
-        det_np[:, :4] = np.round(scaled_boxes) # Update the numpy array with scaled boxes
+        # Scale boxes from model input size to original image size
+        model_shape = (im_in.shape[2], im_in.shape[3])  # (H, W)
+        det[:, :4] = scale_boxes(model_shape, det[:, :4], im_draw.shape).round()
 
-        # Sort by confidence and take top 5
-        det_sorted = det_np[det_np[:, 4].argsort()[::-1]]
-        for *xyxy, conf, cls in det_sorted[:5]:
-            c = int(cls)
+        # Sort by confidence and take top 5 for visualization
+        order = det[:, 4].argsort(descending=True)
+        det_top5 = det[order][:5]
+
+        for *xyxy, conf, cls in det_top5:
+            c = int(cls.item() if isinstance(cls, torch.Tensor) else cls)
             label = f"{name_for(c)} {float(conf):.3f}"
             annotator.box_label(xyxy, label, color=colors(c, True))
-            top5.append((name_for(c), float(conf), [int(k) for k in xyxy]))
+            top5.append((name_for(c), float(conf), [int(v) for v in xyxy]))
 
-    try:
-        cv2.imwrite(str(save_path), annotator.result())
-    except Exception as e:
-        LOGGER.warning(f"Could not save annotated image to {save_path}: {e}")
+    # Render and save exactly like detect.py
+    im_out = annotator.result()
+    cv2.imwrite(str(save_path), im_out)
 
     return head_flat_for_cosine, top5
-
 
 def dump_logits_vs_qparams(label, head_cfirst_concat, names, qdq_params, max_classes_to_show=10):
     a = head_cfirst_concat.reshape(1, head_cfirst_concat.shape[1], -1).astype(np.float32)
