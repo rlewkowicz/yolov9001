@@ -1,3 +1,4 @@
+# common.py
 from copy import copy
 from pathlib import Path
 import numpy as np
@@ -33,8 +34,6 @@ class Requant(nn.Module):
         super().__init__()
 
     def forward(self, x):
-        if torch.onnx.is_in_onnx_export():
-            return x.clone()
         return x
 
 class Silence(nn.Module):
@@ -95,8 +94,10 @@ class RepConvN(nn.Module):
         return self.act(self.conv(x))
 
     def forward(self, x):
-        id_out = 0 if self.bn is None else self.bn(x)
-        return self.act(self.conv1(x) + self.conv2(x) + id_out)
+        y1 = self.conv1(x)
+        y2 = self.conv2(x)
+        id_out = self.bn(x) if self.bn is not None else torch.zeros_like(y1)
+        return self.act(y1 + y2 + id_out)
 
     def get_equivalent_kernel_bias(self):
         (kernel3x3, bias3x3) = self._fuse_bn_tensor(self.conv1)
@@ -366,10 +367,11 @@ class QARepVGGBlockV2(nn.Module):
     def forward(self, inputs):
         if self.deploy:
             return self.nonlinearity(self.se(self.rbr_reparam(inputs)))
-        id_out = self.rbr_identity(inputs) if self.rbr_identity is not None else 0
-        avg_out = self.rbr_avg(inputs) if self.rbr_avg is not None else 0
+        base = self.rbr_dense(inputs) + self.rbr_1x1(inputs)
+        id_out = self.rbr_identity(inputs) if self.rbr_identity is not None else torch.zeros_like(base)
+        avg_out = self.rbr_avg(inputs) if self.rbr_avg is not None else torch.zeros_like(base)
         return self.nonlinearity(
-            self.bn(self.se(self.rbr_dense(inputs) + self.rbr_1x1(inputs) + id_out + avg_out))
+            self.bn(self.se(base + id_out + avg_out))
         )
 
     def get_equivalent_kernel_bias(self):
@@ -520,12 +522,13 @@ class DetectMultiBackend(nn.Module):
         w = str(weights[0] if isinstance(weights, list) else weights)
         if not (w.endswith('.pt') or w.endswith('.pth')):
             w = attempt_download(w)
-        model = attempt_load(
-            weights if isinstance(weights, list) else w, device=device, inplace=True, fuse=fuse
-        )
+        model = attempt_load(weights if isinstance(weights, list) else w, device=device, inplace=True, fuse=fuse)
         stride = max(int(model.stride.max()), 32)
         names = model.module.names if hasattr(model, 'module') else model.names
-        model.half() if fp16 else model.float()
+        if fp16:
+            model.half()
+        else:
+            model.float()
         self.model = model
         self.stride = stride
         self.names = names
@@ -535,7 +538,13 @@ class DetectMultiBackend(nn.Module):
     def forward(self, im, augment=False, visualize=False):
         if self.fp16 and im.dtype != torch.float16:
             im = im.half()
-        return self.model(im, augment=augment, visualize=visualize)
+        try:
+            return self.model(im, augment=augment, visualize=visualize)
+        except TypeError:
+            try:
+                return self.model(im, augment=augment)
+            except TypeError:
+                return self.model(im)
 
     def from_numpy(self, x):
         import numpy as np
@@ -543,10 +552,9 @@ class DetectMultiBackend(nn.Module):
 
     def warmup(self, imgsz=(1, 3, 640, 640)):
         if self.device.type != 'cpu':
-            im = torch.empty(
-                *imgsz, dtype=torch.half if self.fp16 else torch.float, device=self.device
-            )
+            im = torch.empty(*imgsz, dtype=torch.half if self.fp16 else torch.float, device=self.device)
             self.forward(im)
+
 
 class Detections:
     def __init__(self, ims, pred, files, times=(0, 0, 0), names=None, shape=None):
@@ -665,7 +673,6 @@ class Detections:
         return f'YOLO {self.__class__} instance\n' + self.__str__()
 
 class ConvModule(nn.Module):
-    """A combination of Conv + BN + Activation"""
     def __init__(
         self,
         in_channels,

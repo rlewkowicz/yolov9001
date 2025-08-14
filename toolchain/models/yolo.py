@@ -1,3 +1,4 @@
+# yolo.py
 import contextlib
 import math
 import os
@@ -19,7 +20,6 @@ if platform.system() != "Windows":
     ROOT = Path(os.path.relpath(ROOT, Path.cwd()))
 from models.common import *
 from utils.general import LOGGER, make_divisible
-from utils.plots import feature_visualization
 from utils.tal.anchor_generator import make_anchors, dist2bbox
 from utils.torch_utils import (
     fuse_conv_and_bn,
@@ -87,41 +87,8 @@ class RN_DualDDetect(nn.Module):
         self.requant1 = Requant()
         self.requant2 = Requant()
 
-    def _export_like_from_d2(self, d2, shape, anchors=None, strides=None):
-        box2, cls2 = torch.cat([di.view(shape[0], self.no, -1) for di in d2],
-                               2).split((self.reg_max * 4, self.nc), 1)
-
-        if self.training and not torch.onnx.is_in_onnx_export():
-            return torch.cat((box2, cls2), 1)
-
-        if anchors is None or strides is None:
-            anc, strd = (x.transpose(0, 1) for x in make_anchors(d2, self.stride, 0.5))
-        else:
-            anc, strd = anchors, strides
-
-        pixel_anchor_points2 = anc.unsqueeze(0) * strd
-        pixel_pred_dist2 = self.dfl2(box2) * strd
-        dbox2 = dist2bbox(pixel_pred_dist2, pixel_anchor_points2, xywh=True, dim=1)
-
-        cls_out = cls2 if self.export_logits else F.hardsigmoid(cls2)
-
-        return torch.cat((dbox2, cls_out), 1)
-
-    def export_like_for_calib(self, d2, shape, anchors=None, strides=None):
-        box2, cls2 = torch.cat([di.view(shape[0], self.no, -1) for di in d2],
-                               2).split((self.reg_max * 4, self.nc), 1)
-        if anchors is None or strides is None:
-            anc, strd = (x.transpose(0, 1) for x in make_anchors(d2, self.stride, 0.5))
-        else:
-            anc, strd = anchors, strides
-        pixel_anchor_points2 = anc.unsqueeze(0) * strd
-        pixel_pred_dist2 = self.dfl2(box2) * strd
-        dbox2 = dist2bbox(pixel_pred_dist2, pixel_anchor_points2, xywh=True, dim=1)
-        return torch.cat((dbox2, cls2), 1)  # logits for calibration
-
     def forward(self, x):
         shape = x[0].shape
-
         has_aux_branch = (
             hasattr(self, "cv2") and hasattr(self, "cv3") and
             isinstance(getattr(self, "cv2"), nn.ModuleList) and
@@ -145,24 +112,25 @@ class RN_DualDDetect(nn.Module):
         if self.training:
             return [d1, d2]
 
-        if self.dynamic or self.shape != shape:
-            (self.anchors,
-             self.strides) = (x.transpose(0, 1) for x in make_anchors(d2, self.stride, 0.5))
-            self.shape = shape
-
-        y_main = self._export_like_from_d2(d2, shape, self.anchors, self.strides)
+        anc, strd = (t.transpose(0, 1) for t in make_anchors(d2, self.stride, 0.5))
+        box2, cls2 = torch.cat([di.view(shape[0], self.no, -1) for di in d2],
+                               2).split((self.reg_max * 4, self.nc), 1)
+        pixel_anchor_points2 = anc.unsqueeze(0) * strd
+        pixel_pred_dist2 = self.dfl2(box2) * strd
+        dbox2 = dist2bbox(pixel_pred_dist2, pixel_anchor_points2, xywh=True, dim=1)
+        cls_out_main = cls2 if self.export_logits else F.hardsigmoid(cls2)
+        y_main = torch.cat((dbox2, cls_out_main), 1)
 
         if not has_aux_branch:
             return y_main if self.export else (y_main, d2)
 
         box, cls = torch.cat([di.view(shape[0], self.no, -1) for di in d1],
                              2).split((self.reg_max * 4, self.nc), 1)
-        aux_anchors, aux_strides = (x.transpose(0, 1) for x in make_anchors(d1, self.stride, 0.5))
+        aux_anchors, aux_strides = (t.transpose(0, 1) for t in make_anchors(d1, self.stride, 0.5))
         pixel_anchor_points1 = aux_anchors.unsqueeze(0) * aux_strides
         pixel_pred_dist1 = self.dfl(box) * aux_strides
         dbox = dist2bbox(pixel_pred_dist1, pixel_anchor_points1, xywh=True, dim=1)
         cls_out = cls if self.export_logits else F.hardsigmoid(cls)
-
         y_aux = torch.cat((dbox, cls_out), 1)
 
         return [y_aux, y_main] if self.export else ([y_aux, y_main], [d1, d2])
@@ -183,23 +151,21 @@ class BaseModel(nn.Module):
         self.dequant = None
         self.qconfig = None
 
-    def forward(self, x, profile=False, visualize=False):
+    def forward(self, x, profile=False):
         if self.quant is not None and self.dequant is not None:
             x = self.quant(x)
-            x = self._forward_once(x, profile, visualize)
+            x = self._forward_once(x, profile)
             x = self.dequant(x)
             return x
-        return self._forward_once(x, profile, visualize)
+        return self._forward_once(x, profile)
 
-    def _forward_once(self, x, profile=False, visualize=False):
-        y, dt = [], []
+    def _forward_once(self, x, profile=False):
+        y = []
         for m in self.model:
             if m.f != -1:
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
             x = m(x)
             y.append(x if m.i in self.save else None)
-            if visualize:
-                feature_visualization(x, m.type, m.i, save_dir=visualize)
         return x
 
     def fuse(self):
@@ -342,10 +308,10 @@ class DetectionModel(BaseModel):
             self.enable_qat(backend='fbgemm', per_channel=bool(qat_per_channel))
         LOGGER.info("")
 
-    def forward(self, x, augment=False, profile=False, visualize=False):
+    def forward(self, x, augment=False, profile=False):
         if augment:
             return self._forward_augment(x)
-        return self._forward_once(x, profile, visualize)
+        return self._forward_once(x, profile)
 
     def _forward_augment(self, x):
         img_size = x.shape[-2:]
