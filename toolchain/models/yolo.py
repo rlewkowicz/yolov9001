@@ -48,9 +48,7 @@ class RN_DualDDetect(nn.Module):
         self.no = nc + self.reg_max * 4
         self.inplace = inplace
         self.stride = torch.zeros(self.nl)
-
         self.export_logits = True
-        self.export_split = True
 
         (c2, c3) = (
             make_divisible(max((ch[0] // 4, self.reg_max * 4, 16)), 4),
@@ -107,8 +105,6 @@ class RN_DualDDetect(nn.Module):
 
         cls_out = cls2 if self.export_logits else F.hardsigmoid(cls2)
 
-        if self.export and getattr(self, "export_split", False):
-            return dbox2, cls_out
         return torch.cat((dbox2, cls_out), 1)
 
     def export_like_for_calib(self, d2, shape, anchors=None, strides=None):
@@ -125,9 +121,6 @@ class RN_DualDDetect(nn.Module):
 
     def forward(self, x):
         shape = x[0].shape
-
-        if not hasattr(self, "export_split"):
-            self.export_split = False
 
         has_aux_branch = (
             hasattr(self, "cv2") and hasattr(self, "cv3") and
@@ -170,10 +163,7 @@ class RN_DualDDetect(nn.Module):
         dbox = dist2bbox(pixel_pred_dist1, pixel_anchor_points1, xywh=True, dim=1)
         cls_out = cls if self.export_logits else F.hardsigmoid(cls)
 
-        if self.export and getattr(self, "export_split", False):
-            y_aux = (dbox, cls_out)
-        else:
-            y_aux = torch.cat((dbox, cls_out), 1)
+        y_aux = torch.cat((dbox, cls_out), 1)
 
         return [y_aux, y_main] if self.export else ([y_aux, y_main], [d1, d2])
 

@@ -57,79 +57,6 @@ RANK = int(os.getenv("RANK", -1))
 WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
 GIT_INFO = None
 
-class EMAMinMax:
-    def __init__(self, channels=None, momentum=0.99, per_channel=True):
-        self.channels = channels
-        self.momentum = float(momentum)
-        self.per_channel = bool(per_channel)
-        self.min = None
-        self.max = None
-
-    def _reduce(self, x):
-        if x.dim() == 2:
-            b, c = x.shape
-            x = x.view(b, c, 1)
-        elif x.dim() == 3:
-            pass
-        elif x.dim() == 4:
-            b, c, h, w = x.shape
-            x = x.view(b, c, h * w)
-        elif x.dim() == 5:
-            b, c, d1, d2, d3 = x.shape
-            x = x.view(b, c, d1 * d2 * d3)
-        else:
-            x = x.view(x.shape[0], x.shape[1], -1)
-        if self.per_channel:
-            vmin = x.amin(dim=(0, 2))
-            vmax = x.amax(dim=(0, 2))
-        else:
-            vmin = x.amin()
-            vmax = x.amax()
-        return vmin, vmax
-
-    def update(self, x):
-        if not isinstance(x, torch.Tensor):
-            x = torch.as_tensor(x)
-        x = x.detach()
-        if self.channels is None and x.dim() >= 2:
-            self.channels = int(x.shape[1])
-        vmin, vmax = self._reduce(x)
-        if self.min is None:
-            self.min = vmin.float()
-            self.max = vmax.float()
-        else:
-            m = self.momentum
-            self.min = m * self.min + (1.0 - m) * vmin.float()
-            self.max = m * self.max + (1.0 - m) * vmax.float()
-
-    def state_dict(self):
-        if self.min is None or self.max is None:
-            return None
-        if self.per_channel:
-            return {
-                "per_channel": True,
-                "min": self.min.cpu().numpy().tolist(),
-                "max": self.max.cpu().numpy().tolist(),
-                "channels": int(self.channels),
-            }
-        else:
-            return {
-                "per_channel":
-                    False,
-                "min":
-                    float(
-                        self.min.cpu().item() if self.min.numel() ==
-                        1 else self.min.mean().cpu().item()
-                    ),
-                "max":
-                    float(
-                        self.max.cpu().item() if self.max.numel() ==
-                        1 else self.max.mean().cpu().item()
-                    ),
-                "channels":
-                    int(self.channels if self.channels is not None else 0),
-            }
-
 def train(hyp, opt, device, callbacks):
     save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, freeze = \
         Path(opt.save_dir), opt.epochs, opt.batch_size, opt.weights, opt.single_cls, opt.evolve, opt.data, opt.cfg, \
@@ -181,7 +108,6 @@ def train(hyp, opt, device, callbacks):
             nc=nc,
             anchors=hyp.get("anchors"),
             qat=opt.qat,
-            qat_per_channel=opt.int8_per_channel
         ).to(device)
         exclude = ["anchor"] if (cfg or hyp.get("anchors")) and not resume else []
         model_in_ckpt = ckpt['model']
@@ -197,7 +123,6 @@ def train(hyp, opt, device, callbacks):
             nc=nc,
             anchors=hyp.get("anchors"),
             qat=opt.qat,
-            qat_per_channel=opt.int8_per_channel
         ).to(device)
     amp = bool(opt.amp and not opt.qat)
     freeze = [f"model.{x}." for x in (freeze if len(freeze) > 1 else range(freeze[0]))]
@@ -379,36 +304,6 @@ def train(hyp, opt, device, callbacks):
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
     stopper, stop = EarlyStopping(patience=opt.patience), False
     compute_loss = RN_ComputeLoss(model)
-    head_observer = EMAMinMax(
-        channels=None, momentum=opt.int8_calib_momentum, per_channel=opt.int8_per_channel
-    ) if opt.record_int8_calib else None
-
-    def _export_like_from_training(pred, model_ref):
-        base = de_parallel(model_ref)
-        if not hasattr(base, "model") or not base.model:
-            return None
-        head = base.model[-1]
-        if not hasattr(head, "_export_like_from_d2"):
-            return None
-        d2 = None
-        if isinstance(pred, (list, tuple)):
-            if len(pred) >= 2 and isinstance(pred[1], list):
-                d2 = pred[1]
-            elif len(pred) >= 1 and isinstance(pred[0], list):
-                cand = pred[-1]
-                if isinstance(cand, list):
-                    d2 = cand
-        if not d2 or not isinstance(d2, list):
-            return None
-        shape = d2[0].shape
-        no_autocast = torch.cuda.amp.autocast(
-            enabled=False
-        ) if torch.cuda.is_available() else contextlib.nullcontext()
-        with torch.no_grad(), no_autocast:
-            d2 = [t.float() for t in d2]
-            if hasattr(head, "export_like_for_calib"):
-                return head.export_like_for_calib(d2, shape)
-            return head._export_like_from_d2(d2, shape)
 
     callbacks.run("on_train_start")
     LOGGER.info(
@@ -476,10 +371,6 @@ def train(hyp, opt, device, callbacks):
                     loss *= WORLD_SIZE
                 if opt.quad:
                     loss *= 4.0
-            if head_observer is not None:
-                y_main = _export_like_from_training(pred, model)
-                if isinstance(y_main, torch.Tensor) and y_main.dim() >= 2:
-                    head_observer.update(y_main.detach())
             scaler.scale(loss).backward()
             if ni - last_opt_step >= accumulate:
                 scaler.unscale_(optimizer)
@@ -546,23 +437,6 @@ def train(hyp, opt, device, callbacks):
 
                 ckpt_model = _clone_for_save(model)
                 ckpt_ema = _clone_for_save(ema.ema) if ema else None
-                quant_meta = None
-                if head_observer is not None:
-                    head_state = head_observer.state_dict()
-                    if head_state is not None:
-                        quant_meta = {
-                            "head": head_state,
-                            "input": {"range": [0.0, 1.0], "dtype": "float"},
-                            "names": names,
-                            "nc": int(nc),
-                            "stride": [
-                                int(s) for s in
-                                (model.stride.tolist() if hasattr(model, "stride") else [])
-                            ],
-                            "per_channel": bool(opt.int8_per_channel),
-                            "momentum": float(opt.int8_calib_momentum),
-                            "note": "export-like tensor is [xywh(px), cls_logits]",
-                        }
                 ckpt = {
                     "epoch": epoch,
                     "best_fitness": best_fitness,
@@ -573,7 +447,6 @@ def train(hyp, opt, device, callbacks):
                     "opt": vars(opt),
                     "git": GIT_INFO,
                     "date": datetime.now().isoformat(),
-                    "int8_calib": quant_meta,
                 }
                 torch.save(ckpt, last)
                 if best_fitness == fi:
@@ -737,24 +610,6 @@ def parse_opt(known=False):
         type=str,
         default="latest",
         help="W&B: Version of dataset artifact to use"
-    )
-    parser.add_argument(
-        "--record-int8-calib",
-        default=True,
-        action="store_true",
-        help="Record head min/max during training for INT8 export"
-    )
-    parser.add_argument(
-        "--int8-per-channel",
-        default=True,
-        action="store_true",
-        help="Record per-channel ranges for head tensor"
-    )
-    parser.add_argument(
-        "--int8-calib-momentum",
-        type=float,
-        default=0.99,
-        help="EMA momentum for calibration stats"
     )
     parser.add_argument(
         "--amp", default=True, action="store_true", help="Enable mixed precision (fp16 amp)"
