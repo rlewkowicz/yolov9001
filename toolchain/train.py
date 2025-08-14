@@ -9,7 +9,6 @@ from datetime import datetime
 from pathlib import Path
 import contextlib
 import torch
-import torch.nn.functional as F
 from utils.torch_utils import de_parallel
 from utils.tal.anchor_generator import make_anchors, dist2bbox  # kept, though no longer needed directly
 
@@ -301,6 +300,7 @@ def train(hyp, opt, device, callbacks):
         lf_original = lambda x: 1.0
     else:
         lf_original = lambda x: (1 - x / epochs) * (1.0 - lrf) + lrf
+
     def lf(epoch):
         factor = lf_original(epoch)
         ddp_warmup_epochs = 0
@@ -310,6 +310,7 @@ def train(hyp, opt, device, callbacks):
             damp = min_lr_mul + (1.0 - min_lr_mul) * (1.0 - cosine)
             factor *= damp
         return factor
+
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
     ema = None
     if opt.sync_bn and cuda and RANK != -1:
@@ -381,6 +382,7 @@ def train(hyp, opt, device, callbacks):
     head_observer = EMAMinMax(
         channels=None, momentum=opt.int8_calib_momentum, per_channel=opt.int8_per_channel
     ) if opt.record_int8_calib else None
+
     def _export_like_from_training(pred, model_ref):
         base = de_parallel(model_ref)
         if not hasattr(base, "model") or not base.model:
@@ -407,6 +409,7 @@ def train(hyp, opt, device, callbacks):
             if hasattr(head, "export_like_for_calib"):
                 return head.export_like_for_calib(d2, shape)
             return head._export_like_from_d2(d2, shape)
+
     callbacks.run("on_train_start")
     LOGGER.info(
         f"Image sizes {imgsz} train, {imgsz} val\nUsing {train_loader.num_workers * WORLD_SIZE} dataloader workers\n"
@@ -530,6 +533,7 @@ def train(hyp, opt, device, callbacks):
             log_vals = list(mloss) + list(results) + lr
             callbacks.run("on_fit_epoch_end", log_vals, epoch, best_fitness, fi)
             if (not nosave) or (final_epoch and not evolve):
+
                 def _clone_for_save(mm):
                     m2 = deepcopy(de_parallel(mm)).float()
                     for _m in m2.modules():
@@ -539,6 +543,7 @@ def train(hyp, opt, device, callbacks):
                             except Exception:
                                 pass
                     return m2
+
                 ckpt_model = _clone_for_save(model)
                 ckpt_ema = _clone_for_save(ema.ema) if ema else None
                 quant_meta = None

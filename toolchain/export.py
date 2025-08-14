@@ -11,6 +11,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.ao.quantization as tq
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]
@@ -20,7 +21,7 @@ if platform.system() != "Windows":
     ROOT = Path(os.path.relpath(ROOT, Path.cwd()))
 
 from models.experimental import attempt_load
-from models.yolo import DetectionModel, RN_DualDDetect
+from models.yolo import RN_DualDDetect
 from utils.general import (
     LOGGER,
     Profile,
@@ -35,7 +36,7 @@ from utils.general import (
 from utils.torch_utils import select_device, smart_inference_mode
 
 def export_formats():
-    x = [["ONNX", "onnx", ".onnx", True, True]]
+    x = [["ONNX", "onnx", ".onnx", True, True], ["PT", "pt", ".pt", True, False]]
     return pd.DataFrame(x, columns=["Format", "Argument", "Suffix", "CPU", "GPU"])
 
 def try_export(inner_func):
@@ -45,9 +46,7 @@ def try_export(inner_func):
         try:
             with Profile() as dt:
                 f, model = inner_func(*args, **kwargs)
-            LOGGER.info(
-                f"{prefix} export success {dt.t:.1f}s, saved as {f} ({file_size(f):.1f} MB)"
-            )
+            LOGGER.info(f"{prefix} export success {dt.t:.1f}s, saved as {f} ({file_size(f):.1f} MB)")
             return f, model
         except Exception as e:
             LOGGER.info(f"{prefix} export failure {dt.t:.1f}s: {e}")
@@ -57,84 +56,54 @@ def try_export(inner_func):
 def _replace_modules_recursively(m):
     for n, c in list(m.named_children()):
         name = c.__class__.__name__
-        if "FakeQuantize" in name or "Observer" in name:
+        if "FakeQuantize" in name or "Observer" in name or name in ("QuantStub", "DeQuantStub"):
             setattr(m, n, nn.Identity())
         else:
             _replace_modules_recursively(c)
 
-def _prepare_model_for_onnx_export(src_model, int8=False, quant_backend="fbgemm"):
+def _prepare_model_for_onnx_export(src_model):
     m = deepcopy(src_model).eval()
-    if int8:
-        import torch.ao.quantization as tq
-        torch.backends.quantized.engine = quant_backend
-        m = m.cpu()
-        tq.convert(m, inplace=True)
-        return m
-    try:
-        import torch.ao.quantization as tq
-        tq.convert(m, inplace=True)
-    except Exception:
-        pass
     for mod in m.modules():
-        try:
-            if hasattr(mod, "set_observer_enabled"):
-                mod.set_observer_enabled(False)
-        except Exception:
-            pass
-        try:
-            if hasattr(mod, "set_fake_quant_enabled"):
-                mod.set_fake_quant_enabled(False)
-        except Exception:
-            pass
-        try:
-            if hasattr(mod, "observer_enabled"):
-                setattr(mod, "observer_enabled", False)
-        except Exception:
-            pass
-        try:
-            if hasattr(mod, "fake_quant_enabled"):
-                setattr(mod, "fake_quant_enabled", False)
-        except Exception:
-            pass
+        if hasattr(mod, "set_observer_enabled"):
+            mod.set_observer_enabled(False)
+        if hasattr(mod, "set_fake_quant_enabled"):
+            mod.set_fake_quant_enabled(False)
+        if hasattr(mod, "observer_enabled"):
+            setattr(mod, "observer_enabled", False)
+        if hasattr(mod, "fake_quant_enabled"):
+            setattr(mod, "fake_quant_enabled", False)
     _replace_modules_recursively(m)
     return m
 
 @try_export
-def export_onnx(model, im, file, opset, dynamic, simplify, int8=False, quant_backend="fbgemm", prefix=colorstr("ONNX:")):
-    """
-    Exports ONNX with 1 or 2 outputs.
-
-    If RN_DualDDetect.export_split is True (and export=True), the model returns:
-        (boxes_xywh_px, class_logits)  -> 2 ONNX outputs: "boxes", "logits"
-    Otherwise it returns a single concatenated tensor -> 1 ONNX output: "output0".
-    """
+def export_onnx(
+    model,
+    im,
+    file,
+    opset,
+    dynamic,
+    simplify,
+    prefix=colorstr("ONNX:")
+):
     check_requirements("onnx")
     import onnx
-
     LOGGER.info(f"\n{prefix} starting export with onnx {onnx.__version__}...")
     f = file.with_suffix(".onnx")
 
-    # Clone & (optionally) convert QAT graph -> quantized
-    export_model = _prepare_model_for_onnx_export(model, int8=int8, quant_backend=quant_backend)
-
-    # Ensure the head is configured for export (logits + split if present)
+    export_model = _prepare_model_for_onnx_export(model)
     for _, m in export_model.named_modules():
         if isinstance(m, RN_DualDDetect):
             m.export = True
-            # always export logits (your compare expects raw logits -> sigmoid later)
             if not hasattr(m, "export_logits") or not m.export_logits:
                 setattr(m, "export_logits", True)
-            # make sure split mode is ON so we actually get 2 outputs
             if not hasattr(m, "export_split") or not m.export_split:
                 setattr(m, "export_split", True)
 
-    # Decide output count via a dry run
     use_model = export_model.cpu().eval()
     use_im = im.cpu()
     with torch.no_grad():
         y = use_model(use_im)
 
-    # Flatten nested outputs to a simple list of tensors
     def _flatten(o):
         if isinstance(o, (list, tuple)):
             out = []
@@ -147,28 +116,15 @@ def export_onnx(model, im, file, opset, dynamic, simplify, int8=False, quant_bac
             raise TypeError(f"Unexpected output type during export: {type(o)}")
 
     outs = _flatten(y)
-    if len(outs) == 0:
-        raise RuntimeError("Model produced no tensors on the dry run; cannot export.")
+    if len(outs) != 2:
+        raise RuntimeError("Expected dual outputs (boxes, logits).")
 
-    # Build output names and dynamic axes
-    if len(outs) == 2:
-        # Expect (boxes[N,4,S], logits[N,nc,S])
-        output_names = ["boxes", "logits"]
-    else:
-        output_names = ["output0"]
+    output_names = ["boxes", "logits"]
+    dynamic_axes = {"images": {0: "batch", 2: "height", 3: "width"}}
+    if dynamic:
+        for name in output_names:
+            dynamic_axes[name] = {0: "batch", 2: "anchors"}
 
-    if int8:
-        # ORT quantizer can be picky about dynamic axes
-        dynamic_axes = None
-    else:
-        dynamic_axes = {"images": {0: "batch", 2: "height", 3: "width"}}
-        if dynamic:
-            # Set sensible dynamic axes for outputs
-            # boxes/logits: [N, C, S] -> batch dim=0; anchors/positions dim=2
-            for name in output_names:
-                dynamic_axes[name] = {0: "batch", 2: "anchors"}
-
-    # Export
     torch.onnx.export(
         use_model,
         use_im,
@@ -184,13 +140,10 @@ def export_onnx(model, im, file, opset, dynamic, simplify, int8=False, quant_bac
     model_onnx = onnx.load(f)
     onnx.checker.check_model(model_onnx)
 
-    # Metadata: tell downstream tools this head emits logits and xywh pixel boxes
-    # (matches your RN_DualDDetect decode path which returns xywh(px) + logits)
     d = {
         "stride": int(max(model.stride)),
         "names": model.names,
         "head_activation": "logits",
-        "boxes_format": "xywh",
         "outputs": len(output_names),
     }
     for k, v in d.items():
@@ -198,7 +151,6 @@ def export_onnx(model, im, file, opset, dynamic, simplify, int8=False, quant_bac
         meta.key, meta.value = k, str(v)
     onnx.save(model_onnx, f)
 
-    # Optional simplification
     if simplify:
         try:
             cuda = torch.cuda.is_available()
@@ -213,7 +165,79 @@ def export_onnx(model, im, file, opset, dynamic, simplify, int8=False, quant_bac
 
     return f, model_onnx
 
+def _load_state_dict_only(path):
+    obj = torch.load(path, map_location="cpu", weights_only=False)
+    if isinstance(obj, dict):
+        if "state_dict" in obj and isinstance(obj["state_dict"], dict):
+            return obj["state_dict"]
+        if "model" in obj and hasattr(obj["model"], "state_dict"):
+            return obj["model"].state_dict()
+        if "ema" in obj and hasattr(obj["ema"], "state_dict"):
+            return obj["ema"].state_dict()
+        if all(isinstance(v, torch.Tensor) for v in obj.values()):
+            return obj
+    if hasattr(obj, "state_dict"):
+        return obj.state_dict()
+    raise RuntimeError("Unsupported checkpoint format")
 
+def _quant_ready(model):
+    import importlib
+    import torch.ao.quantization as tq
+    fqmod = importlib.import_module("torch.ao.quantization.fake_quantize")
+    FakeQuantize = getattr(fqmod, "FakeQuantize", tuple())
+    FusedMovingAvgObsFakeQuantize = getattr(fqmod, "FusedMovingAvgObsFakeQuantize", FakeQuantize)
+    has_any_fq = 0
+    has_eager_attrs = 0
+    has_qconfig_any = False
+    has_stubs = 0
+    for m in model.modules():
+        if isinstance(m, (FakeQuantize, FusedMovingAvgObsFakeQuantize)):
+            has_any_fq += 1
+        if hasattr(m, "weight_fake_quant") or hasattr(m, "activation_post_process"):
+            has_eager_attrs += 1
+        if getattr(m, "qconfig", None) is not None:
+            has_qconfig_any = True
+        if isinstance(m, (tq.QuantStub, tq.DeQuantStub)):
+            has_stubs += 1
+    return (has_any_fq > 0) or (has_eager_attrs > 0) or (has_qconfig_any and has_stubs > 0)
+
+
+@try_export
+def export_pt_fp32_weights(
+    weights_path,
+    file,
+    prefix=colorstr("PT:")
+):
+    sd = _load_state_dict_only(weights_path)
+    out_fp32 = file.with_name(file.stem + "_weights.pt")
+    torch.save(sd, out_fp32)
+    return out_fp32, None
+
+@try_export
+def export_pt_int8_torchscript(
+    model,
+    file,
+    device,
+    prefix=colorstr("PT-INT8:")
+):
+    torch.backends.quantized.engine = "fbgemm"
+    m = deepcopy(model).to("cpu").eval()
+    if not _quant_ready(m):
+        raise RuntimeError("Model is not quantization-ready. Prepare QAT/PTQ with observers/stubs before --int8 export.")
+    try:
+        for _, mod in m.named_modules():
+            if isinstance(mod, RN_DualDDetect):
+                if hasattr(mod, "export_logits"):
+                    mod.export_logits = False
+                if hasattr(mod, "export_split"):
+                    mod.export_split = False
+    except Exception:
+        pass
+    qmodel = tq.convert(m, inplace=False)
+    ts = torch.jit.script(qmodel)
+    out_ts = file.with_name(file.stem + "_int8.ts.pt")
+    ts.save(str(out_ts))
+    return out_ts, None
 
 @smart_inference_mode()
 def run(
@@ -222,25 +246,21 @@ def run(
     imgsz=(640, 640),
     batch_size=1,
     device="cpu",
-    include=("onnx", ),
+    include=("onnx",),
     half=False,
     inplace=False,
     dynamic=False,
     simplify=True,
     opset=19,
     int8=False,
-    quant_backend="fbgemm",
 ):
     t = time.time()
     include = [x.lower() for x in include]
     file = Path(url2file(weights) if str(weights).startswith(("http:/", "https:/")) else weights)
 
-    if int8:
-        device = "cpu"
     device = select_device(device)
     if half:
-        assert not int8, "--half is not compatible with --int8"
-        assert device.type != "cpu", ("--half only compatible with GPU export, i.e. use --device 0")
+        assert device.type != "cpu", "--half only compatible with GPU export, i.e. use --device 0"
         assert not dynamic, "--half not compatible with --dynamic"
 
     model = attempt_load(weights, device=device, inplace=True, fuse=True)
@@ -257,6 +277,8 @@ def run(
             m.export = True
             if not hasattr(m, "export_logits") or not m.export_logits:
                 setattr(m, "export_logits", True)
+            if not hasattr(m, "export_split") or not m.export_split:
+                setattr(m, "export_split", True)
 
     for _ in range(2):
         y = model(im)
@@ -264,12 +286,15 @@ def run(
         im, model = im.half(), model.half()
 
     shape = (y[0] if isinstance(y, (tuple, list)) else y).shape
-    LOGGER.info(
-        f"\n{colorstr('PyTorch:')} starting from {file} with output shape {shape} ({file_size(file):.1f} MB)"
-    )
+    LOGGER.info(f"\n{colorstr('PyTorch:')} starting from {file} with output shape {shape} ({file_size(file):.1f} MB)")
 
     if "onnx" in include:
-        export_onnx(model, im, file, opset, dynamic, simplify, int8=int8, quant_backend=quant_backend)
+        export_onnx(model, im, file, opset, dynamic, simplify)
+    if "pt" in include:
+        if int8:
+            export_pt_int8_torchscript(model, file, device)
+        else:
+            export_pt_fp32_weights(str(file), file)
 
     LOGGER.info(f"\nExport complete ({time.time() - t:.1f}s)")
     LOGGER.info(f"Results saved to {colorstr('bold', file.parent.resolve())}")
@@ -277,31 +302,18 @@ def run(
 
 def parse_opt():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--data", type=str, default=ROOT / "data/coco128.yaml", help="dataset.yaml path"
-    )
+    parser.add_argument("--data", type=str, default=ROOT / "data/coco128.yaml", help="dataset.yaml path")
     parser.add_argument("--weights", type=str, default=ROOT / "yolo.pt", help="model.pt path")
-    parser.add_argument(
-        "--imgsz",
-        "--img",
-        "--img-size",
-        nargs="+",
-        type=int,
-        default=[640, 640],
-        help="image (h, w)"
-    )
+    parser.add_argument("--imgsz", "--img", "--img-size", nargs="+", type=int, default=[640, 640], help="image (h, w)")
     parser.add_argument("--batch-size", type=int, default=1, help="batch size")
     parser.add_argument("--device", default="cpu", help="cuda device, i.e. 0 or 0,1,2,3 or cpu")
     parser.add_argument("--half", action="store_true", help="FP16 half-precision export")
     parser.add_argument("--inplace", action="store_true", help="set Detect() inplace=True")
     parser.add_argument("--dynamic", default=False, action="store_true", help="ONNX: dynamic axes")
-    parser.add_argument(
-        "--simplify", default=True, action="store_true", help="ONNX: simplify model"
-    )
+    parser.add_argument("--simplify", default=True, action="store_true", help="ONNX: simplify model")
     parser.add_argument("--opset", type=int, default=19, help="ONNX: opset version")
-    parser.add_argument("--include", nargs="+", default=["onnx"], help="Export format")
-    parser.add_argument("--int8", action="store_true", help="Enable INT8 export via PyTorch QAT convert (CPU only)")
-    parser.add_argument("--quant-backend", type=str, default="fbgemm", choices=["fbgemm", "qnnpack"], help="Quantized backend for INT8 export")
+    parser.add_argument("--include", nargs="+", default=["onnx"], help="export formats, e.g. --include pt onnx")
+    parser.add_argument("--int8", action="store_true", help="when --include pt: export TorchScript INT8 instead of FP32 weights")
     opt = parser.parse_args()
     print_args(vars(opt))
     return opt

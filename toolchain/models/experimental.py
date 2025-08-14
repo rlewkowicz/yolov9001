@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-from models.yolo import Model
 from utils.downloads import attempt_download
 from models.common import GatedSPPF, GatedPool, Requant, QARepNBottleneck
 

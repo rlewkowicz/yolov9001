@@ -1,6 +1,3 @@
-#
-# ONLY ADAMW AND LION IS PROPERLY TUNED FOR THIS CONFIG
-#
 optimizer:
   SGD:
     lr_scheduler_type: cosine
@@ -13,7 +10,7 @@ optimizer:
     warmup_bias_lr: 0.1
   LION:
     lr_scheduler_type: cosine
-    lr0: 0.007
+    lr0: 0.007 # The paper has this at .001 if I recall. I don't have the patience for this. This whole model could probably hit .45+ before fine tune. .47/.48, .46/.47 after qat.
     lrf: 0.01
     b1: 0.9
     b2: 0.999

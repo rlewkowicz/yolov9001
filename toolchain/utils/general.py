@@ -793,7 +793,7 @@ def non_max_suppression(
     return output
 
 def strip_optimizer(f="best.pt", s=""):
-    x = torch.load(f, map_location=torch.device("cpu"))
+    x = torch.load(f, map_location=torch.device("cpu"), weights_only=False)
     if x.get("ema"):
         x["model"] = x["ema"]
     for k in ("optimizer", "best_fitness", "ema", "updates"):

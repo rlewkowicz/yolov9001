@@ -1,4 +1,4 @@
-# Nano+. I think most "Nano" models are in the 2M Param range. After pruning we're at ~4
+# Nano+. I think most "Nano" models are in the 2M Param range. After pruning we're at ~5.5
 # This puts us between most small and nano models.
 nc: 80
 depth_multiple: 1
