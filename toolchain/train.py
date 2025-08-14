@@ -52,6 +52,8 @@ from utils.torch_utils import (
     torch_distributed_zero_first
 )
 
+torch.set_float32_matmul_precision('high')
+
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", -1))
 RANK = int(os.getenv("RANK", -1))
 WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
@@ -111,8 +113,7 @@ def train(hyp, opt, device, callbacks):
         ).to(device)
         exclude = ["anchor"] if (cfg or hyp.get("anchors")) and not resume else []
         model_in_ckpt = ckpt['model']
-        csd = model_in_ckpt.float().state_dict(
-        ) if hasattr(model_in_ckpt, 'state_dict') else model_in_ckpt
+        csd = model_in_ckpt.float().state_dict() if hasattr(model_in_ckpt, 'state_dict') else model_in_ckpt
         csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)
         model.load_state_dict(csd, strict=False)
         LOGGER.info(f"Transferred {len(csd)}/{len(model.state_dict())} items from {weights}")
@@ -125,6 +126,20 @@ def train(hyp, opt, device, callbacks):
             qat=opt.qat,
         ).to(device)
     amp = bool(opt.amp and not opt.qat)
+    if opt.qat:
+        import torch.ao.quantization as tq
+        from torch.ao.quantization.quantize_fx import prepare_qat_fx
+        from torch.ao.quantization import QConfigMapping, get_default_qat_qconfig
+        torch.backends.quantized.engine = 'fbgemm'
+        qconfig = get_default_qat_qconfig('fbgemm')
+        qconfig_mapping = QConfigMapping().set_global(qconfig).set_object_type(nn.Conv2d, qconfig).set_object_type(nn.Linear, qconfig)
+        model.train()
+        model = prepare_qat_fx(model, qconfig_mapping)
+        if hasattr(torch, "compile"):
+            model = torch.compile(model, dynamic=False)
+    else:
+        if hasattr(torch, "compile"):
+            model = torch.compile(model, dynamic=False)
     freeze = [f"model.{x}." for x in (freeze if len(freeze) > 1 else range(freeze[0]))]
     for k, v in model.named_parameters():
         if any(x in k for x in freeze):
@@ -142,9 +157,7 @@ def train(hyp, opt, device, callbacks):
     decoupled_settings = optimizer_settings.get("decoupled_lr", {})
     lr_scale_backbone = decoupled_settings.get("backbone", {}).get("lr_scale", 1.0)
     lr_scale_head = decoupled_settings.get("head", {}).get("lr_scale", 1.0)
-    lr_scale_sppf = decoupled_settings.get("sppf", {}).get(
-        "lr_scale", (lr_scale_backbone + lr_scale_head) / 2.0
-    )
+    lr_scale_sppf = decoupled_settings.get("sppf", {}).get("lr_scale", (lr_scale_backbone + lr_scale_head) / 2.0)
     if hasattr(model, 'yaml') and 'backbone' in model.yaml:
         backbone_full_len = len(model.yaml['backbone'])
         sppf_index = backbone_full_len - 1
@@ -159,17 +172,11 @@ def train(hyp, opt, device, callbacks):
         )
     backbone_indices = range(backbone_len)
     param_groups = {
-        "backbone_weights": {
-            "params": [], "lr_scale": lr_scale_backbone, "weight_decay": scaled_weight_decay
-        },
+        "backbone_weights": {"params": [], "lr_scale": lr_scale_backbone, "weight_decay": scaled_weight_decay},
         "backbone_others": {"params": [], "lr_scale": lr_scale_backbone, "weight_decay": 0.0},
-        "sppf_weights": {
-            "params": [], "lr_scale": lr_scale_sppf, "weight_decay": scaled_weight_decay
-        },
+        "sppf_weights": {"params": [], "lr_scale": lr_scale_sppf, "weight_decay": scaled_weight_decay},
         "sppf_others": {"params": [], "lr_scale": lr_scale_sppf, "weight_decay": 0.0},
-        "head_weights": {
-            "params": [], "lr_scale": lr_scale_head, "weight_decay": scaled_weight_decay
-        },
+        "head_weights": {"params": [], "lr_scale": lr_scale_head, "weight_decay": scaled_weight_decay},
         "head_others": {"params": [], "lr_scale": lr_scale_head, "weight_decay": 0.0},
     }
     for name, p in model.named_parameters():
@@ -225,7 +232,6 @@ def train(hyp, opt, device, callbacks):
         lf_original = lambda x: 1.0
     else:
         lf_original = lambda x: (1 - x / epochs) * (1.0 - lrf) + lrf
-
     def lf(epoch):
         factor = lf_original(epoch)
         ddp_warmup_epochs = 0
@@ -235,7 +241,6 @@ def train(hyp, opt, device, callbacks):
             damp = min_lr_mul + (1.0 - min_lr_mul) * (1.0 - cosine)
             factor *= damp
         return factor
-
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
     ema = None
     if opt.sync_bn and cuda and RANK != -1:
@@ -304,7 +309,6 @@ def train(hyp, opt, device, callbacks):
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
     stopper, stop = EarlyStopping(patience=opt.patience), False
     compute_loss = RN_ComputeLoss(model)
-
     callbacks.run("on_train_start")
     LOGGER.info(
         f"Image sizes {imgsz} train, {imgsz} val\nUsing {train_loader.num_workers * WORLD_SIZE} dataloader workers\n"
@@ -356,14 +360,6 @@ def train(hyp, opt, device, callbacks):
                             [optimizer_settings['warmup_momentum'], optimizer_settings['b1']]
                         )
                         x['betas'] = (new_beta1, x['betas'][1])
-            if opt.multi_scale:
-                sz = random.randrange(int(imgsz * 0.5), int(imgsz * 1.5) + gs) // gs * gs
-                sf = sz / max(imgs.shape[2:])
-                if sf != 1:
-                    ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]
-                    imgs = nn.functional.interpolate(
-                        imgs, size=ns, mode="bilinear", align_corners=False
-                    )
             with torch.cuda.amp.autocast(enabled=amp):
                 pred = model(imgs)
                 loss, loss_items = compute_loss(pred, targets.to(device))
@@ -424,7 +420,6 @@ def train(hyp, opt, device, callbacks):
             log_vals = list(mloss) + list(results) + lr
             callbacks.run("on_fit_epoch_end", log_vals, epoch, best_fitness, fi)
             if (not nosave) or (final_epoch and not evolve):
-
                 def _clone_for_save(mm):
                     m2 = deepcopy(de_parallel(mm)).float()
                     for _m in m2.modules():
@@ -434,7 +429,6 @@ def train(hyp, opt, device, callbacks):
                             except Exception:
                                 pass
                     return m2
-
                 ckpt_model = _clone_for_save(model)
                 ckpt_ema = _clone_for_save(ema.ema) if ema else None
                 ckpt = {
@@ -537,7 +531,6 @@ def parse_opt(known=False):
         "--image-weights", action="store_true", help="use weighted image selection for training"
     )
     parser.add_argument("--device", default="", help="cuda device, i.e. 0 or 0,1,2,3 or cpu")
-    parser.add_argument("--multi-scale", action="store_true", help="vary img-size +/- 50%")
     parser.add_argument(
         "--single-cls", action="store_true", help="train multi-class data as single-class"
     )

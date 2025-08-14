@@ -89,28 +89,25 @@ class RN_DualDDetect(nn.Module):
 
     def forward(self, x):
         shape = x[0].shape
-        has_aux_branch = (
-            hasattr(self, "cv2") and hasattr(self, "cv3") and
-            isinstance(getattr(self, "cv2"), nn.ModuleList) and
-            isinstance(getattr(self, "cv3"), nn.ModuleList)
-        )
-
-        rq1 = getattr(self, "requant1", nn.Identity())
-        rq2 = getattr(self, "requant2", nn.Identity())
-        d1, d2 = [], []
-
-        if has_aux_branch:
-            for i in range(self.nl):
-                d1.append(rq1(torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)))
-                d2.append(
-                    rq2(torch.cat((self.cv4[i](x[self.nl + i]), self.cv5[i](x[self.nl + i])), 1))
-                )
-        else:
-            for i in range(self.nl):
-                d2.append(rq2(torch.cat((self.cv4[i](x[i]), self.cv5[i](x[i])), 1)))
-
+        nl = self.nl
         if self.training:
+            rq1 = getattr(self, "requant1", nn.Identity())
+            rq2 = getattr(self, "requant2", nn.Identity())
+            d1, d2 = [], []
+            for i in range(nl):
+                d1.append(rq1(torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)))
+            for i in range(nl):
+                d2.append(rq2(torch.cat((self.cv4[i](x[nl + i]), self.cv5[i](x[nl + i])), 1)))
             return [d1, d2]
+
+        rq2 = getattr(self, "requant2", nn.Identity())
+        d2 = []
+        if len(x) >= 2 * nl:
+            for i in range(nl):
+                d2.append(rq2(torch.cat((self.cv4[i](x[nl + i]), self.cv5[i](x[nl + i])), 1)))
+        else:
+            for i in range(nl):
+                d2.append(rq2(torch.cat((self.cv4[i](x[i]), self.cv5[i](x[i])), 1)))
 
         anc, strd = (t.transpose(0, 1) for t in make_anchors(d2, self.stride, 0.5))
         box2, cls2 = torch.cat([di.view(shape[0], self.no, -1) for di in d2],
@@ -120,20 +117,7 @@ class RN_DualDDetect(nn.Module):
         dbox2 = dist2bbox(pixel_pred_dist2, pixel_anchor_points2, xywh=True, dim=1)
         cls_out_main = cls2 if self.export_logits else F.hardsigmoid(cls2)
         y_main = torch.cat((dbox2, cls_out_main), 1)
-
-        if not has_aux_branch:
-            return y_main if self.export else (y_main, d2)
-
-        box, cls = torch.cat([di.view(shape[0], self.no, -1) for di in d1],
-                             2).split((self.reg_max * 4, self.nc), 1)
-        aux_anchors, aux_strides = (t.transpose(0, 1) for t in make_anchors(d1, self.stride, 0.5))
-        pixel_anchor_points1 = aux_anchors.unsqueeze(0) * aux_strides
-        pixel_pred_dist1 = self.dfl(box) * aux_strides
-        dbox = dist2bbox(pixel_pred_dist1, pixel_anchor_points1, xywh=True, dim=1)
-        cls_out = cls if self.export_logits else F.hardsigmoid(cls)
-        y_aux = torch.cat((dbox, cls_out), 1)
-
-        return [y_aux, y_main] if self.export else ([y_aux, y_main], [d1, d2])
+        return y_main if self.export else (y_main, d2)
 
     def bias_init(self):
         if hasattr(self, "cv2"):
@@ -143,6 +127,7 @@ class RN_DualDDetect(nn.Module):
         for a, b, s in zip(self.cv4, self.cv5, self.stride):
             a[-1].bias.data[:] = 1.0
             b[-1].bias.data[:self.nc] = math.log(5 / self.nc / (640 / s)**2)
+
 
 class BaseModel(nn.Module):
     def __init__(self):
