@@ -140,7 +140,7 @@ def create_dataloader(
     pad=0.0,
     rect=False,
     rank=-1,
-    workers=8,
+    workers=24,
     image_weights=False,
     close_mosaic=False,
     quad=False,

@@ -99,6 +99,7 @@ RANK = int(os.getenv("RANK", -1))
 WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
 GIT_INFO = None
 compiled_val = None 
+torch.backends.cudnn.benchmark = True
 
 def train(hyp, opt, device, callbacks):
     save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, freeze = \
@@ -344,7 +345,6 @@ def train(hyp, opt, device, callbacks):
         model.to(memory_format=torch.channels_last)
         LOGGER.info("Compiling TRAIN graph (inductor, max-autotune)...")
         with SuppressLogs():
-            torch.backends.cudnn.benchmark = True
             opt_dict = {
                 "max_autotune": True,
                 "coordinate_descent_tuning": True,
