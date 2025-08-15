@@ -107,6 +107,7 @@ class RN_ComputeLoss(nn.Module):
         self.assigner = TaskAlignedAssigner(topk=10, num_classes=self.nc, alpha=0.5, beta=6.0)
         self.bbox_loss = BboxLoss(m.reg_max - 1, use_dfl=use_dfl).to(device)
         self.proj = torch.arange(m.reg_max).float().to(device)
+        self.ddp_reduce = True
 
     def preprocess(self, targets, batch_size, scale_tensor):
         if targets.shape[0] == 0:

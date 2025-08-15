@@ -1,16 +1,7 @@
 import os
 
-# os.environ.setdefault("TORCHINDUCTOR_USE_CUDA_GRAPHS", "0")
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-# os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE", "0")
 os.environ.setdefault("TORCH_LOGS", "-aot,-dynamo")
-import warnings
-
-warnings.filterwarnings(
-    "ignore",
-    message=".*pow_by_natural.*",
-    module="torch.utils._sympy.interp",
-)
 
 import argparse
 import gc
@@ -32,35 +23,27 @@ from torch.optim import lr_scheduler
 from tqdm import tqdm
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from utils.torch_utils import de_parallel, EarlyStopping, ModelEMA, select_device, smart_DDP, smart_resume, torch_distributed_zero_first  # noqa: E402
-from models.common import Requant  # noqa: E402
-import val as validate  # noqa: E402
-from models.experimental import attempt_load  # noqa: E402
-from models.yolo import Model  # noqa: E402
-from utils.autobatch import check_train_batch_size  # noqa: E402
-from utils.callbacks import Callbacks  # noqa: E402
-from utils.dataloaders import create_dataloader  # noqa: E402
-from utils.downloads import attempt_download, is_url  # noqa: E402
-from utils.general import (  # noqa: E402
+from utils.torch_utils import de_parallel, EarlyStopping, ModelEMA, select_device, smart_DDP, smart_resume, torch_distributed_zero_first  
+from models.common import Requant  
+import val as validate  
+from models.experimental import attempt_load  
+from models.yolo import Model  
+from utils.autobatch import check_train_batch_size  
+from utils.callbacks import Callbacks  
+from utils.dataloaders import create_dataloader  
+from utils.downloads import attempt_download, is_url  
+from utils.general import (  
     LOGGER, TQDM_BAR_FORMAT, check_dataset, check_file, check_img_size, check_suffix, check_yaml,
     colorstr, get_latest_run, increment_path, init_seeds, intersect_dicts, labels_to_class_weights,
     labels_to_image_weights, methods, one_cycle, one_flat_cycle, print_args, print_mutation,
     strip_optimizer, yaml_save
 )
-from utils.loggers import Loggers  # noqa: E402
-from utils.loggers.comet.comet_utils import check_comet_resume  # noqa: E402
-from utils.loss_tal import RN_ComputeLoss  # noqa: E402
-from utils.metrics import fitness  # noqa: E402
-from utils.plots import plot_evolve  # noqa: E402
-from utils.lion import Lion  # noqa: E402
-
-# try:
-#     from torch._inductor import config as inductor_config
-#     inductor_config.use_cuda_graphs = False
-#     if hasattr(inductor_config, "triton"):
-#         inductor_config.triton.cudagraphs = False
-# except Exception:
-#     pass
+from utils.loggers import Loggers  
+from utils.loggers.comet.comet_utils import check_comet_resume  
+from utils.loss_tal import RN_ComputeLoss  
+from utils.metrics import fitness  
+from utils.plots import plot_evolve  
+from utils.lion import Lion  
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]
@@ -83,41 +66,6 @@ def SuppressLogs():
         os.close(fd_null)
         os.close(fd_stdout_original)
         os.close(fd_stderr_original)
-
-from torch._inductor import config as inductor_config
-
-inductor_config.max_autotune = False
-inductor_config.coordinate_descent_tuning = False
-
-if hasattr(inductor_config, "triton"):
-    inductor_config.triton.cudagraphs = False
-
-def _mark_cudagraph_step():
-    """Mark iteration boundary to prevent graph-replay hazards."""
-    try:
-        if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
-            torch.compiler.cudagraph_mark_step_begin()
-    except Exception:
-        pass
-
-def _maybe_mark_cudagraph_step():
-    mark = getattr(getattr(torch, "compiler", None), "cudagraph_mark_step_begin", None)
-    if mark is not None:
-        mark()
-
-def _clone_for_backward(obj):
-    """
-    Clone tensors that will be consumed by backward() to avoid
-    'CUDAGraphs output overwritten by subsequent run' errors when compiled.
-    """
-    if torch.is_tensor(obj):
-        return obj.clone()
-    if isinstance(obj, (list, tuple)):
-        out = [_clone_for_backward(x) for x in obj]
-        return tuple(out) if isinstance(obj, tuple) else out
-    if isinstance(obj, dict):
-        return {k: _clone_for_backward(v) for k, v in obj.items()}
-    return obj
 
 def tie_requant_observers_fx(model: torch.nn.Module) -> torch.nn.Module:
     try:
@@ -146,48 +94,11 @@ def tie_requant_observers_fx(model: torch.nn.Module) -> torch.nn.Module:
     except Exception:
         return model
     
-@contextlib.contextmanager
-def set_inductor_flags(**overrides):
-    """
-    Version-safe: toggles torch._inductor.config flags for the duration
-    of the context and restores them afterward. Supports nested attrs via
-    dotted keys like "triton.cudagraphs" (ignored if missing).
-    """
-    saved = {}
-    try:
-        for k, v in overrides.items():
-            if "." in k:
-                root, sub = k.split(".", 1)
-                obj = getattr(inductor_config, root, None)
-                if obj is None:
-                    continue
-                saved[k] = getattr(obj, sub, None)
-                try:
-                    setattr(obj, sub, v)
-                except Exception:
-                    pass  # missing/readonly attr -> ignore
-            else:
-                saved[k] = getattr(inductor_config, k, None)
-                setattr(inductor_config, k, v)
-        yield
-    finally:
-        for k, v in saved.items():
-            try:
-                if "." in k:
-                    root, sub = k.split(".", 1)
-                    obj = getattr(inductor_config, root, None)
-                    if obj is not None:
-                        setattr(obj, sub, v)
-                else:
-                    setattr(inductor_config, k, v)
-            except Exception:
-                pass
-
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", -1))
 RANK = int(os.getenv("RANK", -1))
 WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
 GIT_INFO = None
-compiled_val = None # I could not get these both to work with full optimization. 
+compiled_val = None 
 
 def train(hyp, opt, device, callbacks):
     save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, freeze = \
@@ -437,34 +348,23 @@ def train(hyp, opt, device, callbacks):
         LOGGER.info("Compiling TRAIN graph (inductor, max-autotune)...")
         with SuppressLogs():
             torch.backends.cudnn.benchmark = True
-            inductor_config.max_autotune = True
-            inductor_config.coordinate_descent_tuning = True
-            if hasattr(inductor_config, "autotune_in_subproc"):
-                inductor_config.autotune_in_subproc = True
-            if hasattr(inductor_config, "search_autotune_cache"):
-                inductor_config.search_autotune_cache = True
-            if hasattr(inductor_config, "triton"):
-                inductor_config.triton.cudagraphs = True
-                if hasattr(inductor_config.triton, "autotune_pointwise"):
-                    inductor_config.triton.autotune_pointwise = True
+
             opt_dict = {
-                "max_autotune": True,       
-                "triton.cudagraphs": True,  
-                "epilogue_fusion": True,    
-                "shape_padding": True,      
+                "max_autotune": True,
+                "coordinate_descent_tuning": True,
+                "epilogue_fusion": True,
+                "shape_padding": True,
+                "use_fast_math": True,
+                "triton.cudagraphs": False,
             }
-            with set_inductor_flags(
-                max_autotune=True,
-                coordinate_descent_tuning=True,
-                **({"triton.cudagraphs": True} if hasattr(inductor_config, "triton") else {}),
-            ):
-                model = torch.compile(
-                    model,
-                    backend="inductor",
-                    fullgraph=True,
-                    dynamic=False,
-                    options=opt_dict
-                )
+
+            model = torch.compile(
+                model,
+                backend="inductor",
+                fullgraph=True,
+                dynamic=False,
+                options=opt_dict
+            )
 
     ema = None
     if RANK in {-1, 0}:
@@ -571,11 +471,7 @@ def train(hyp, opt, device, callbacks):
         optimizer.zero_grad()
 
         for i, (imgs, targets, paths, _) in pbar:
-            _maybe_mark_cudagraph_step()
-            torch.compiler.cudagraph_mark_step_begin()
             callbacks.run("on_train_batch_start")
-            _maybe_mark_cudagraph_step()
-            torch.compiler.cudagraph_mark_step_begin()
             ni = i + nb * epoch
 
             imgs = imgs.to(device, non_blocking=True).to(memory_format=torch.channels_last)
@@ -610,20 +506,17 @@ def train(hyp, opt, device, callbacks):
 
             if hasattr(model, "no_sync") and not will_step:
                 with model.no_sync():
-                    torch.compiler.cudagraph_mark_step_begin()
                     with torch.cuda.amp.autocast(enabled=amp):
-                        _mark_cudagraph_step()
                         pred = model(imgs)
-                        pred = _clone_for_backward(pred)
+                        pred = pred
                         loss, loss_items = compute_loss(pred, targets.to(device))
                         if opt.quad:
                             loss *= 4.0
                     scaler.scale(loss).backward()
             else:
                 with torch.cuda.amp.autocast(enabled=amp):
-                    _mark_cudagraph_step()
                     pred = model(imgs)
-                    pred = _clone_for_backward(pred)
+                    pred = pred
                     loss, loss_items = compute_loss(pred, targets.to(device))
                     if opt.quad:
                         loss *= 4.0
@@ -646,7 +539,7 @@ def train(hyp, opt, device, callbacks):
                     ("%11s" * 2 + "%11.4g" * 5) %
                     (f"{epoch}/{epochs - 1}", mem, *mloss, targets.shape[0], imgs.shape[-1])
                 )
-                callbacks.run("on_train_batch_end", model, ni, imgs.detach().clone(), targets.detach().clone(), paths, list(mloss))
+                callbacks.run("on_train_batch_end", model, ni, imgs, targets, paths, list(mloss))
                 if callbacks.stop_training:
                     return
 
@@ -665,26 +558,31 @@ def train(hyp, opt, device, callbacks):
             if not noval or final_epoch:
                 prev = compute_loss.ddp_reduce
                 compute_loss.ddp_reduce = False
-
-                _mark_cudagraph_step()
+                torch.cuda.empty_cache()  
                 vm = ema.ema if ema else model
                 if compiled_val is None:
-                    torch.backends.cudnn.benchmark = False
+                    vm.to(memory_format=torch.channels_last)
                     vm.eval()
-                    LOGGER.info("Compiling VAL graph (inductor, reduce-overhead, no autotune)...")
+                    LOGGER.info("Compiling VAL graph")
                     with SuppressLogs():
-                        with set_inductor_flags(
-                            max_autotune=False,
-                            coordinate_descent_tuning=False,
-                            **({"triton.cudagraphs": False} if hasattr(inductor_config, "triton") else {})
-                        ):
-                            compiled_val = torch.compile(
-                                vm,
-                                backend="inductor",
-                                mode="max-autotune-no-cudagraphs",
-                                fullgraph=True,
-                                dynamic=True,
-                            )
+                        torch.backends.cudnn.benchmark = True
+
+                        opt_dict = {
+                            "max_autotune": True,
+                            "coordinate_descent_tuning": True,
+                            "epilogue_fusion": True,
+                            "shape_padding": True,
+                            "use_fast_math": True,
+                            "triton.cudagraphs": False,
+                        }
+
+                        model = torch.compile(
+                            model,
+                            backend="inductor",
+                            fullgraph=True,
+                            dynamic=False,
+                            options=opt_dict
+                        )
                 results, maps, _ = validate.run(
                     data_dict,
                     batch_size=val_bs,
@@ -764,7 +662,6 @@ def train(hyp, opt, device, callbacks):
                     prev = compute_loss.ddp_reduce
                     compute_loss.ddp_reduce = False
 
-                    _mark_cudagraph_step()
                     results, _, _ = validate.run(
                         data_dict,
                         batch_size=val_bs,
@@ -778,7 +675,7 @@ def train(hyp, opt, device, callbacks):
                         plots=plots,
                         callbacks=callbacks,
                         compute_loss=compute_loss,
-                        half=half_val  # keep same val precision policy
+                        half=half_val  
                     )
                     compute_loss.ddp_reduce = prev
         callbacks.run("on_train_end", last, best, epoch, results)
@@ -838,7 +735,7 @@ def parse_opt(known=False):
     parser.add_argument(
         "--optimizer",
         type=str,
-        choices=["SGD", "Adam", "AdamW", "LION"],
+        choices=["SGD", "AdamW", "LION"],
         default="SGD",
         help="optimizer"
     )

@@ -22,6 +22,9 @@ os.environ["TF_CPP_MAX_VLOG_LEVEL"] = "3"
 os.environ["PYTHONWARNINGS"] = "ignore"
 os.environ["ABSL_LOG_THRESHOLD"] = "ERROR"
 os.environ["ABSL_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["CUDNN_LOGLEVEL_DBG"] = "0"
+os.environ["CUDNN_LOGDEST_DBG"] = "/dev/null"
+
 warnings.filterwarnings("ignore")
 
 ROOT = Path(__file__).resolve().parent
@@ -246,7 +249,7 @@ def ddptrain(ctx: click.Context) -> None:
         if "--qat" in ctx.args:
             reference_batch_size = 15
         else:
-            reference_batch_size = 39
+            reference_batch_size = 38
         
         gpu_mem_bytes = [
             torch.cuda.get_device_properties(i).total_memory for i in range(num_gpus)
