@@ -7,10 +7,8 @@ import time
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
-import contextlib
 import torch
 from utils.torch_utils import de_parallel
-from utils.tal.anchor_generator import make_anchors, dist2bbox  # kept, though no longer needed directly
 
 import numpy as np
 import torch
@@ -54,6 +52,21 @@ from utils.torch_utils import (
 
 torch.set_float32_matmul_precision('high')
 
+try:
+    import torch._logging as _tl
+    _tl.set_logs(
+        dynamo=False, inductor=False, aot_graphs=False,
+        graph_breaks=True, guards=False, recompiles=False
+    )
+except Exception:
+    pass
+
+try:
+    from torch._inductor import config as inductor_config
+    inductor_config.verbose_progress = False
+except Exception:
+    pass
+
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", -1))
 RANK = int(os.getenv("RANK", -1))
 WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
@@ -91,7 +104,7 @@ def train(hyp, opt, device, callbacks):
             optimizer_settings = hyp["optimizer"][opt.optimizer]
     plots = not evolve and not opt.noplots
     cuda = device.type != "cpu"
-    init_seeds(opt.seed + 1 + RANK, deterministic=True)
+    init_seeds(opt.seed + 1 + RANK, deterministic=False)
     with torch_distributed_zero_first(LOCAL_RANK):
         data_dict = data_dict or check_dataset(data)
     train_path, val_path = data_dict["train"], data_dict["val"]
@@ -113,7 +126,8 @@ def train(hyp, opt, device, callbacks):
         ).to(device)
         exclude = ["anchor"] if (cfg or hyp.get("anchors")) and not resume else []
         model_in_ckpt = ckpt['model']
-        csd = model_in_ckpt.float().state_dict() if hasattr(model_in_ckpt, 'state_dict') else model_in_ckpt
+        csd = model_in_ckpt.float().state_dict(
+        ) if hasattr(model_in_ckpt, 'state_dict') else model_in_ckpt
         csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)
         model.load_state_dict(csd, strict=False)
         LOGGER.info(f"Transferred {len(csd)}/{len(model.state_dict())} items from {weights}")
@@ -125,21 +139,51 @@ def train(hyp, opt, device, callbacks):
             anchors=hyp.get("anchors"),
             qat=opt.qat,
         ).to(device)
+
     amp = bool(opt.amp and not opt.qat)
+
     if opt.qat:
         import torch.ao.quantization as tq
         from torch.ao.quantization.quantize_fx import prepare_qat_fx
-        from torch.ao.quantization import QConfigMapping, get_default_qat_qconfig
-        torch.backends.quantized.engine = 'fbgemm'
-        qconfig = get_default_qat_qconfig('fbgemm')
-        qconfig_mapping = QConfigMapping().set_global(qconfig).set_object_type(nn.Conv2d, qconfig).set_object_type(nn.Linear, qconfig)
+        from torch.ao.quantization.qconfig import QConfig
+        from torch.ao.quantization.fake_quantize import FakeQuantize
+        from torch.ao.quantization.observer import (
+            MovingAverageMinMaxObserver,
+            PerChannelMinMaxObserver,
+        )
+
+        torch.backends.quantized.engine = "fbgemm"
+
+        # Activations: per-tensor uint8 affine (keeps cat/add happy)
+        act_observer = MovingAverageMinMaxObserver.with_args(
+            dtype=torch.quint8, qscheme=torch.per_tensor_affine, reduce_range=False
+        )
+        # Weights: per-channel int8 symmetric (best accuracy)
+        w_observer = PerChannelMinMaxObserver.with_args(
+            dtype=torch.qint8, qscheme=torch.per_channel_symmetric, ch_axis=0
+        )
+
+        qat_qconfig = QConfig(
+            activation=FakeQuantize.with_args(observer=act_observer),
+            weight=FakeQuantize.with_args(observer=w_observer),
+        )
+
+        qconfig_mapping = (
+            tq.QConfigMapping()
+            .set_global(qat_qconfig)
+            .set_object_type(nn.Conv2d, qat_qconfig)
+            .set_object_type(nn.Linear, qat_qconfig)
+            .set_object_type(nn.Hardswish, qat_qconfig)   # ensure quantizable act
+            .set_object_type(nn.Hardsigmoid, qat_qconfig)
+            .set_module_name_regex(".*requant.*", qat_qconfig)  # ensure Requant gets observers
+        )
+
         model.train()
         model = prepare_qat_fx(model, qconfig_mapping)
-        if hasattr(torch, "compile"):
-            model = torch.compile(model, dynamic=False)
-    else:
-        if hasattr(torch, "compile"):
-            model = torch.compile(model, dynamic=False)
+
+        # Align observers on tagged Requants so add/cat stay INT8 end-to-end
+        model = tie_requant_observers_fx(model)
+
     freeze = [f"model.{x}." for x in (freeze if len(freeze) > 1 else range(freeze[0]))]
     for k, v in model.named_parameters():
         if any(x in k for x in freeze):
@@ -150,6 +194,11 @@ def train(hyp, opt, device, callbacks):
     if RANK == -1 and batch_size == -1:
         batch_size = check_train_batch_size(model, imgsz, amp)
         loggers.on_params_update({"batch_size": batch_size})
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+
     nbs = 64
     accumulate = max(round(nbs / batch_size), 1)
     lambda_target = optimizer_settings.get("weight_decay", 0.0)
@@ -157,7 +206,9 @@ def train(hyp, opt, device, callbacks):
     decoupled_settings = optimizer_settings.get("decoupled_lr", {})
     lr_scale_backbone = decoupled_settings.get("backbone", {}).get("lr_scale", 1.0)
     lr_scale_head = decoupled_settings.get("head", {}).get("lr_scale", 1.0)
-    lr_scale_sppf = decoupled_settings.get("sppf", {}).get("lr_scale", (lr_scale_backbone + lr_scale_head) / 2.0)
+    lr_scale_sppf = decoupled_settings.get("sppf", {}).get(
+        "lr_scale", (lr_scale_backbone + lr_scale_head) / 2.0
+    )
     if hasattr(model, 'yaml') and 'backbone' in model.yaml:
         backbone_full_len = len(model.yaml['backbone'])
         sppf_index = backbone_full_len - 1
@@ -172,11 +223,17 @@ def train(hyp, opt, device, callbacks):
         )
     backbone_indices = range(backbone_len)
     param_groups = {
-        "backbone_weights": {"params": [], "lr_scale": lr_scale_backbone, "weight_decay": scaled_weight_decay},
+        "backbone_weights": {
+            "params": [], "lr_scale": lr_scale_backbone, "weight_decay": scaled_weight_decay
+        },
         "backbone_others": {"params": [], "lr_scale": lr_scale_backbone, "weight_decay": 0.0},
-        "sppf_weights": {"params": [], "lr_scale": lr_scale_sppf, "weight_decay": scaled_weight_decay},
+        "sppf_weights": {
+            "params": [], "lr_scale": lr_scale_sppf, "weight_decay": scaled_weight_decay
+        },
         "sppf_others": {"params": [], "lr_scale": lr_scale_sppf, "weight_decay": 0.0},
-        "head_weights": {"params": [], "lr_scale": lr_scale_head, "weight_decay": scaled_weight_decay},
+        "head_weights": {
+            "params": [], "lr_scale": lr_scale_head, "weight_decay": scaled_weight_decay
+        },
         "head_others": {"params": [], "lr_scale": lr_scale_head, "weight_decay": 0.0},
     }
     for name, p in model.named_parameters():
@@ -232,6 +289,7 @@ def train(hyp, opt, device, callbacks):
         lf_original = lambda x: 1.0
     else:
         lf_original = lambda x: (1 - x / epochs) * (1.0 - lrf) + lrf
+
     def lf(epoch):
         factor = lf_original(epoch)
         ddp_warmup_epochs = 0
@@ -241,10 +299,14 @@ def train(hyp, opt, device, callbacks):
             damp = min_lr_mul + (1.0 - min_lr_mul) * (1.0 - cosine)
             factor *= damp
         return factor
+
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
     ema = None
     if opt.sync_bn and cuda and RANK != -1:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
+    if hasattr(torch, "compile"):
+        model.to(memory_format=torch.channels_last)
+        model = torch.compile(model, backend="inductor", mode="max-autotune", fullgraph=True)
     if RANK in {-1, 0}:
         ema = ModelEMA(model)
     best_fitness, start_epoch = 0.0, 0
@@ -309,6 +371,7 @@ def train(hyp, opt, device, callbacks):
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
     stopper, stop = EarlyStopping(patience=opt.patience), False
     compute_loss = RN_ComputeLoss(model)
+
     callbacks.run("on_train_start")
     LOGGER.info(
         f"Image sizes {imgsz} train, {imgsz} val\nUsing {train_loader.num_workers * WORLD_SIZE} dataloader workers\n"
@@ -337,7 +400,10 @@ def train(hyp, opt, device, callbacks):
         for i, (imgs, targets, paths, _) in pbar:
             callbacks.run("on_train_batch_start")
             ni = i + nb * epoch
-            imgs = imgs.to(device, non_blocking=True).float() / 255
+            imgs = imgs.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+            if amp:
+                imgs = imgs.half()
+            imgs = imgs / 255
             if ni <= nw:
                 xi = [0, nw]
                 accumulate = max(1, np.interp(ni, xi, [1, nbs / batch_size]).round())
@@ -360,15 +426,23 @@ def train(hyp, opt, device, callbacks):
                             [optimizer_settings['warmup_momentum'], optimizer_settings['b1']]
                         )
                         x['betas'] = (new_beta1, x['betas'][1])
-            with torch.cuda.amp.autocast(enabled=amp):
-                pred = model(imgs)
-                loss, loss_items = compute_loss(pred, targets.to(device))
-                if RANK != -1:
-                    loss *= WORLD_SIZE
-                if opt.quad:
-                    loss *= 4.0
-            scaler.scale(loss).backward()
-            if ni - last_opt_step >= accumulate:
+            will_step = (ni - last_opt_step) >= accumulate
+            if hasattr(model, "no_sync") and not will_step:
+                with model.no_sync():
+                    with torch.cuda.amp.autocast(enabled=amp):
+                        pred = model(imgs)
+                        loss, loss_items = compute_loss(pred, targets.to(device))
+                        if opt.quad:
+                            loss *= 4.0
+                    scaler.scale(loss).backward()
+            else:
+                with torch.cuda.amp.autocast(enabled=amp):
+                    pred = model(imgs)
+                    loss, loss_items = compute_loss(pred, targets.to(device))
+                    if opt.quad:
+                        loss *= 4.0
+                scaler.scale(loss).backward()
+            if will_step:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
                 scaler.step(optimizer)

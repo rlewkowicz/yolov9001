@@ -1,4 +1,3 @@
-# yolo.py
 import contextlib
 import math
 import os
@@ -9,8 +8,6 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.ao.quantization as tq
-from torch.ao.quantization import QuantStub, DeQuantStub
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[1]
@@ -22,16 +19,9 @@ from models.common import *
 from utils.general import LOGGER, make_divisible
 from utils.tal.anchor_generator import make_anchors, dist2bbox
 from utils.torch_utils import (
-    fuse_conv_and_bn,
     initialize_weights,
     model_info,
-    scale_img,
 )
-
-try:
-    import thop
-except ImportError:
-    thop = None
 
 class RN_DualDDetect(nn.Module):
     dynamic = False
@@ -128,20 +118,11 @@ class RN_DualDDetect(nn.Module):
             a[-1].bias.data[:] = 1.0
             b[-1].bias.data[:self.nc] = math.log(5 / self.nc / (640 / s)**2)
 
-
 class BaseModel(nn.Module):
     def __init__(self):
         super().__init__()
-        self.quant = None
-        self.dequant = None
-        self.qconfig = None
 
     def forward(self, x, profile=False):
-        if self.quant is not None and self.dequant is not None:
-            x = self.quant(x)
-            x = self._forward_once(x, profile)
-            x = self.dequant(x)
-            return x
         return self._forward_once(x, profile)
 
     def _forward_once(self, x, profile=False):
@@ -152,76 +133,6 @@ class BaseModel(nn.Module):
             x = m(x)
             y.append(x if m.i in self.save else None)
         return x
-
-    def fuse(self):
-        LOGGER.info("Fusing layers... ")
-        detect_head = self.model[-1]
-        if isinstance(detect_head, RN_DualDDetect) and hasattr(detect_head, "cv2"):
-            backbone_len = 0
-            if hasattr(self, "yaml") and "backbone" in self.yaml:
-                backbone_len = len(self.yaml["backbone"])
-            main_head_input_indices = detect_head.f[detect_head.nl:]
-            layers_to_keep = set(range(backbone_len))
-            q = list(main_head_input_indices)
-            visited = set(q)
-            while q:
-                idx = q.pop(0)
-                layers_to_keep.add(idx)
-                from_indices = self.model[idx].f
-                if isinstance(from_indices, int):
-                    from_indices = [from_indices]
-                for from_idx in from_indices:
-                    actual_idx = from_idx if from_idx != -1 else idx - 1
-                    if actual_idx not in visited:
-                        q.append(actual_idx)
-                        visited.add(actual_idx)
-            for i in range(backbone_len, len(self.model) - 1):
-                if i not in layers_to_keep:
-                    silent_module = Silence()
-                    silent_module.i = self.model[i].i
-                    silent_module.f = self.model[i].f
-                    silent_module.type = "models.common.Silence"
-                    silent_module.np = 0
-                    self.model[i] = silent_module
-            if hasattr(detect_head, "cv2"):
-                delattr(detect_head, "cv2")
-            if hasattr(detect_head, "cv3"):
-                delattr(detect_head, "cv3")
-            if hasattr(detect_head, "dfl"):
-                delattr(detect_head, "dfl")
-            detect_head.f = main_head_input_indices
-
-        for m in self.model.modules():
-            if isinstance(m, RepBlockAdd) and not hasattr(m, "requant"):
-                m.requant = Requant() if getattr(m, "add", False) else nn.Identity()
-            elif isinstance(m, (QuantAdd, QARepNCSPELAN, DFL)) and not hasattr(m, "requant"):
-                m.requant = Requant()
-        detect_head = self.model[-1]
-        if isinstance(detect_head, RN_DualDDetect):
-            if not hasattr(detect_head, "requant1"):
-                detect_head.requant1 = Requant()
-            if not hasattr(detect_head, "requant2"):
-                detect_head.requant2 = Requant()
-
-        for m in self.model.modules():
-            if hasattr(m, "switch_to_deploy"):
-                m.switch_to_deploy()
-            if isinstance(m, RepConvN) and hasattr(m, "fuse_convs"):
-                rq = getattr(m, "requant", None)
-                m.fuse_convs()
-                m.forward = m.forward_fuse
-                if rq is not None:
-                    m.requant = rq
-            elif isinstance(m, Conv) and hasattr(m, "bn"):
-                rq = getattr(m, "requant", None)
-                m.conv = fuse_conv_and_bn(m.conv, m.bn)
-                delattr(m, "bn")
-                m.forward = m.forward_fuse
-                if rq is not None:
-                    m.requant = rq
-
-        self.info()
-        return self
 
     def info(self, verbose=False, img_size=640):
         model_info(self, verbose, img_size)
@@ -234,28 +145,6 @@ class BaseModel(nn.Module):
             m.anchors = fn(m.anchors)
             m.strides = fn(m.strides)
         return self
-
-    def _fuse_for_qat(self):
-        for m in self.model.modules():
-            if isinstance(m, Conv) and hasattr(m, 'bn') and m.bn is not None:
-                try:
-                    tq.fuse_modules(m, ['conv', 'bn'], inplace=True)
-                except Exception:
-                    pass
-
-    def enable_qat(self, backend='fbgemm', per_channel=True):
-        torch.backends.quantized.engine = backend
-        self.quant = QuantStub()
-        self.dequant = DeQuantStub()
-        if per_channel:
-            self.qconfig = tq.get_default_qat_qconfig(backend)
-        else:
-            self.qconfig = tq.qconfig.QConfig(
-                activation=tq.default_fake_quant, weight=tq.default_weight_fake_quant
-            )
-        self.train()
-        self._fuse_for_qat()
-        tq.prepare_qat(self, inplace=True)
 
 class DetectionModel(BaseModel):
     def __init__(
@@ -289,57 +178,10 @@ class DetectionModel(BaseModel):
             m.bias_init()
         initialize_weights(self)
         self.info()
-        if qat:
-            self.enable_qat(backend='fbgemm', per_channel=bool(qat_per_channel))
         LOGGER.info("")
 
     def forward(self, x, augment=False, profile=False):
-        if augment:
-            return self._forward_augment(x)
         return self._forward_once(x, profile)
-
-    def _forward_augment(self, x):
-        img_size = x.shape[-2:]
-        s = [1, 0.83, 0.67]
-        f = [None, 3, None]
-        y = []
-        for si, fi in zip(s, f):
-            xi = scale_img(x.flip(fi) if fi else x, si, gs=int(self.stride.max()))
-            output = self._forward_once(xi)
-            yi = (
-                output[0][1]
-                if isinstance(output, tuple) and isinstance(output[0], list) else output
-            )
-            yi = self._descale_pred(yi, fi, si, img_size)
-            y.append(yi)
-        y = self._clip_augmented(y)
-        return (torch.cat(y, 1), None)
-
-    def _descale_pred(self, p, flips, scale, img_size):
-        if self.inplace:
-            p[..., :4] /= scale
-            if flips == 2:
-                p[..., 1] = img_size[0] - p[..., 1]
-            elif flips == 3:
-                p[..., 0] = img_size[1] - p[..., 0]
-        else:
-            (x, y, wh) = (p[..., 0:1] / scale, p[..., 1:2] / scale, p[..., 2:4] / scale)
-            if flips == 2:
-                y = img_size[0] - y
-            elif flips == 3:
-                x = img_size[1] - x
-            p = torch.cat((x, y, wh, p[..., 4:]), -1)
-        return p
-
-    def _clip_augmented(self, y):
-        nl = self.model[-1].nl
-        g = sum((4**x for x in range(nl)))
-        e = 1
-        i = y[0].shape[1] // g * sum((4**x for x in range(e)))
-        y[0] = y[0][:, :-i]
-        i = y[-1].shape[1] // g * sum((4**(nl - 1 - x) for x in range(e)))
-        y[-1] = y[-1][:, i:]
-        return y
 
 Model = DetectionModel
 

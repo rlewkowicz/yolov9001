@@ -27,13 +27,6 @@ warnings.filterwarnings(
 )
 warnings.filterwarnings("ignore", category=UserWarning)
 
-def _count_relu_like(m, x, y):
-    """THOP custom op for ReLU-like activations (e.g., nn.ReLU6, Hardswish, SiLU)."""
-    out = y if torch.is_tensor(y) else y[0]
-    if not hasattr(m, "total_ops"):
-        m.register_buffer("total_ops", torch.zeros(1, dtype=torch.int64))
-    m.total_ops += torch.as_tensor(out.numel(), device=out.device, dtype=torch.int64)
-
 def smart_inference_mode(torch_1_9=check_version(torch.__version__, "1.9.0")):
     def decorate(fn):
         return (torch.inference_mode if torch_1_9 else torch.no_grad)()(fn)
@@ -41,13 +34,15 @@ def smart_inference_mode(torch_1_9=check_version(torch.__version__, "1.9.0")):
     return decorate
 
 def smart_DDP(model):
-    assert not check_version(torch.__version__, "1.12.0", pinned=True), (
-        "torch==1.12.0 torchvision==0.13.0 DDP training is not supported due to a known issue. Please upgrade or downgrade torch to use DDP. See https://github.com/ultralytics/yolov5/issues/8395"
+    return DDP(
+        model,
+        device_ids=[LOCAL_RANK],
+        output_device=LOCAL_RANK,
+        broadcast_buffers=False,
+        gradient_as_bucket_view=False,
+        find_unused_parameters=True,
+        static_graph=True
     )
-    if check_version(torch.__version__, "1.11.0"):
-        return DDP(model, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK, static_graph=True)
-    else:
-        return DDP(model, device_ids=[LOCAL_RANK], output_device=LOCAL_RANK)
 
 @contextmanager
 def torch_distributed_zero_first(local_rank: int):

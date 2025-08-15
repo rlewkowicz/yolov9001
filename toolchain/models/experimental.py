@@ -85,5 +85,6 @@ def attempt_load(weights, device=None, inplace=True, fuse=True):
     for k in ("names", "nc", "yaml"):
         setattr(model, k, getattr(model[0], k))
     model.stride = model[torch.argmax(torch.tensor([m.stride.max() for m in model])).int()].stride
-    assert all((model[0].nc == m.nc for m in model)), f"Models have different class counts: {[m.nc for m in model]}"
+    assert all((model[0].nc == m.nc
+                for m in model)), f"Models have different class counts: {[m.nc for m in model]}"
     return model

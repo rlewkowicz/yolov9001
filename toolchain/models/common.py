@@ -1,4 +1,3 @@
-# common.py
 from copy import copy
 from pathlib import Path
 import numpy as np
@@ -32,16 +31,9 @@ from torch.nn import Parameter
 class Requant(nn.Module):
     def __init__(self):
         super().__init__()
-
+        self.act = nn.Identity()
     def forward(self, x):
-        return x
-
-class Silence(nn.Module):
-    def __init__(self):
-        super(Silence, self).__init__()
-
-    def forward(self, x):
-        return x
+        return self.act(x)
 
 def autopad(k, p=None, d=1):
     if d > 1:
@@ -297,12 +289,13 @@ class QARepNCSPELAN(nn.Module):
         self.requant = Requant()
 
     def forward(self, x):
-        y = list(self.cv1(x).chunk(2, 1))
-        y.extend((m(y[-1]) for m in [self.cv2, self.cv3]))
-        p1 = self.proj1(y[0])
-        p2 = self.proj2(y[1])
-        p3 = self.proj3(y[2])
-        p4 = self.proj4(y[3])
+        y1, y2 = self.cv1(x).chunk(2, 1)
+        z2 = self.cv2(y2)
+        z3 = self.cv3(z2)
+        p1 = self.proj1(y1)
+        p2 = self.proj2(y2)
+        p3 = self.proj3(z2)
+        p4 = self.proj4(z3)
         rq = getattr(self, "requant", nn.Identity())
         return rq(p1 + p2 + p3 + p4)
 
@@ -368,11 +361,10 @@ class QARepVGGBlockV2(nn.Module):
         if self.deploy:
             return self.nonlinearity(self.se(self.rbr_reparam(inputs)))
         base = self.rbr_dense(inputs) + self.rbr_1x1(inputs)
-        id_out = self.rbr_identity(inputs) if self.rbr_identity is not None else torch.zeros_like(base)
+        id_out = self.rbr_identity(inputs
+                                  ) if self.rbr_identity is not None else torch.zeros_like(base)
         avg_out = self.rbr_avg(inputs) if self.rbr_avg is not None else torch.zeros_like(base)
-        return self.nonlinearity(
-            self.bn(self.se(base + id_out + avg_out))
-        )
+        return self.nonlinearity(self.bn(self.se(base + id_out + avg_out)))
 
     def get_equivalent_kernel_bias(self):
         (kernel3x3, bias3x3) = self._fuse_bn_tensor(self.rbr_dense)
@@ -522,7 +514,9 @@ class DetectMultiBackend(nn.Module):
         w = str(weights[0] if isinstance(weights, list) else weights)
         if not (w.endswith('.pt') or w.endswith('.pth')):
             w = attempt_download(w)
-        model = attempt_load(weights if isinstance(weights, list) else w, device=device, inplace=True, fuse=fuse)
+        model = attempt_load(
+            weights if isinstance(weights, list) else w, device=device, inplace=True, fuse=fuse
+        )
         stride = max(int(model.stride.max()), 32)
         names = model.module.names if hasattr(model, 'module') else model.names
         if fp16:
@@ -552,9 +546,10 @@ class DetectMultiBackend(nn.Module):
 
     def warmup(self, imgsz=(1, 3, 640, 640)):
         if self.device.type != 'cpu':
-            im = torch.empty(*imgsz, dtype=torch.half if self.fp16 else torch.float, device=self.device)
+            im = torch.empty(
+                *imgsz, dtype=torch.half if self.fp16 else torch.float, device=self.device
+            )
             self.forward(im)
-
 
 class Detections:
     def __init__(self, ims, pred, files, times=(0, 0, 0), names=None, shape=None):

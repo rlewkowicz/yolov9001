@@ -38,7 +38,6 @@ from utils.general import (
 )
 from utils.plots import Annotator, colors
 
-
 def safe_cosine(a: np.ndarray, b: np.ndarray) -> float:
     a = np.asarray(a, dtype=np.float32).ravel()
     b = np.asarray(b, dtype=np.float32).ravel()
@@ -54,7 +53,6 @@ def safe_cosine(a: np.ndarray, b: np.ndarray) -> float:
         return 0.0
     return 1.0 - cosine(a, b)
 
-
 def print_side_by_side_table(rows, headers):
     col_widths = [
         max(len(str(row[i])) for row in rows + [headers]) + 2 for i in range(len(headers))
@@ -65,15 +63,12 @@ def print_side_by_side_table(rows, headers):
     for r in rows:
         print("".join(str(r[i]).ljust(col_widths[i]) for i in range(len(headers))))
 
-
 def get_providers(opt_device: str):
     avail = onnxruntime.get_available_providers()
     if "CUDAExecutionProvider" in avail and opt_device != "cpu":
-        return ["CUDAExecutionProvider"] + (
-            ["CPUExecutionProvider"] if "CPUExecutionProvider" in avail else []
-        )
+        return ["CUDAExecutionProvider"
+               ] + (["CPUExecutionProvider"] if "CPUExecutionProvider" in avail else [])
     return ["CPUExecutionProvider"]
-
 
 def names_from_meta(session, fallback_nc=80):
     try:
@@ -93,7 +88,6 @@ def names_from_meta(session, fallback_nc=80):
     except Exception:
         pass
     return [str(i) for i in range(fallback_nc)]
-
 
 class ImageCalibrator:
     def __init__(self, calib_files, input_name, imgsz=(640, 640), stride=32):
@@ -116,7 +110,6 @@ class ImageCalibrator:
         except StopIteration:
             return None
 
-
 def _screen_calib_images(model_path, candidate_image_paths, imgsz, providers):
     sess = onnxruntime.InferenceSession(str(model_path), providers=providers)
     input_name = sess.get_inputs()[0].name
@@ -133,7 +126,6 @@ def _screen_calib_images(model_path, candidate_image_paths, imgsz, providers):
             pass
     LOGGER.info(f"[Calib screening] {len(good)}/{len(candidate_image_paths)} images passed.")
     return good
-
 
 def quantize_qdq(
     fp32_onnx,
@@ -225,14 +217,12 @@ def quantize_qdq(
     LOGGER.info(f"Quantization complete. Model saved to {out_qdq}")
     return str(out_qdq)
 
-
 def _producer_map(g):
     prod = {}
     for n in g.node:
         for o in n.output:
             prod[o] = n
     return prod
-
 
 def get_output_qdq_params(model_path: str, prefer_output: str | None = None):
     m = onnx.load(model_path)
@@ -285,12 +275,15 @@ def get_output_qdq_params(model_path: str, prefer_output: str | None = None):
             axis = int(a.i)
 
     return {
-        "scale": float(scale_arr) if scale_arr.size == 1 else scale_arr.astype(np.float32).reshape(-1),
-        "zero_point": int(zp_arr) if zp_arr.size == 1 else zp_arr.reshape(-1),
-        "axis": axis,
-        "zp_dtype": zp_arr.dtype,
+        "scale":
+            float(scale_arr) if scale_arr.size == 1 else scale_arr.astype(np.float32).reshape(-1),
+        "zero_point":
+            int(zp_arr) if zp_arr.size == 1 else zp_arr.reshape(-1),
+        "axis":
+            axis,
+        "zp_dtype":
+            zp_arr.dtype,
     }
-
 
 def dq_from_pt(pt_path, expect_channels=None):
     try:
@@ -305,19 +298,19 @@ def dq_from_pt(pt_path, expect_channels=None):
     mins, maxs = calib.get("min"), calib.get("max")
 
     if per_channel:
-        mins, maxs = np.array(mins, dtype=np.float32).reshape(-1), np.array(maxs, dtype=np.float32).reshape(-1)
+        mins, maxs = np.array(mins,
+                              dtype=np.float32).reshape(-1), np.array(maxs,
+                                                                      dtype=np.float32).reshape(-1)
         scale = (maxs - mins) / 255.0
         scale = np.where(scale <= 1e-12, 1.0, scale).astype(np.float32)
         zp = np.clip(np.round(-mins / scale), -128, 255).astype(np.int32)
         return {"scale": scale, "zero_point": zp, "axis": 1}
     else:
-        mins, maxs = float(mins[0] if isinstance(mins, (list, tuple)) else mins), float(
-            maxs[0] if isinstance(maxs, (list, tuple)) else maxs
-        )
+        mins, maxs = float(mins[0] if isinstance(mins, (list, tuple)) else mins
+                          ), float(maxs[0] if isinstance(maxs, (list, tuple)) else maxs)
         sc = (maxs - mins) / 255.0 if (maxs - mins) > 1e-12 else 1.0
         zp = int(np.clip(round(-mins / sc), -128, 255))
         return {"scale": float(sc), "zero_point": int(zp), "axis": 1}
-
 
 def print_pt_vs_qdq_qparams(pt_dq, qdq_params, names, max_classes_to_show=10):
     if pt_dq is None:
@@ -336,18 +329,22 @@ def print_pt_vs_qdq_qparams(pt_dq, qdq_params, names, max_classes_to_show=10):
 
     def slice_cls(arr, default_val, dtype=np.float32):
         if not isinstance(arr, np.ndarray):
-            return np.full((nc,), float(arr), dtype=dtype)
+            return np.full((nc, ), float(arr), dtype=dtype)
         if arr.size >= (nc + 4):
             return arr[-nc:]
         elif arr.size == nc:
             return arr
-        return np.full((nc,), default_val, dtype=dtype)
+        return np.full((nc, ), default_val, dtype=dtype)
 
     cls_sc_qdq = slice_cls(sc_q, float(sc_q) if not isinstance(sc_q, np.ndarray) else 1.0)
-    cls_zp_qdq = slice_cls(zp_q, int(zp_q) if not isinstance(zp_q, np.ndarray) else 0, dtype=np.int32)
+    cls_zp_qdq = slice_cls(
+        zp_q, int(zp_q) if not isinstance(zp_q, np.ndarray) else 0, dtype=np.int32
+    )
     sc_p, zp_p = pt_dq["scale"], pt_dq["zero_point"]
     cls_sc_pt = slice_cls(sc_p, float(sc_p) if not isinstance(sc_p, np.ndarray) else 1.0)
-    cls_zp_pt = slice_cls(zp_p, int(zp_p) if not isinstance(zp_p, np.ndarray) else 0, dtype=np.int32)
+    cls_zp_pt = slice_cls(
+        zp_p, int(zp_p) if not isinstance(zp_p, np.ndarray) else 0, dtype=np.int32
+    )
 
     print(f"\nPT vs QDQ qparams for class logits (first {max_classes_to_show}):")
     print(f"{'cls':<4} {'sc_pt':>10} {'zp_pt':>7} {'sc_qdq':>10} {'zp_qdq':>8}")
@@ -356,7 +353,6 @@ def print_pt_vs_qdq_qparams(pt_dq, qdq_params, names, max_classes_to_show=10):
         print(
             f"{k:<4d} {float(cls_sc_pt[k]):10.6g} {int(cls_zp_pt[k]):7d} {float(cls_sc_qdq[k]):10.6g} {int(cls_zp_qdq[k]):8d}"
         )
-
 
 def prepare_input_for_session(session, source, imgsz):
     loader = LoadImages(source, img_size=imgsz, auto=False)
@@ -368,13 +364,11 @@ def prepare_input_for_session(session, source, imgsz):
         x = x[None]
     return x, im0
 
-
 def _to_cfirst(a: np.ndarray) -> np.ndarray:
     a = np.asarray(a, dtype=np.float32)
     if a.ndim != 3:
         return a.reshape(a.shape[0], a.shape[1], -1)
     return a if a.shape[1] < a.shape[2] else np.transpose(a, (0, 2, 1))
-
 
 def run_head(session, x, _names_unused):
     outs = session.get_outputs()
@@ -393,7 +387,6 @@ def run_head(session, x, _names_unused):
     idx_logits = 1 - idx_boxes
     return ys[idx_boxes].astype(np.float32), ys[idx_logits].astype(np.float32)
 
-
 def xywh2xyxy(x):
     y = np.copy(x)
     y[:, 0] = x[:, 0] - x[:, 2] / 2
@@ -401,7 +394,6 @@ def xywh2xyxy(x):
     y[:, 2] = x[:, 0] + x[:, 2] / 2
     y[:, 3] = x[:, 1] + x[:, 3] / 2
     return y
-
 
 def iou(box1, boxes2):
     x1 = np.maximum(box1[0], boxes2[:, 0])
@@ -417,7 +409,6 @@ def iou(box1, boxes2):
     union = area1 + area2 - intersection
 
     return intersection / (union + 1e-6)
-
 
 def custom_non_max_suppression(boxes_cfirst, logits_cfirst, conf_thres, iou_thres, max_det=300):
     boxes_xywh = np.transpose(boxes_cfirst[0], (1, 0))
@@ -469,7 +460,6 @@ def custom_non_max_suppression(boxes_cfirst, logits_cfirst, conf_thres, iou_thre
 
     return [torch.from_numpy(final_detections)]
 
-
 def safe_save_image(img_like, save_path: Path, ref_shape=None):
     try:
         arr = img_like
@@ -482,7 +472,9 @@ def safe_save_image(img_like, save_path: Path, ref_shape=None):
 
         arr = np.asarray(arr)
 
-        if arr.ndim == 3 and arr.shape[0] in (1, 3) and arr.shape[0] < arr.shape[-1] and arr.shape[1] != 1:
+        if arr.ndim == 3 and arr.shape[0] in (
+            1, 3
+        ) and arr.shape[0] < arr.shape[-1] and arr.shape[1] != 1:
             arr = np.transpose(arr, (1, 2, 0))
 
         if arr.ndim == 2:
@@ -513,7 +505,8 @@ def safe_save_image(img_like, save_path: Path, ref_shape=None):
     except Exception:
         try:
             from PIL import Image
-            img = Image.fromarray(arr[..., ::-1]) if arr.ndim == 3 and arr.shape[2] == 3 else Image.fromarray(arr)
+            img = Image.fromarray(arr[..., ::-1]
+                                 ) if arr.ndim == 3 and arr.shape[2] == 3 else Image.fromarray(arr)
             img.save(str(save_path))
         except Exception as e2:
             npy_path = str(save_path.with_suffix(".npy"))
@@ -521,7 +514,6 @@ def safe_save_image(img_like, save_path: Path, ref_shape=None):
             LOGGER.warning(
                 f"Could not save annotated image to {save_path}; saved raw array to {npy_path} instead. Error: {e2}"
             )
-
 
 def run_one(session, im_in, im0, names, conf_thres, iou_thres, max_det, save_path):
     boxes, logits = run_head(session, im_in, names)
@@ -564,7 +556,6 @@ def run_one(session, im_in, im0, names, conf_thres, iou_thres, max_det, save_pat
 
     return head_flat_for_cosine, top5
 
-
 def dump_logits_vs_qparams(label, head_cfirst_concat, names, qdq_params, max_classes_to_show=10):
     a = head_cfirst_concat.reshape(1, head_cfirst_concat.shape[1], -1).astype(np.float32)
     nc = len(names)
@@ -574,7 +565,9 @@ def dump_logits_vs_qparams(label, head_cfirst_concat, names, qdq_params, max_cla
         print(f"\n{label}: No QDQ params found (final DQ not detected).")
         return
 
-    sc, zp, zp_dtype = qdq_params["scale"], qdq_params["zero_point"], qdq_params.get("zp_dtype", np.uint8)
+    sc, zp, zp_dtype = qdq_params["scale"], qdq_params["zero_point"], qdq_params.get(
+        "zp_dtype", np.uint8
+    )
 
     if isinstance(sc, np.ndarray) and sc.size >= nc:
         cls_sc = sc[-nc:] if sc.size > nc else sc
@@ -582,12 +575,14 @@ def dump_logits_vs_qparams(label, head_cfirst_concat, names, qdq_params, max_cla
     else:
         s = float(sc.item() if not isinstance(sc, float) else sc)
         z = int(zp.item() if not isinstance(zp, int) else zp)
-        cls_sc, cls_zp = np.full((nc,), s, dtype=np.float32), np.full((nc,), z, dtype=np.int32)
+        cls_sc, cls_zp = np.full((nc, ), s, dtype=np.float32), np.full((nc, ), z, dtype=np.int32)
 
     qmin_q, qmax_q = (-128, 127) if zp_dtype == np.int8 else (0, 255)
 
     print(f"\nClass logits vs QDQ qparams ({label}, first {max_classes_to_show}):")
-    print(f"{'cls':<4} {'mean':>9} {'min':>10} {'max':>10} {'scale':>9} {'zp':>5} {'q_min':>9} {'q_max':>9}")
+    print(
+        f"{'cls':<4} {'mean':>9} {'min':>10} {'max':>10} {'scale':>9} {'zp':>5} {'q_min':>9} {'q_max':>9}"
+    )
     print("-" * 75)
     for k in range(min(nc, max_classes_to_show)):
         v = cls_logits[k, :]
@@ -597,7 +592,6 @@ def dump_logits_vs_qparams(label, head_cfirst_concat, names, qdq_params, max_cla
         print(
             f"{k:<4d} {mean_v:9.4f} {min_v:10.4f} {max_v:10.4f} {float(cls_sc[k]):9.6g} {int(cls_zp[k]):5d} {qmin_dequant:9.3f} {qmax_dequant:9.3f}"
         )
-
 
 def compare_models(opt):
     fp32_path = Path(opt.weights)
@@ -629,10 +623,12 @@ def compare_models(opt):
     base = Path(opt.source).stem if not Path(opt.source).is_dir() else "image"
 
     head_fp32_cfirst, top5_fp32 = run_one(
-        sess_fp32, im_in, im0, names, opt.conf_thres, opt.iou_thres, opt.max_det, save_dir / f"{base}_fp32.jpg"
+        sess_fp32, im_in, im0, names, opt.conf_thres, opt.iou_thres, opt.max_det,
+        save_dir / f"{base}_fp32.jpg"
     )
     head_qdq_cfirst, top5_qdq = run_one(
-        sess_qdq, im_in, im0.copy(), names, opt.conf_thres, opt.iou_thres, opt.max_det, save_dir / f"{base}_int8.jpg"
+        sess_qdq, im_in, im0.copy(), names, opt.conf_thres, opt.iou_thres, opt.max_det,
+        save_dir / f"{base}_int8.jpg"
     )
 
     cs = safe_cosine(head_fp32_cfirst, head_qdq_cfirst)
@@ -642,20 +638,21 @@ def compare_models(opt):
     for i in range(max(len(top5_fp32), len(top5_qdq))):
         lf = top5_fp32[i] if i < len(top5_fp32) else ("-", "-", "-")
         ri = top5_qdq[i] if i < len(top5_qdq) else ("-", "-", "-")
-        rows.append(
-            (
-                i + 1,
-                lf[0],
-                f"{lf[1]:.3f}" if isinstance(lf[1], float) else "-",
-                str(lf[2]),
-                ri[0],
-                f"{ri[1]:.3f}" if isinstance(ri[1], float) else "-",
-                str(ri[2]),
-            )
-        )
+        rows.append((
+            i + 1,
+            lf[0],
+            f"{lf[1]:.3f}" if isinstance(lf[1], float) else "-",
+            str(lf[2]),
+            ri[0],
+            f"{ri[1]:.3f}" if isinstance(ri[1], float) else "-",
+            str(ri[2]),
+        ))
     print("Top-5 detections (side-by-side):")
     print_side_by_side_table(
-        rows, ["Rank", "FP32 class", "FP32 conf", "FP32 box [xyxy]", "QDQ class", "QDQ conf", "QDQ box [xyxy]"]
+        rows, [
+            "Rank", "FP32 class", "FP32 conf", "FP32 box [xyxy]", "QDQ class", "QDQ conf",
+            "QDQ box [xyxy]"
+        ]
     )
     print(f"\nSaved annotated images to: {save_dir}")
 
@@ -676,15 +673,27 @@ def compare_models(opt):
     elif opt.pt:
         print(f"\n[PT calib] PT file not found: {opt.pt}")
 
-
 def parse_opt():
     p = argparse.ArgumentParser(description="FP32 vs QDQ INT8 comparison with YOLO split heads")
     p.add_argument("--weights", type=str, required=True, help="Path to FP32 ONNX model")
-    p.add_argument("--source", type=str, required=True, help="Path to a single image for comparison")
-    p.add_argument("--data", type=str, default=str(ROOT / "data/coco.yaml"), help="dataset.yaml for calibration")
-    p.add_argument("--imgsz", "--img-size", nargs="+", type=int, default=[640], help="Inference size h,w")
-    p.add_argument("--device", default="cpu", help="Hardware device for inference, e.g., 'cuda' or 'cpu'")
-    p.add_argument("--quantize", action="store_true", help="Force re-quantization even if INT8 model exists")
+    p.add_argument(
+        "--source", type=str, required=True, help="Path to a single image for comparison"
+    )
+    p.add_argument(
+        "--data",
+        type=str,
+        default=str(ROOT / "data/coco.yaml"),
+        help="dataset.yaml for calibration"
+    )
+    p.add_argument(
+        "--imgsz", "--img-size", nargs="+", type=int, default=[640], help="Inference size h,w"
+    )
+    p.add_argument(
+        "--device", default="cpu", help="Hardware device for inference, e.g., 'cuda' or 'cpu'"
+    )
+    p.add_argument(
+        "--quantize", action="store_true", help="Force re-quantization even if INT8 model exists"
+    )
     p.add_argument(
         "--calib",
         type=str,
@@ -694,18 +703,26 @@ def parse_opt():
     )
     p.add_argument("--conf-thres", type=float, default=0.25, help="Confidence threshold for NMS")
     p.add_argument("--iou-thres", type=float, default=0.45, help="IoU threshold for NMS")
-    p.add_argument("--max-det", type=int, default=300, help="Maximum number of detections per image")
+    p.add_argument(
+        "--max-det", type=int, default=300, help="Maximum number of detections per image"
+    )
     p.add_argument("--project", default=ROOT / "runs/compare", help="Directory to save results")
     p.add_argument("--name", default="exp", help="Subdirectory name for results")
-    p.add_argument("--act-signed", action="store_true", help="Use signed int8 (symmetric) for activations")
-    p.add_argument("--pt", type=str, default=None, help="Optional: path to .pt file with int8_calib.head to compare qparams")
+    p.add_argument(
+        "--act-signed", action="store_true", help="Use signed int8 (symmetric) for activations"
+    )
+    p.add_argument(
+        "--pt",
+        type=str,
+        default=None,
+        help="Optional: path to .pt file with int8_calib.head to compare qparams"
+    )
     opt = p.parse_args()
     opt.imgsz = check_img_size(opt.imgsz)
     if len(opt.imgsz) == 1:
         opt.imgsz *= 2
     print_args(vars(opt))
     return opt
-
 
 if __name__ == "__main__":
     opt = parse_opt()

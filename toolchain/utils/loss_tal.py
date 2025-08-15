@@ -185,13 +185,6 @@ class RN_ComputeLoss(nn.Module):
                 fg_mask,
             )
 
-        if self.ddp_reduce and torch.distributed.is_available(
-        ) and torch.distributed.is_initialized():
-            torch.distributed.all_reduce(cls_num_local, op=torch.distributed.ReduceOp.SUM)
-            torch.distributed.all_reduce(target_scores_sum_local, op=torch.distributed.ReduceOp.SUM)
-            torch.distributed.all_reduce(iou_sum_local, op=torch.distributed.ReduceOp.SUM)
-            torch.distributed.all_reduce(dfl_sum_local, op=torch.distributed.ReduceOp.SUM)
-
         denom = target_scores_sum_local.clamp(min=1)
         loss[1] = cls_num_local / denom
         loss[0] = iou_sum_local / denom

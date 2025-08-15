@@ -216,9 +216,7 @@ def ddptrain(ctx: click.Context) -> None:
     script_path = str(TOOLCHAIN / ALIASES["ddptrain"][0])
 
     cmd = [
-        sys.executable,
-        "-m",
-        "torch.distributed.launch",
+        "torchrun",
         "--nproc_per_node",
         str(num_gpus),
         "--nnodes",
@@ -266,12 +264,9 @@ def ddptrain(ctx: click.Context) -> None:
 
     env = os.environ.copy()
     env["OMP_NUM_THREADS"] = str(omp_threads)
-    env["MASTER_ADDR"] = master_addr
-    env["MASTER_PORT"] = master_port
-    env["WORLD_SIZE"] = str(world_size)
-
+    
     print(
-        f"DDP launch: node_rank={node_rank}, nnodes={nnodes}, gpus_per_node={num_gpus}"
+        f"torchrun launch: node_rank={node_rank}, nnodes={nnodes}, gpus_per_node={num_gpus}"
     )
     try:
         subprocess.run(cmd, check=True, env=env)

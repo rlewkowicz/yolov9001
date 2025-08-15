@@ -190,20 +190,36 @@ def run(
 
         with dt[1]:
             output = model(im, augment=augment)
-            if compute_loss:
-                preds = output[0][1]
-                train_out = output[1]
-            else:
-                if isinstance(output, tuple) and isinstance(output[0], list):
-                    preds = output[0][1]
-                elif isinstance(output, list):
-                    preds = output[1]
-                else:
-                    preds = output
-                train_out = None
 
-        if compute_loss:
-            loss += compute_loss(train_out, targets)[1]
+            preds = None
+            aux_feats = None
+            main_feats = None
+
+            # Normalize model outputs:
+            # - Training returns [d1, d2]
+            # - Eval may return ([y_aux, y_main], [d1, d2])  OR  (y_main, d2)  OR just y_main
+            if isinstance(output, tuple):
+                head_out, feat_out = output
+                # Get main logits for NMS
+                if isinstance(head_out, list):
+                    preds = head_out[-1]  # y_main
+                else:
+                    preds = head_out      # y_main tensor
+                # Decode features container
+                if isinstance(feat_out, (list, tuple)):
+                    if len(feat_out) == 2 and isinstance(feat_out[0], (list, tuple)) and isinstance(feat_out[1], (list, tuple)):
+                        aux_feats, main_feats = feat_out[0], feat_out[1]
+                    else:
+                        main_feats = list(feat_out)
+            elif isinstance(output, list):
+                # If it's just heads, pick main logits; no features available
+                preds = output[-1] if output and torch.is_tensor(output[-1]) else output
+            else:
+                preds = output
+
+        # Only compute val loss if BOTH branches are present (YOLOv9-style)
+        if compute_loss is not None and aux_feats is not None and main_feats is not None:
+            loss += compute_loss([aux_feats, main_feats], targets)[1]
 
         targets[:, 2:] *= torch.tensor((width, height, width, height), device=device)
         lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []

@@ -41,16 +41,20 @@ def export_formats():
 
 def try_export(inner_func):
     inner_args = get_default_args(inner_func)
+
     def outer_func(*args, **kwargs):
         prefix = inner_args["prefix"]
         try:
             with Profile() as dt:
                 f, model = inner_func(*args, **kwargs)
-            LOGGER.info(f"{prefix} export success {dt.t:.1f}s, saved as {f} ({file_size(f):.1f} MB)")
+            LOGGER.info(
+                f"{prefix} export success {dt.t:.1f}s, saved as {f} ({file_size(f):.1f} MB)"
+            )
             return f, model
         except Exception as e:
             LOGGER.info(f"{prefix} export failure {dt.t:.1f}s: {e}")
             return None, None
+
     return outer_func
 
 def _replace_modules_recursively(m):
@@ -76,15 +80,7 @@ def _prepare_model_for_onnx_export(src_model):
     return m
 
 @try_export
-def export_onnx(
-    model,
-    im,
-    file,
-    opset,
-    dynamic,
-    simplify,
-    prefix=colorstr("ONNX:")
-):
+def export_onnx(model, im, file, opset, dynamic, simplify, prefix=colorstr("ONNX:")):
     check_requirements("onnx")
     import onnx
     LOGGER.info(f"\n{prefix} starting export with onnx {onnx.__version__}...")
@@ -154,7 +150,9 @@ def export_onnx(
     if simplify:
         try:
             cuda = torch.cuda.is_available()
-            check_requirements(("onnxruntime-gpu" if cuda else "onnxruntime", "onnx-simplifier>=0.4.1"))
+            check_requirements(
+                ("onnxruntime-gpu" if cuda else "onnxruntime", "onnx-simplifier>=0.4.1")
+            )
             import onnxsim
             LOGGER.info(f"{prefix} simplifying with onnx-simplifier {onnxsim.__version__}...")
             model_onnx, check = onnxsim.simplify(model_onnx)
@@ -201,29 +199,21 @@ def _quant_ready(model):
             has_stubs += 1
     return (has_any_fq > 0) or (has_eager_attrs > 0) or (has_qconfig_any and has_stubs > 0)
 
-
 @try_export
-def export_pt_fp32_weights(
-    weights_path,
-    file,
-    prefix=colorstr("PT:")
-):
+def export_pt_fp32_weights(weights_path, file, prefix=colorstr("PT:")):
     sd = _load_state_dict_only(weights_path)
     out_fp32 = file.with_name(file.stem + "_weights.pt")
     torch.save(sd, out_fp32)
     return out_fp32, None
 
 @try_export
-def export_pt_int8_torchscript(
-    model,
-    file,
-    device,
-    prefix=colorstr("PT-INT8:")
-):
+def export_pt_int8_torchscript(model, file, device, prefix=colorstr("PT-INT8:")):
     torch.backends.quantized.engine = "fbgemm"
     m = deepcopy(model).to("cpu").eval()
     if not _quant_ready(m):
-        raise RuntimeError("Model is not quantization-ready. Prepare QAT/PTQ with observers/stubs before --int8 export.")
+        raise RuntimeError(
+            "Model is not quantization-ready. Prepare QAT/PTQ with observers/stubs before --int8 export."
+        )
     try:
         for _, mod in m.named_modules():
             if isinstance(mod, RN_DualDDetect):
@@ -246,7 +236,7 @@ def run(
     imgsz=(640, 640),
     batch_size=1,
     device="cpu",
-    include=("onnx",),
+    include=("onnx", ),
     half=False,
     inplace=False,
     dynamic=False,
@@ -286,7 +276,9 @@ def run(
         im, model = im.half(), model.half()
 
     shape = (y[0] if isinstance(y, (tuple, list)) else y).shape
-    LOGGER.info(f"\n{colorstr('PyTorch:')} starting from {file} with output shape {shape} ({file_size(file):.1f} MB)")
+    LOGGER.info(
+        f"\n{colorstr('PyTorch:')} starting from {file} with output shape {shape} ({file_size(file):.1f} MB)"
+    )
 
     if "onnx" in include:
         export_onnx(model, im, file, opset, dynamic, simplify)
@@ -302,18 +294,36 @@ def run(
 
 def parse_opt():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", type=str, default=ROOT / "data/coco128.yaml", help="dataset.yaml path")
+    parser.add_argument(
+        "--data", type=str, default=ROOT / "data/coco128.yaml", help="dataset.yaml path"
+    )
     parser.add_argument("--weights", type=str, default=ROOT / "yolo.pt", help="model.pt path")
-    parser.add_argument("--imgsz", "--img", "--img-size", nargs="+", type=int, default=[640, 640], help="image (h, w)")
+    parser.add_argument(
+        "--imgsz",
+        "--img",
+        "--img-size",
+        nargs="+",
+        type=int,
+        default=[640, 640],
+        help="image (h, w)"
+    )
     parser.add_argument("--batch-size", type=int, default=1, help="batch size")
     parser.add_argument("--device", default="cpu", help="cuda device, i.e. 0 or 0,1,2,3 or cpu")
     parser.add_argument("--half", action="store_true", help="FP16 half-precision export")
     parser.add_argument("--inplace", action="store_true", help="set Detect() inplace=True")
     parser.add_argument("--dynamic", default=False, action="store_true", help="ONNX: dynamic axes")
-    parser.add_argument("--simplify", default=True, action="store_true", help="ONNX: simplify model")
+    parser.add_argument(
+        "--simplify", default=True, action="store_true", help="ONNX: simplify model"
+    )
     parser.add_argument("--opset", type=int, default=19, help="ONNX: opset version")
-    parser.add_argument("--include", nargs="+", default=["onnx"], help="export formats, e.g. --include pt onnx")
-    parser.add_argument("--int8", action="store_true", help="when --include pt: export TorchScript INT8 instead of FP32 weights")
+    parser.add_argument(
+        "--include", nargs="+", default=["onnx"], help="export formats, e.g. --include pt onnx"
+    )
+    parser.add_argument(
+        "--int8",
+        action="store_true",
+        help="when --include pt: export TorchScript INT8 instead of FP32 weights"
+    )
     opt = parser.parse_args()
     print_args(vars(opt))
     return opt

@@ -75,11 +75,13 @@ def _get_uint8_output_qparams_for_output(model_path: str, out_name: str):
     if node is None or node.op_type != "QuantizeLinear" or len(node.input) < 3:
         return None
     sc_name, zp_name = node.input[1], node.input[2]
+
     def find_init(name):
         for ini in g.initializer:
             if ini.name == name:
                 return numpy_helper.to_array(ini)
         return None
+
     scale = find_init(sc_name)
     zp = find_init(zp_name)
     if scale is None or zp is None:
@@ -89,9 +91,15 @@ def _get_uint8_output_qparams_for_output(model_path: str, out_name: str):
         if a.name == "axis":
             axis = int(a.i)
     if scale.size == 1 and zp.size == 1:
-        return {"scale": float(scale.reshape(())), "zero_point": int(np.uint8(zp.reshape(()))), "axis": axis}
+        return {
+            "scale": float(scale.reshape(())), "zero_point": int(np.uint8(zp.reshape(()))), "axis":
+                axis
+        }
     else:
-        return {"scale": scale.astype(np.float32).reshape(-1), "zero_point": zp.astype(np.uint8).reshape(-1), "axis": axis}
+        return {
+            "scale": scale.astype(np.float32).reshape(-1), "zero_point":
+                zp.astype(np.uint8).reshape(-1), "axis": axis
+        }
 
 def _floatize_uint8_logits(y_uint8: np.ndarray, qparams: dict) -> np.ndarray:
     x = y_uint8.astype(np.float32)
@@ -145,8 +153,10 @@ def _run_dual_outputs(session, ort_input, names_hint=None):
     out_names = [o.name for o in outs]
     out_types = {o.name: o.type for o in outs}
     if "boxes" in out_names and "logits" in out_names:
-        y_boxes, y_logits = session.run(["boxes", "logits"], {session.get_inputs()[0].name: ort_input})
-        return ("boxes", _to_cfirst(y_boxes).astype(np.float32), out_types["boxes"]), ("logits", _to_cfirst(y_logits).astype(np.float32), out_types["logits"])
+        y_boxes, y_logits = session.run(["boxes", "logits"],
+                                        {session.get_inputs()[0].name: ort_input})
+        return ("boxes", _to_cfirst(y_boxes).astype(np.float32), out_types["boxes"]
+               ), ("logits", _to_cfirst(y_logits).astype(np.float32), out_types["logits"])
     ys = session.run(out_names, {session.get_inputs()[0].name: ort_input})
     ys_c = [_to_cfirst(y) for y in ys]
     idx_boxes = None
@@ -156,17 +166,20 @@ def _run_dual_outputs(session, ort_input, names_hint=None):
             break
     if idx_boxes is None:
         idx_boxes = 0
-    idx_logits = 1 - idx_boxes if len(ys_c) == 2 else next(i for i in range(len(ys_c)) if i != idx_boxes)
+    idx_logits = 1 - idx_boxes if len(ys_c) == 2 else next(
+        i for i in range(len(ys_c)) if i != idx_boxes
+    )
     name_b, name_l = out_names[idx_boxes], out_names[idx_logits]
-    return (name_b, ys_c[idx_boxes].astype(np.float32), out_types[name_b]), (name_l, ys_c[idx_logits].astype(np.float32), out_types[name_l])
+    return (name_b, ys_c[idx_boxes].astype(np.float32),
+            out_types[name_b]), (name_l, ys_c[idx_logits].astype(np.float32), out_types[name_l])
 
 def _sigmoid(x):
     return 1.0 / (1.0 + np.exp(-x))
 
 def _custom_nms_from_dual(boxes_cfirst, logits_cfirst, conf_thres, iou_thres, max_det=300):
     B = boxes_cfirst.shape[0]
-    S = boxes_cfirst.shape[2]
-    NC = logits_cfirst.shape[1]
+    boxes_cfirst.shape[2]
+    logits_cfirst.shape[1]
     out = []
     for b in range(B):
         bx = boxes_cfirst[b].T
@@ -200,7 +213,8 @@ def _custom_nms_from_dual(boxes_cfirst, logits_cfirst, conf_thres, iou_thres, ma
                 h = np.maximum(0, yy2 - yy1)
                 inter = w * h
                 area_i = (cb[i, 2] - cb[i, 0]) * (cb[i, 3] - cb[i, 1])
-                area_o = (cb[order[1:], 2] - cb[order[1:], 0]) * (cb[order[1:], 3] - cb[order[1:], 1])
+                area_o = (cb[order[1:], 2] -
+                          cb[order[1:], 0]) * (cb[order[1:], 3] - cb[order[1:], 1])
                 iou = inter / (area_i + area_o - inter + 1e-6)
                 inds = np.where(iou <= iou_thres)[0]
                 order = order[inds + 1]
@@ -221,20 +235,25 @@ def detect(opt):
     (save_dir / "labels" if opt.save_txt else save_dir).mkdir(parents=True, exist_ok=True)
     LOGGER.info(f"Loading {opt.weights} for ONNX Runtime inference...")
     device = select_device(opt.device)
-    providers = (["CUDAExecutionProvider", "CPUExecutionProvider"] if device.type != "cpu" else ["CPUExecutionProvider"])
+    providers = (["CUDAExecutionProvider", "CPUExecutionProvider"]
+                 if device.type != "cpu" else ["CPUExecutionProvider"])
     session = onnxruntime.InferenceSession(opt.weights, providers=providers)
     model_meta = session.get_modelmeta().custom_metadata_map or {}
-    names = eval(model_meta["names"]) if "names" in model_meta else {i: f"class{i}" for i in range(1000)}
+    names = eval(model_meta["names"]
+                ) if "names" in model_meta else {i: f"class{i}"
+                                                 for i in range(1000)}
     stride = int(model_meta["stride"]) if "stride" in model_meta else 32
     imgsz = check_img_size(opt.imgsz, s=stride)
     input_name, np_dtype, mode = _infer_input(session, opt.weights)
     is_file = Path(source).suffix[1:] in (IMG_FORMATS + VID_FORMATS)
     is_url = source.lower().startswith(("rtsp://", "rtmp://", "http://", "https://"))
     webcam = source.isnumeric() or source.endswith(".txt") or (is_url and not is_file)
-    dataset = LoadStreams(source, img_size=imgsz, stride=stride, auto=False) if webcam else LoadImages(source, img_size=imgsz, stride=stride, auto=False)
-    nc = len(names) if isinstance(names, (list, tuple, dict)) else 80
+    dataset = LoadStreams(
+        source, img_size=imgsz, stride=stride, auto=False
+    ) if webcam else LoadImages(source, img_size=imgsz, stride=stride, auto=False)
+    len(names) if isinstance(names, (list, tuple, dict)) else 80
     if isinstance(names, dict):
-        nc = len(names)
+        len(names)
     outs_info = session.get_outputs()
     out_types = {o.name: o.type for o in outs_info}
     dt = (Profile(), Profile(), Profile())
@@ -245,16 +264,26 @@ def detect(opt):
         with dt[0]:
             ort_input = _prep_input_numpy(im, np_dtype, mode)
         with dt[1]:
-            (boxes_name, boxes_cfirst, boxes_type), (logits_name, logits_cfirst, logits_type) = _run_dual_outputs(session, ort_input)
+            (boxes_name, boxes_cfirst,
+             boxes_type), (logits_name, logits_cfirst,
+                           logits_type) = _run_dual_outputs(session, ort_input)
             if not first_qparams_checked:
                 logits_out_name = logits_name
                 if logits_type == "tensor(uint8)":
-                    logits_qparams = _get_uint8_output_qparams_for_output(opt.weights, logits_out_name)
+                    logits_qparams = _get_uint8_output_qparams_for_output(
+                        opt.weights, logits_out_name
+                    )
                 first_qparams_checked = True
             if logits_type == "tensor(uint8)":
                 logits_cfirst = _floatize_uint8_logits(logits_cfirst, logits_qparams)
             probs_cfirst = _sigmoid(logits_cfirst)
-            pred_list = _custom_nms_from_dual(boxes_cfirst.astype(np.float32), probs_cfirst.astype(np.float32), opt.conf_thres if opt.conf_thres is not None else 0.25, opt.iou_thres if opt.iou_thres is not None else 0.45, max_det=opt.max_det)
+            pred_list = _custom_nms_from_dual(
+                boxes_cfirst.astype(np.float32),
+                probs_cfirst.astype(np.float32),
+                opt.conf_thres if opt.conf_thres is not None else 0.25,
+                opt.iou_thres if opt.iou_thres is not None else 0.45,
+                max_det=opt.max_det
+            )
         with dt[2]:
             pass
         for i, det in enumerate(pred_list):
@@ -284,7 +313,10 @@ def detect(opt):
                 cv2.imwrite(save_path, im0)
         LOGGER.info(f"{s}{'' if len(det) else '(no detections), '}{dt[1].dt * 1e3:.1f}ms")
     t = tuple(x.t / len(dataset) * 1e3 for x in dt)
-    LOGGER.info("Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape (1, 3, %d, %d)" % (t + (imgsz[0], imgsz[1])))
+    LOGGER.info(
+        "Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape (1, 3, %d, %d)"
+        % (t + (imgsz[0], imgsz[1]))
+    )
     if opt.save_txt or opt.save_img:
         s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if opt.save_txt else ""
         LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s}")
@@ -323,10 +355,13 @@ def val(opt):
     save_dir.mkdir(parents=True, exist_ok=True)
     LOGGER.info(f"Loading {weights} for ONNX Runtime validation...")
     device = select_device(opt.device)
-    providers = (["CUDAExecutionProvider", "CPUExecutionProvider"] if device.type != "cpu" else ["CPUExecutionProvider"])
+    providers = (["CUDAExecutionProvider", "CPUExecutionProvider"]
+                 if device.type != "cpu" else ["CPUExecutionProvider"])
     session = onnxruntime.InferenceSession(weights, providers=providers)
     model_meta = session.get_modelmeta().custom_metadata_map or {}
-    names = eval(model_meta["names"]) if "names" in model_meta else {i: f"class{i}" for i in range(1000)}
+    names = eval(model_meta["names"]
+                ) if "names" in model_meta else {i: f"class{i}"
+                                                 for i in range(1000)}
     stride = int(model_meta["stride"]) if "stride" in model_meta else 32
     imgsz = check_img_size(imgsz, s=stride)
     input_name, np_dtype, mode = _infer_input(session, weights)
@@ -355,7 +390,7 @@ def val(opt):
     first_qparams_checked = False
     logits_qparams = None
     logits_out_name = None
-    names_nc = len(names) if not isinstance(names, dict) else len(names.keys())
+    len(names) if not isinstance(names, dict) else len(names.keys())
     for batch_i, (im, targets, paths, shapes) in enumerate(pbar):
         _cuda_sync(device)
         t_start_pre = time.time()
@@ -373,7 +408,9 @@ def val(opt):
             preprocess_times.append(t_end_pre - t_start_pre)
         _cuda_sync(device)
         t_start_inf = time.time()
-        (boxes_name, boxes_cfirst, boxes_type), (logits_name, logits_cfirst, logits_type) = _run_dual_outputs(session, im_for_ort)
+        (boxes_name, boxes_cfirst,
+         boxes_type), (logits_name, logits_cfirst,
+                       logits_type) = _run_dual_outputs(session, im_for_ort)
         _cuda_sync(device)
         t_end_inf = time.time()
         if batch_i >= warmup_batches:
@@ -388,7 +425,13 @@ def val(opt):
         if logits_type == "tensor(uint8)":
             logits_cfirst = _floatize_uint8_logits(logits_cfirst, logits_qparams)
         probs_cfirst = _sigmoid(logits_cfirst)
-        pred_list = _custom_nms_from_dual(boxes_cfirst.astype(np.float32), probs_cfirst.astype(np.float32), conf_thres if conf_thres is not None else 0.001, iou_thres if iou_thres is not None else 0.7, max_det=max_det)
+        pred_list = _custom_nms_from_dual(
+            boxes_cfirst.astype(np.float32),
+            probs_cfirst.astype(np.float32),
+            conf_thres if conf_thres is not None else 0.001,
+            iou_thres if iou_thres is not None else 0.7,
+            max_det=max_det
+        )
         targets[:, 2:] *= torch.tensor((width, height, width, height), device=device)
         for si, det in enumerate(pred_list):
             det = det.to(device)
@@ -409,7 +452,9 @@ def val(opt):
                 scale_boxes(im[si].shape[1:], tbox, shape, shapes[si][1])
                 labelsn = torch.cat((labels[:, 0:1], tbox), 1)
                 correct = process_batch(predn, labelsn, iouv)
-            stats.append((correct, det[:, 4].to(device), det[:, 5].to(device), labels[:, 0].to(device)))
+            stats.append(
+                (correct, det[:, 4].to(device), det[:, 5].to(device), labels[:, 0].to(device))
+            )
         _cuda_sync(device)
         t_end_post = time.time()
         if batch_i >= warmup_batches:
@@ -440,7 +485,9 @@ def val(opt):
         LOGGER.info(f"  - Inference:       {avg_inf:.2f}ms per batch")
         LOGGER.info(f"  - Post-processing: {avg_post:.2f}ms per batch")
     else:
-        LOGGER.warning(f"Not enough batches ({len(dataloader)}) to calculate average speed after warm-up ({warmup_batches} batches).")
+        LOGGER.warning(
+            f"Not enough batches ({len(dataloader)}) to calculate average speed after warm-up ({warmup_batches} batches)."
+        )
 
 def main(opt):
     if opt.val and opt.data is None:
@@ -475,20 +522,32 @@ def main(opt):
         val(opt)
 
 def parse_opt():
-    parser = argparse.ArgumentParser(description="ONNX Model Inference and Validation Script (dual-output boxes+logits)")
+    parser = argparse.ArgumentParser(
+        description="ONNX Model Inference and Validation Script (dual-output boxes+logits)"
+    )
     parser.add_argument("--weights", type=str, default=ROOT / "best.onnx", help="ONNX model path")
-    parser.add_argument("--imgsz", "--img-size", nargs="+", type=int, default=[640], help="inference size h,w")
+    parser.add_argument(
+        "--imgsz", "--img-size", nargs="+", type=int, default=[640], help="inference size h,w"
+    )
     parser.add_argument("--conf-thres", type=float, default=None, help="confidence threshold")
     parser.add_argument("--iou-thres", type=float, default=None, help="NMS IoU threshold")
     parser.add_argument("--max-det", type=int, default=1000, help="maximum detections per image")
     parser.add_argument("--device", default="0", help="cuda device, i.e. 0 or cpu")
-    parser.add_argument("--project", default=ROOT / "runs/onnx", help="save results to project/name")
+    parser.add_argument(
+        "--project", default=ROOT / "runs/onnx", help="save results to project/name"
+    )
     parser.add_argument("--name", default="exp", help="save to project/name")
-    parser.add_argument("--exist-ok", action="store_true", help="existing project/name ok, do not increment")
-    parser.add_argument("--source", type=str, default=None, help="file/dir/URL/glob/screen/0(webcam) for detection")
+    parser.add_argument(
+        "--exist-ok", action="store_true", help="existing project/name ok, do not increment"
+    )
+    parser.add_argument(
+        "--source", type=str, default=None, help="file/dir/URL/glob/screen/0(webcam) for detection"
+    )
     parser.add_argument("--save-img", action="store_true", help="save annotated images")
     parser.add_argument("--save-txt", action="store_true", help="save results to *.txt")
-    parser.add_argument("--line-thickness", default=3, type=int, help="bounding box thickness (pixels)")
+    parser.add_argument(
+        "--line-thickness", default=3, type=int, help="bounding box thickness (pixels)"
+    )
     parser.add_argument("--data", type=str, default=None, help="dataset.yaml path for validation")
     parser.add_argument("--workers", type=int, default=8, help="max dataloader workers")
     parser.add_argument("--batch-size", type=int, default=None, help="batch size for validation")
