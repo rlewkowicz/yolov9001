@@ -10,30 +10,30 @@ from utils import TryExcept
 from utils.general import LOGGER, colorstr, increment_path, is_notebook, xyxy2xywh
 from utils.plots import Annotator, colors, save_one_box
 from torch.nn import Parameter
-from utils import TryExcept
-from utils.general import LOGGER, colorstr, increment_path, is_notebook, xyxy2xywh
-from utils.plots import Annotator, colors, save_one_box
 
-from copy import copy
-from pathlib import Path
-import numpy as np
-import pandas as pd
-import torch
-import torch.nn as nn
-from IPython.display import display
-from PIL import Image
-
-from utils import TryExcept
-from utils.general import LOGGER, colorstr, increment_path, is_notebook, xyxy2xywh
-from utils.plots import Annotator, colors, save_one_box
-from torch.nn import Parameter
+# ----------------------------------------------------------------------
+# Quantization helpers
+# ----------------------------------------------------------------------
 
 class Requant(nn.Module):
-    def __init__(self):
+    """
+    A quantization barrier. During vanilla FP training/inference this is nn.Identity.
+    Under FX QAT, an observer/fake-quant is inserted here. 'tag' lets us tie
+    observers across branches so add/cat use the same qparams.
+    """
+    def __init__(self, tag: str | None = None):
         super().__init__()
         self.act = nn.Identity()
+        self.tag = tag  # used by the training script to tie observers
+        # FX will attach activation_post_process here during prepare_qat_fx
+        # self.activation_post_process = ...
+
     def forward(self, x):
         return self.act(x)
+
+# ----------------------------------------------------------------------
+# Ops
+# ----------------------------------------------------------------------
 
 def autopad(k, p=None, d=1):
     if d > 1:
@@ -169,20 +169,52 @@ class RepConvN(nn.Module):
         if hasattr(self, 'id_tensor'):
             self.__delattr__('id_tensor')
 
+# ---------------------- DFL with optional INT8 LUT softmax ----------------------
+
 class DFL(nn.Module):
+    """
+    Distribution Focal Loss projection.
+    - Training/backprop: uses true softmax (float) for exact gradients.
+    - Inference/export (opt-in): integer-LUT softmax approximation for full INT8 graphs.
+    """
     def __init__(self, c1=17):
         super().__init__()
         self.conv = nn.Conv2d(c1, 1, 1, bias=False).requires_grad_(False)
         self.conv.weight.data[:] = torch.arange(c1, dtype=torch.float).view(1, c1, 1, 1)
         self.c1 = c1
         self.requant = Requant()
+        # INT8 softmax LUT support (disabled by default)
+        self.use_int8_lut = False
+        # Grid over [-8, 8] with 256 bins (maps neatly to int8)
+        self.register_buffer("_lut_x", torch.linspace(-8.0, 8.0, steps=256))
+        self.register_buffer("_lut_exp", torch.exp(self._lut_x))
+
+    def enable_int8_lut(self, enabled: bool = True):
+        self.use_int8_lut = bool(enabled)
+
+    def _softmax_int8_lut(self, x: torch.Tensor, dim: int = 1) -> torch.Tensor:
+        """
+        Approx softmax via exp-LUT index: i = round( (x+8) * 255/16 ). Range is clamped.
+        Returns float outputs normalized along 'dim'. No gradients required (inference only).
+        """
+        scale = 255.0 / 16.0  # 16 = 8 - (-8)
+        idx = torch.clamp(((x + 8.0) * scale).round().long(), 0, 255)
+        exp_approx = self._lut_exp[idx]  # gather LUT
+        exp_sum = exp_approx.sum(dim=dim, keepdim=True).clamp_min(1e-12)
+        return exp_approx / exp_sum
 
     def forward(self, x):
         b, c, a = x.shape
+        x = x.view(b, 4, self.c1, a).transpose(2, 1)  # [B, 4, C1, A] -> softmax over C1
+        if not self.training and self.use_int8_lut:
+            sm = self._softmax_int8_lut(x, dim=1)
+        else:
+            sm = x.softmax(1)
         rq = getattr(self, "requant", nn.Identity())
-        x = x.view(b, 4, self.c1, a).transpose(2, 1)
-        x = rq(x.softmax(1))
-        return self.conv(x).view(b, 4, a)
+        sm = rq(sm)
+        return self.conv(sm).view(b, 4, a)
+
+# ---------------------- Gated pool & SPPF (with pre-merge Requants) ----------------------
 
 class GatedPool(nn.Module):
     def __init__(self, kernel_size=5, stride=1):
@@ -192,10 +224,10 @@ class GatedPool(nn.Module):
         self.gate_act = nn.Hardsigmoid()
         self.max_pool = nn.MaxPool2d(kernel_size, stride, padding)
         self.avg_pool = nn.AvgPool2d(kernel_size, stride, padding)
-        self.requant_gate_in = Requant()
-        self.requant_mp_in = Requant()
-        self.requant_ap_in = Requant()
-        self.requant_out = Requant()
+        self.requant_gate_in = Requant(tag="gated_gate_in")
+        self.requant_mp_in = Requant(tag="gated_mp_in")
+        self.requant_ap_in = Requant(tag="gated_ap_in")
+        self.requant_out = Requant(tag="gated_out")
 
     def forward(self, x):
         gate_input = torch.mean(x, dim=1, keepdim=True)
@@ -218,30 +250,39 @@ class GatedSPPF(nn.Module):
         self.norm_y1 = Conv(c_, c_, 1, 1)
         self.norm_y2 = Conv(c_, c_, 1, 1)
         self.norm_y3 = Conv(c_, c_, 1, 1)
-        self.requant_cat = Requant()
+        # Pre-cat requants with same tag so cat stays in INT8
+        self.requant_cat_a = Requant(tag="gatedsppf_cat0")
+        self.requant_cat_b = Requant(tag="gatedsppf_cat0")
+        self.requant_cat_c = Requant(tag="gatedsppf_cat0")
+        self.requant_cat_d = Requant(tag="gatedsppf_cat0")
 
     def forward(self, x):
         x_hidden = self.cv1(x)
         y1 = self.m1(x_hidden)
         y2 = self.m2(y1)
         y3 = self.m3(y2)
-        norm_x = self.norm_x(x_hidden)
-        norm_y1 = self.norm_y1(y1)
-        norm_y2 = self.norm_y2(y2)
-        norm_y3 = self.norm_y3(y3)
-        cat = torch.cat([norm_x, norm_y1, norm_y2, norm_y3], 1)
-        return self.cv2(self.requant_cat(cat))
+        nx = self.requant_cat_a(self.norm_x(x_hidden))
+        ny1 = self.requant_cat_b(self.norm_y1(y1))
+        ny2 = self.requant_cat_c(self.norm_y2(y2))
+        ny3 = self.requant_cat_d(self.norm_y3(y3))
+        cat = torch.cat([nx, ny1, ny2, ny3], 1)
+        return self.cv2(cat)
+
+# ---------------------- Merge ops quant-safe (pre-branch requants) ----------------------
 
 class QuantAdd(nn.Module):
     def __init__(self, c1, c2):
         super().__init__()
         self.cv1 = Conv(c1, c2, 1, 1)
         self.cv2 = Conv(c2, c2, 1, 1)
-        self.requant = Requant()
+        # Pre-add requants with same tag ensures qparams alignment
+        self.requant_a = Requant(tag="quantadd_add0")
+        self.requant_b = Requant(tag="quantadd_add0")
 
     def forward(self, x):
-        rq = getattr(self, "requant", nn.Identity())
-        return rq(self.cv1(x[0]) + self.cv2(x[1]))
+        a = self.requant_a(self.cv1(x[0]))
+        b = self.requant_b(self.cv2(x[1]))
+        return a + b
 
 class QARepNBottleneck(nn.Module):
     def __init__(self, c1, c2, shortcut=True, g=1, k=(3, 3), e=0.5):
@@ -251,11 +292,14 @@ class QARepNBottleneck(nn.Module):
         self.cv2 = Conv(c_, c2, k[1], 1, g=g)
         self.add = shortcut and c1 == c2
         if self.add:
-            self.requant = Requant()
+            self.requant_id = Requant(tag="bneck_add0")
+            self.requant_res = Requant(tag="bneck_add0")
 
     def forward(self, x):
         if self.add:
-            return self.requant(x + self.cv2(self.cv1(x)))
+            res = self.requant_res(self.cv2(self.cv1(x)))
+            ident = self.requant_id(x)
+            return ident + res
         else:
             return self.cv2(self.cv1(x))
 
@@ -267,13 +311,15 @@ class QARepNCSP(nn.Module):
         self.cv2 = Conv(c1, c_, 1, 1)
         self.cv3 = Conv(2 * c_, c2, 1)
         self.m = nn.Sequential(*(QARepNBottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
-        self.requant_cat = Requant()
+        # Pre-cat requants with same tag
+        self.requant_left = Requant(tag="ncsp_cat0")
+        self.requant_right = Requant(tag="ncsp_cat0")
 
     def forward(self, x):
-        left = self.m(self.cv1(x))
-        right = self.cv2(x)
+        left = self.requant_left(self.m(self.cv1(x)))
+        right = self.requant_right(self.cv2(x))
         cat = torch.cat((left, right), 1)
-        return self.cv3(self.requant_cat(cat))
+        return self.cv3(cat)
 
 class QARepNCSPELAN(nn.Module):
     def __init__(self, c1, c2, c3, c4, c5=1):
@@ -286,18 +332,21 @@ class QARepNCSPELAN(nn.Module):
         self.proj2 = Conv(self.c_split, c2, 1, 1)
         self.proj3 = Conv(c4, c2, 1, 1)
         self.proj4 = Conv(c4, c2, 1, 1)
-        self.requant = Requant()
+        # Pre-add requants (all share tag)
+        self.rq1 = Requant(tag="elan_add0")
+        self.rq2 = Requant(tag="elan_add0")
+        self.rq3 = Requant(tag="elan_add0")
+        self.rq4 = Requant(tag="elan_add0")
 
     def forward(self, x):
         y1, y2 = self.cv1(x).chunk(2, 1)
         z2 = self.cv2(y2)
         z3 = self.cv3(z2)
-        p1 = self.proj1(y1)
-        p2 = self.proj2(y2)
-        p3 = self.proj3(z2)
-        p4 = self.proj4(z3)
-        rq = getattr(self, "requant", nn.Identity())
-        return rq(p1 + p2 + p3 + p4)
+        p1 = self.rq1(self.proj1(y1))
+        p2 = self.rq2(self.proj2(y2))
+        p3 = self.rq3(self.proj3(z2))
+        p4 = self.rq4(self.proj4(z3))
+        return p1 + p2 + p3 + p4
 
 class QARepVGGBlockV2(nn.Module):
     default_act = nn.ReLU6()
@@ -400,8 +449,6 @@ class QARepVGGBlockV2(nn.Module):
             return torch.nn.functional.pad(kernel1x1, [1, 1, 1, 1])
 
     def _fuse_bn_tensor(self, branch):
-        if branch is None:
-            return (0, 0)
         if isinstance(branch, ConvModule):
             kernel = branch.conv.weight
             running_mean = branch.bn.running_mean
@@ -473,16 +520,21 @@ class RepBlockAdd(nn.Module):
                     for _ in range(n - 1)
                 )
             ) if n > 1 else None
-        self.requant = Requant() if self.add else nn.Identity()
+        # Pre-add requants if residual exists
+        if self.add:
+            self.requant_id = Requant(tag="rep_add0")
+            self.requant_out = Requant(tag="rep_add0")
 
     def forward(self, x):
         identity = x
         out = self.conv1(x)
         if self.block is not None:
             out = self.block(out)
-        out = out + identity if self.add else out
-        rq = getattr(self, "requant", nn.Identity())
-        return rq(out)
+        if self.add:
+            out = self.requant_out(out)
+            identity = self.requant_id(identity)
+            out = out + identity
+        return out
 
 class BottleRep(nn.Module):
     def __init__(self, in_channels, out_channels, basic_block=QARepVGGBlockV2, weight=False):
@@ -491,13 +543,20 @@ class BottleRep(nn.Module):
         self.conv2 = basic_block(out_channels, out_channels)
         self.shortcut = in_channels == out_channels
         self.alpha = Parameter(torch.ones(1)) if weight else 1.0
-        self.requant = Requant() if self.shortcut else nn.Identity()
+        if self.shortcut:
+            self.requant_id = Requant(tag="bottlerep_add0")
+            self.requant_out = Requant(tag="bottlerep_add0")
 
     def forward(self, x):
         outputs = self.conv1(x)
         outputs = self.conv2(outputs)
-        out = outputs + self.alpha * x if self.shortcut else outputs
-        return self.requant(out)
+        if self.shortcut:
+            out = self.requant_out(outputs) + self.requant_id(self.alpha * x)
+        else:
+            out = outputs
+        return out
+
+# ---------------------- Runtime wrappers (unchanged) ----------------------
 
 class DetectMultiBackend(nn.Module):
     def __init__(

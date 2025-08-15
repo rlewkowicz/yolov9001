@@ -195,29 +195,24 @@ def run(
             aux_feats = None
             main_feats = None
 
-            # Normalize model outputs:
-            # - Training returns [d1, d2]
-            # - Eval may return ([y_aux, y_main], [d1, d2])  OR  (y_main, d2)  OR just y_main
             if isinstance(output, tuple):
                 head_out, feat_out = output
-                # Get main logits for NMS
                 if isinstance(head_out, list):
-                    preds = head_out[-1]  # y_main
+                    preds = head_out[-1]  
                 else:
-                    preds = head_out      # y_main tensor
-                # Decode features container
+                    preds = head_out  
                 if isinstance(feat_out, (list, tuple)):
-                    if len(feat_out) == 2 and isinstance(feat_out[0], (list, tuple)) and isinstance(feat_out[1], (list, tuple)):
+                    if len(feat_out) == 2 and isinstance(feat_out[0], (list, tuple)) and isinstance(
+                        feat_out[1], (list, tuple)
+                    ):
                         aux_feats, main_feats = feat_out[0], feat_out[1]
                     else:
                         main_feats = list(feat_out)
             elif isinstance(output, list):
-                # If it's just heads, pick main logits; no features available
                 preds = output[-1] if output and torch.is_tensor(output[-1]) else output
             else:
                 preds = output
 
-        # Only compute val loss if BOTH branches are present (YOLOv9-style)
         if compute_loss is not None and aux_feats is not None and main_feats is not None:
             loss += compute_loss([aux_feats, main_feats], targets)[1]
 

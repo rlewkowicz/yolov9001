@@ -10,6 +10,8 @@ from pathlib import Path
 import torch
 from utils.torch_utils import de_parallel
 
+from models.common import Requant
+
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -26,7 +28,7 @@ ROOT = FILE.parents[0]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))
-
+import contextlib
 import val as validate
 from models.experimental import attempt_load
 from models.yolo import Model
@@ -50,22 +52,56 @@ from utils.torch_utils import (
     torch_distributed_zero_first
 )
 
-torch.set_float32_matmul_precision('high')
+@contextlib.contextmanager
+def SuppressLogs():
+    """A context manager to suppress stdout and stderr."""
+    # Open a pair of null file descriptors
+    fd_null = os.open(os.devnull, os.O_RDWR)
+    # Save the original file descriptors
+    fd_stdout_original = os.dup(1)
+    fd_stderr_original = os.dup(2)
+    # Redirect stdout and stderr to the null device
+    os.dup2(fd_null, 1)
+    os.dup2(fd_null, 2)
+    try:
+        yield
+    finally:
+        # Restore the original stdout and stderr
+        os.dup2(fd_stdout_original, 1)
+        os.dup2(fd_stderr_original, 2)
+        # Close the file descriptors
+        os.close(fd_null)
+        os.close(fd_stdout_original)
+        os.close(fd_stderr_original)
 
-try:
-    import torch._logging as _tl
-    _tl.set_logs(
-        dynamo=False, inductor=False, aot_graphs=False,
-        graph_breaks=True, guards=False, recompiles=False
-    )
-except Exception:
-    pass
+def tie_requant_observers_fx(model: torch.nn.Module) -> torch.nn.Module:
+    try:
+        import torch.fx as fx
+        from torch.ao.quantization.fake_quantize import FakeQuantize
 
-try:
-    from torch._inductor import config as inductor_config
-    inductor_config.verbose_progress = False
-except Exception:
-    pass
+        if not isinstance(model, fx.GraphModule):
+            return model
+
+        last_obs = None
+        for node in model.graph.nodes:
+            if node.op == "call_module":
+                mod = dict(model.named_modules()).get(node.target, None)
+                if mod is None:
+                    continue
+
+                if hasattr(mod, "activation_post_process"
+                          ) and isinstance(getattr(mod, "activation_post_process"), FakeQuantize):
+                    last_obs = mod.activation_post_process
+
+                if isinstance(mod, Requant):
+                    if hasattr(mod, "activation_post_process") and isinstance(
+                        getattr(mod, "activation_post_process"), FakeQuantize
+                    ):
+                        if last_obs is not None:
+                            mod.activation_post_process = last_obs
+        return model
+    except Exception:
+        return model
 
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", -1))
 RANK = int(os.getenv("RANK", -1))
@@ -140,60 +176,64 @@ def train(hyp, opt, device, callbacks):
             qat=opt.qat,
         ).to(device)
 
+    _YOLO_ATTRS_TO_SAVE = ("stride", "names", "nc", "hyp", "class_weights", "yaml", "inplace")
+    _yolo_attr_backup = {k: getattr(model, k) for k in _YOLO_ATTRS_TO_SAVE if hasattr(model, k)}
+
+    model.nc = nc
+    model.hyp = hyp
+    model.names = names
+
     amp = bool(opt.amp and not opt.qat)
-
-    if opt.qat:
-        import torch.ao.quantization as tq
-        from torch.ao.quantization.quantize_fx import prepare_qat_fx
-        from torch.ao.quantization.qconfig import QConfig
-        from torch.ao.quantization.fake_quantize import FakeQuantize
-        from torch.ao.quantization.observer import (
-            MovingAverageMinMaxObserver,
-            PerChannelMinMaxObserver,
-        )
-
-        torch.backends.quantized.engine = "fbgemm"
-
-        # Activations: per-tensor uint8 affine (keeps cat/add happy)
-        act_observer = MovingAverageMinMaxObserver.with_args(
-            dtype=torch.quint8, qscheme=torch.per_tensor_affine, reduce_range=False
-        )
-        # Weights: per-channel int8 symmetric (best accuracy)
-        w_observer = PerChannelMinMaxObserver.with_args(
-            dtype=torch.qint8, qscheme=torch.per_channel_symmetric, ch_axis=0
-        )
-
-        qat_qconfig = QConfig(
-            activation=FakeQuantize.with_args(observer=act_observer),
-            weight=FakeQuantize.with_args(observer=w_observer),
-        )
-
-        qconfig_mapping = (
-            tq.QConfigMapping()
-            .set_global(qat_qconfig)
-            .set_object_type(nn.Conv2d, qat_qconfig)
-            .set_object_type(nn.Linear, qat_qconfig)
-            .set_object_type(nn.Hardswish, qat_qconfig)   # ensure quantizable act
-            .set_object_type(nn.Hardsigmoid, qat_qconfig)
-            .set_module_name_regex(".*requant.*", qat_qconfig)  # ensure Requant gets observers
-        )
-
-        model.train()
-        model = prepare_qat_fx(model, qconfig_mapping)
-
-        # Align observers on tagged Requants so add/cat stay INT8 end-to-end
-        model = tie_requant_observers_fx(model)
 
     freeze = [f"model.{x}." for x in (freeze if len(freeze) > 1 else range(freeze[0]))]
     for k, v in model.named_parameters():
         if any(x in k for x in freeze):
             LOGGER.info(f"freezing {k}")
             v.requires_grad = False
-    gs = max(int(model.stride.max()), 32)
+    try:
+        gs = max(int(model.stride.max()), 32)
+    except Exception:
+        _stride = _yolo_attr_backup.get("stride", torch.tensor([32], device=device))
+        gs = max(int(_stride.max()), 32)
     imgsz = check_img_size(opt.imgsz, gs, floor=gs * 2)
+
     if RANK == -1 and batch_size == -1:
         batch_size = check_train_batch_size(model, imgsz, amp)
         loggers.on_params_update({"batch_size": batch_size})
+
+    compute_loss = RN_ComputeLoss(model)
+
+    if opt.qat:
+        from torch.ao.quantization.quantize_fx import prepare_qat_fx
+        from torch.ao.quantization import QConfigMapping, get_default_qat_qconfig
+        import torch.ao.nn.intrinsic as nni
+
+        torch.backends.quantized.engine = "fbgemm"
+        qconfig = get_default_qat_qconfig("fbgemm")
+
+        qconfig_mapping = (
+            QConfigMapping().set_global(qconfig).set_object_type(
+                nn.Conv2d, qconfig
+            ).set_object_type(nn.BatchNorm2d,
+                              qconfig).set_object_type(nn.Linear,
+                                                       qconfig).set_object_type(Requant, qconfig)
+        )
+        for fused_t in (
+            getattr(nni, "ConvBn2d", None), getattr(nni, "ConvReLU2d",
+                                                    None), getattr(nni, "ConvBnReLU2d", None)
+        ):
+            if fused_t is not None:
+                qconfig_mapping = qconfig_mapping.set_object_type(fused_t, qconfig)
+
+        model.train()
+        example_inputs = (torch.randn(1, 3, int(opt.imgsz), int(opt.imgsz), device=device), )
+        model = prepare_qat_fx(model, qconfig_mapping, example_inputs)
+        for k, v in _yolo_attr_backup.items():
+            try:
+                setattr(model, k, v)
+            except Exception:
+                pass
+        model = tie_requant_observers_fx(model)
 
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -304,9 +344,11 @@ def train(hyp, opt, device, callbacks):
     ema = None
     if opt.sync_bn and cuda and RANK != -1:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
-    if hasattr(torch, "compile"):
+    if hasattr(torch, "compile") and not opt.qat:
         model.to(memory_format=torch.channels_last)
-        model = torch.compile(model, backend="inductor", mode="max-autotune", fullgraph=True)
+        LOGGER.info("Compiling model with torch.compile(mode='max-autotune')...")
+        with SuppressLogs():
+            model = torch.compile(model, backend="inductor", mode="max-autotune", fullgraph=True)
     if RANK in {-1, 0}:
         ema = ModelEMA(model)
     best_fitness, start_epoch = 0.0, 0
@@ -339,10 +381,14 @@ def train(hyp, opt, device, callbacks):
     mlc = int(np.concatenate(dataset.labels, 0)[:, 0].max()) if len(dataset.labels) else 0
     assert mlc < nc, f'Label class {mlc} exceeds nc={nc} in {data}.'
     if RANK in {-1, 0}:
+        val_bs = batch_size // WORLD_SIZE
+        if not (hasattr(torch, "compile") and not opt.qat):
+            val_bs = batch_size // WORLD_SIZE * 2  # keep the old behavior only when NOT compiled
+
         val_loader = create_dataloader(
             val_path,
             imgsz,
-            batch_size // WORLD_SIZE * 2,
+            val_bs,
             gs,
             single_cls,
             hyp=hyp,
@@ -358,9 +404,6 @@ def train(hyp, opt, device, callbacks):
             callbacks.run("on_pretrain_routine_end", labels, names)
     if cuda and RANK != -1:
         model = smart_DDP(model)
-    model.nc = nc
-    model.hyp = hyp
-    model.names = names
     model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc
     t0 = time.time()
     nb = len(train_loader)
@@ -370,7 +413,6 @@ def train(hyp, opt, device, callbacks):
     results = (0, 0, 0, 0, 0, 0, 0)
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
     stopper, stop = EarlyStopping(patience=opt.patience), False
-    compute_loss = RN_ComputeLoss(model)
 
     callbacks.run("on_train_start")
     LOGGER.info(
@@ -486,6 +528,8 @@ def train(hyp, opt, device, callbacks):
                     callbacks=callbacks,
                     compute_loss=compute_loss
                 )
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
                 compute_loss.ddp_reduce = prev
             fi = fitness(np.array(results).reshape(1, -1))
             stop = stopper(epoch=epoch, fitness=fi)
@@ -494,6 +538,7 @@ def train(hyp, opt, device, callbacks):
             log_vals = list(mloss) + list(results) + lr
             callbacks.run("on_fit_epoch_end", log_vals, epoch, best_fitness, fi)
             if (not nosave) or (final_epoch and not evolve):
+
                 def _clone_for_save(mm):
                     m2 = deepcopy(de_parallel(mm)).float()
                     for _m in m2.modules():
@@ -503,6 +548,7 @@ def train(hyp, opt, device, callbacks):
                             except Exception:
                                 pass
                     return m2
+
                 ckpt_model = _clone_for_save(model)
                 ckpt_ema = _clone_for_save(ema.ema) if ema else None
                 ckpt = {

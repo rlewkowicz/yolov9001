@@ -74,6 +74,12 @@ class RN_DualDDetect(nn.Module):
         ))
         self.dfl2 = DFL(self.reg_max)
 
+        for dfl_mod in (self.dfl, self.dfl2):
+            if hasattr(dfl_mod, "enable_int8_lut"):
+                dfl_mod.enable_int8_lut(True)
+            elif hasattr(dfl_mod, "use_int8_lut"):
+                dfl_mod.use_int8_lut = True
+
         self.requant1 = Requant()
         self.requant2 = Requant()
 
@@ -99,7 +105,8 @@ class RN_DualDDetect(nn.Module):
             for i in range(nl):
                 d2.append(rq2(torch.cat((self.cv4[i](x[i]), self.cv5[i](x[i])), 1)))
 
-        anc, strd = (t.transpose(0, 1) for t in make_anchors(d2, self.stride, 0.5))
+        strides_for_anchors = getattr(self, "stride_py", tuple(float(v) for v in self.stride.tolist()))
+        anc, strd = (t.transpose(0, 1) for t in make_anchors(d2, strides_for_anchors, 0.5))
         box2, cls2 = torch.cat([di.view(shape[0], self.no, -1) for di in d2],
                                2).split((self.reg_max * 4, self.nc), 1)
         pixel_anchor_points2 = anc.unsqueeze(0) * strd
@@ -176,6 +183,7 @@ class DetectionModel(BaseModel):
             m.stride = torch.tensor([s / x.shape[-2] for x in forward(torch.zeros(1, ch, s, s))])
             self.stride = m.stride
             m.bias_init()
+            m.stride_py = tuple(float(v) for v in m.stride.tolist())
         initialize_weights(self)
         self.info()
         LOGGER.info("")
