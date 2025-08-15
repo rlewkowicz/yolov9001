@@ -19,6 +19,9 @@ from PIL import ExifTags, Image, ImageOps
 from torch.utils.data import DataLoader, Dataset, dataloader, distributed
 from tqdm import tqdm
 
+cv2.setUseOptimized(True)
+cv2.setNumThreads(1)
+
 from utils.augmentations import (
     Albumentations,
     augment_hsv,
@@ -189,13 +192,13 @@ def create_dataloader(
         shuffle=shuffle and sampler is None,
         num_workers=nw,
         sampler=sampler,
-        pin_memory=PIN_MEMORY,
+        pin_memory=True,
         collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn,
         worker_init_fn=seed_worker,
         generator=generator,
     )
     if nw > 0:
-        loader_kwargs.update(dict(prefetch_factor=4, persistent_workers=True))
+        loader_kwargs.update(dict(prefetch_factor=12, persistent_workers=True))
 
     return (
         loader(**loader_kwargs),
@@ -831,42 +834,58 @@ class LoadImagesAndLabels(Dataset):
     def load_mosaic(self, index):
         labels4, segments4 = [], []
         s = self.img_size
-        yc, xc = (
-            int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border
-        )
-        indices = [index] + random.choices(self.indices, k=3)
-        random.shuffle(indices)
-        for i, index in enumerate(indices):
-            img, _, (h, w) = self.load_image(index)
+        yc, xc = (int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border)
+        idxs = [index] + random.choices(self.indices, k=3)
+        random.shuffle(idxs)
+        img0, _, (h0, w0) = self.load_image(idxs[0])
+        img4 = np.empty((s * 2, s * 2, img0.shape[2]), dtype=np.uint8)
+        img4.fill(114)
+
+        for i, idx in enumerate(idxs):
+            img, _, (h, w) = self.load_image(idx)
             if i == 0:
-                img4 = np.full((s * 2, s * 2, img.shape[2]), 114,
-                               dtype=np.uint8)
-                x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc
-                x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h
+                x1a = max(xc - w, 0); y1a = max(yc - h, 0); x2a = xc;           y2a = yc
+                x1b = w - (x2a - x1a); y1b = h - (y2a - y1a); x2b = w;          y2b = h
             elif i == 1:
-                x1a, y1a, x2a, y2a = xc, max(yc - h, 0), min(xc + w, s * 2), yc
-                x1b, y1b, x2b, y2b = 0, h - (y2a - y1a), min(w, x2a - x1a), h
+                x1a = xc;                 y1a = max(yc - h, 0); x2a = min(xc + w, s * 2); y2a = yc
+                x1b = 0;                  y1b = h - (y2a - y1a); x2b = min(w, x2a - x1a); y2b = h
             elif i == 2:
-                x1a, y1a, x2a, y2a = max(xc - w, 0), yc, xc, min(s * 2, yc + h)
-                x1b, y1b, x2b, y2b = w - (x2a - x1a), 0, w, min(y2a - y1a, h)
-            elif i == 3:
-                x1a, y1a, x2a, y2a = xc, yc, min(xc + w, s * 2), min(s * 2, yc + h)
-                x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(y2a - y1a, h)
+                x1a = max(xc - w, 0);     y1a = yc;             x2a = xc;                 y2a = min(s * 2, yc + h)
+                x1b = w - (x2a - x1a);    y1b = 0;              x2b = w;                  y2b = min(y2a - y1a, h)
+            else:
+                x1a = xc;                 y1a = yc;             x2a = min(xc + w, s * 2); y2a = min(s * 2, yc + h)
+                x1b = 0;                  y1b = 0;              x2b = min(w, x2a - x1a);  y2b = min(y2a - y1a, h)
+
             img4[y1a:y2a, x1a:x2a] = img[y1b:y2b, x1b:x2b]
             padw = x1a - x1b
             padh = y1a - y1b
-            labels, segments = self.labels[index].copy(), self.segments[index].copy()
+
+            labels = self.labels[idx].copy()
+            segments = self.segments[idx].copy()
             if labels.size:
-                labels[:, 1:] = xywhn2xyxy(
-                    labels[:, 1:], w, h, padw, padh
-                )
-                segments = [xyn2xy(x, w, h, padw, padh) for x in segments]
+                xywh = labels[:, 1:5]
+                x = xywh[:, 0]; y = xywh[:, 1]; w_n = xywh[:, 2]; h_n = xywh[:, 3]
+                labels[:, 1] = (x - w_n * 0.5) * w + padw
+                labels[:, 2] = (y - h_n * 0.5) * h + padh
+                labels[:, 3] = (x + w_n * 0.5) * w + padw
+                labels[:, 4] = (y + h_n * 0.5) * h + padh
+                if segments:
+                    seg_out = []
+                    for seg in segments:
+                        seg = seg.copy()
+                        seg[:, 0] = seg[:, 0] * w + padw
+                        seg[:, 1] = seg[:, 1] * h + padh
+                        seg_out.append(seg)
+                    segments = seg_out
             labels4.append(labels)
             segments4.extend(segments)
 
-        labels4 = np.concatenate(labels4, 0)
-        for x in (labels4[:, 1:], *segments4):
-            np.clip(x, 0, 2 * s, out=x)
+        labels4 = np.concatenate(labels4, 0) if labels4 else np.zeros((0, 5), dtype=np.float32)
+        if labels4.size:
+            np.clip(labels4[:, 1:], 0, 2 * s, out=labels4[:, 1:])
+        if segments4:
+            for seg in segments4:
+                np.clip(seg, 0, 2 * s, out=seg)
 
         img4, labels4, segments4 = copy_paste(img4, labels4, segments4, p=self.hyp["copy_paste"])
         img4, labels4 = random_perspective(
@@ -880,7 +899,6 @@ class LoadImagesAndLabels(Dataset):
             perspective=self.hyp["perspective"],
             border=self.mosaic_border,
         )
-
         return img4, labels4
 
     @staticmethod
