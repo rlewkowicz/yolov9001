@@ -19,8 +19,7 @@ from PIL import ExifTags, Image, ImageOps
 from torch.utils.data import DataLoader, Dataset, dataloader, distributed
 from tqdm import tqdm
 
-cv2.setUseOptimized(True)
-cv2.setNumThreads(1)
+
 
 from utils.augmentations import (
     Albumentations,
