@@ -11,29 +11,14 @@ from utils.general import LOGGER, colorstr, increment_path, is_notebook, xyxy2xy
 from utils.plots import Annotator, colors, save_one_box
 from torch.nn import Parameter
 
-# ----------------------------------------------------------------------
-# Quantization helpers
-# ----------------------------------------------------------------------
-
 class Requant(nn.Module):
-    """
-    A quantization barrier. During vanilla FP training/inference this is nn.Identity.
-    Under FX QAT, an observer/fake-quant is inserted here. 'tag' lets us tie
-    observers across branches so add/cat use the same qparams.
-    """
     def __init__(self, tag: str | None = None):
         super().__init__()
         self.act = nn.Identity()
         self.tag = tag  # used by the training script to tie observers
-        # FX will attach activation_post_process here during prepare_qat_fx
-        # self.activation_post_process = ...
 
     def forward(self, x):
         return self.act(x)
-
-# ----------------------------------------------------------------------
-# Ops
-# ----------------------------------------------------------------------
 
 def autopad(k, p=None, d=1):
     if d > 1:
@@ -169,8 +154,6 @@ class RepConvN(nn.Module):
         if hasattr(self, 'id_tensor'):
             self.__delattr__('id_tensor')
 
-# ---------------------- DFL with optional INT8 LUT softmax ----------------------
-
 class DFL(nn.Module):
     """
     Distribution Focal Loss projection.
@@ -183,9 +166,7 @@ class DFL(nn.Module):
         self.conv.weight.data[:] = torch.arange(c1, dtype=torch.float).view(1, c1, 1, 1)
         self.c1 = c1
         self.requant = Requant()
-        # INT8 softmax LUT support (disabled by default)
         self.use_int8_lut = False
-        # Grid over [-8, 8] with 256 bins (maps neatly to int8)
         self.register_buffer("_lut_x", torch.linspace(-8.0, 8.0, steps=256))
         self.register_buffer("_lut_exp", torch.exp(self._lut_x))
 
@@ -213,8 +194,6 @@ class DFL(nn.Module):
         rq = getattr(self, "requant", nn.Identity())
         sm = rq(sm)
         return self.conv(sm).view(b, 4, a)
-
-# ---------------------- Gated pool & SPPF (with pre-merge Requants) ----------------------
 
 class GatedPool(nn.Module):
     def __init__(self, kernel_size=5, stride=1):
@@ -250,7 +229,6 @@ class GatedSPPF(nn.Module):
         self.norm_y1 = Conv(c_, c_, 1, 1)
         self.norm_y2 = Conv(c_, c_, 1, 1)
         self.norm_y3 = Conv(c_, c_, 1, 1)
-        # Pre-cat requants with same tag so cat stays in INT8
         self.requant_cat_a = Requant(tag="gatedsppf_cat0")
         self.requant_cat_b = Requant(tag="gatedsppf_cat0")
         self.requant_cat_c = Requant(tag="gatedsppf_cat0")
@@ -268,14 +246,11 @@ class GatedSPPF(nn.Module):
         cat = torch.cat([nx, ny1, ny2, ny3], 1)
         return self.cv2(cat)
 
-# ---------------------- Merge ops quant-safe (pre-branch requants) ----------------------
-
 class QuantAdd(nn.Module):
     def __init__(self, c1, c2):
         super().__init__()
         self.cv1 = Conv(c1, c2, 1, 1)
         self.cv2 = Conv(c2, c2, 1, 1)
-        # Pre-add requants with same tag ensures qparams alignment
         self.requant_a = Requant(tag="quantadd_add0")
         self.requant_b = Requant(tag="quantadd_add0")
 
@@ -311,7 +286,6 @@ class QARepNCSP(nn.Module):
         self.cv2 = Conv(c1, c_, 1, 1)
         self.cv3 = Conv(2 * c_, c2, 1)
         self.m = nn.Sequential(*(QARepNBottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
-        # Pre-cat requants with same tag
         self.requant_left = Requant(tag="ncsp_cat0")
         self.requant_right = Requant(tag="ncsp_cat0")
 
@@ -332,7 +306,6 @@ class QARepNCSPELAN(nn.Module):
         self.proj2 = Conv(self.c_split, c2, 1, 1)
         self.proj3 = Conv(c4, c2, 1, 1)
         self.proj4 = Conv(c4, c2, 1, 1)
-        # Pre-add requants (all share tag)
         self.rq1 = Requant(tag="elan_add0")
         self.rq2 = Requant(tag="elan_add0")
         self.rq3 = Requant(tag="elan_add0")
@@ -520,7 +493,6 @@ class RepBlockAdd(nn.Module):
                     for _ in range(n - 1)
                 )
             ) if n > 1 else None
-        # Pre-add requants if residual exists
         if self.add:
             self.requant_id = Requant(tag="rep_add0")
             self.requant_out = Requant(tag="rep_add0")
@@ -555,8 +527,6 @@ class BottleRep(nn.Module):
         else:
             out = outputs
         return out
-
-# ---------------------- Runtime wrappers (unchanged) ----------------------
 
 class DetectMultiBackend(nn.Module):
     def __init__(

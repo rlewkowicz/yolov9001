@@ -1,13 +1,11 @@
-# --------------------------- ENV + IMPORTS (order matters) ---------------------------
 import os
 
-# Disable Inductor CUDA Graphs globally and tune allocator to reduce fragmentation.
-# Must be set BEFORE importing torch.
 os.environ.setdefault("TORCHINDUCTOR_USE_CUDA_GRAPHS", "0")
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE", "0") 
-os.environ.setdefault("TORCH_LOGS", "-aot,-dynamo")   
+os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE", "0")
+os.environ.setdefault("TORCH_LOGS", "-aot,-dynamo")
 import warnings
+
 warnings.filterwarnings(
     "ignore",
     message=".*pow_by_natural.*",
@@ -33,7 +31,6 @@ import yaml
 from torch.optim import lr_scheduler
 from tqdm import tqdm
 
-# --------------------------- PROJECT IMPORTS ---------------------------
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from utils.torch_utils import de_parallel, EarlyStopping, ModelEMA, select_device, smart_DDP, smart_resume, torch_distributed_zero_first  # noqa: E402
 from models.common import Requant  # noqa: E402
@@ -57,7 +54,6 @@ from utils.metrics import fitness  # noqa: E402
 from utils.plots import plot_evolve  # noqa: E402
 from utils.lion import Lion  # noqa: E402
 
-# Inductor runtime switches (extra safety; complements env var above)
 try:
     from torch._inductor import config as inductor_config
     inductor_config.use_cuda_graphs = False
@@ -72,7 +68,6 @@ if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))
 
-# --------------------------- UTILS ---------------------------
 @contextlib.contextmanager
 def SuppressLogs():
     fd_null = os.open(os.devnull, os.O_RDWR)
@@ -103,9 +98,7 @@ def _mark_cudagraph_step():
         if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
             torch.compiler.cudagraph_mark_step_begin()
     except Exception:
-        # Best-effort; safe to ignore if not available
         pass
-
 
 def _clone_for_backward(obj):
     """
@@ -121,7 +114,6 @@ def _clone_for_backward(obj):
         return {k: _clone_for_backward(v) for k, v in obj.items()}
     return obj
 
-
 def tie_requant_observers_fx(model: torch.nn.Module) -> torch.nn.Module:
     try:
         import torch.fx as fx
@@ -136,9 +128,8 @@ def tie_requant_observers_fx(model: torch.nn.Module) -> torch.nn.Module:
                 mod = dict(model.named_modules()).get(node.target, None)
                 if mod is None:
                     continue
-                if hasattr(mod, "activation_post_process") and isinstance(
-                    getattr(mod, "activation_post_process"), FakeQuantize
-                ):
+                if hasattr(mod, "activation_post_process"
+                          ) and isinstance(getattr(mod, "activation_post_process"), FakeQuantize):
                     last_obs = mod.activation_post_process
                 if isinstance(mod, Requant):
                     if hasattr(mod, "activation_post_process") and isinstance(
@@ -150,15 +141,11 @@ def tie_requant_observers_fx(model: torch.nn.Module) -> torch.nn.Module:
     except Exception:
         return model
 
-
-# --------------------------- DDP / RANK ---------------------------
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", -1))
 RANK = int(os.getenv("RANK", -1))
 WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
 GIT_INFO = None
 
-
-# --------------------------- TRAIN ---------------------------
 def train(hyp, opt, device, callbacks):
     save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, freeze = \
         Path(opt.save_dir), opt.epochs, opt.batch_size, opt.weights, opt.single_cls, opt.evolve, opt.data, opt.cfg, \
@@ -220,7 +207,8 @@ def train(hyp, opt, device, callbacks):
         ).to(device)
         exclude = ["anchor"] if (cfg or hyp.get("anchors")) and not resume else []
         model_in_ckpt = ckpt['model']
-        csd = model_in_ckpt.float().state_dict() if hasattr(model_in_ckpt, 'state_dict') else model_in_ckpt
+        csd = model_in_ckpt.float().state_dict(
+        ) if hasattr(model_in_ckpt, 'state_dict') else model_in_ckpt
         csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)
         model.load_state_dict(csd, strict=False)
         LOGGER.info(f"Transferred {len(csd)}/{len(model.state_dict())} items from {weights}")
@@ -236,7 +224,6 @@ def train(hyp, opt, device, callbacks):
 
     amp = bool(opt.amp and not opt.qat)
 
-    # Freeze
     freeze = [f"model.{x}." for x in (freeze if len(freeze) > 1 else range(freeze[0]))]
     for k, v in model.named_parameters():
         if any(x in k for x in freeze):
@@ -250,14 +237,12 @@ def train(hyp, opt, device, callbacks):
         gs = max(int(_stride.max()), 32)
     imgsz = check_img_size(opt.imgsz, gs, floor=gs * 2)
 
-    # Autobatch
     if RANK == -1 and batch_size == -1:
         batch_size = check_train_batch_size(model, imgsz, amp)
         loggers.on_params_update({"batch_size": batch_size})
 
     compute_loss = RN_ComputeLoss(model)
 
-    # QAT
     if opt.qat:
         from torch.ao.quantization.quantize_fx import prepare_qat_fx
         from torch.ao.quantization import QConfigMapping, get_default_qat_qconfig
@@ -267,16 +252,16 @@ def train(hyp, opt, device, callbacks):
         qconfig = get_default_qat_qconfig("fbgemm")
 
         qconfig_mapping = (
-            QConfigMapping()
-            .set_global(qconfig)
-            .set_object_type(nn.Conv2d, qconfig)
-            .set_object_type(nn.BatchNorm2d, qconfig)
-            .set_object_type(nn.Linear, qconfig)
-            .set_object_type(Requant, qconfig)
+            QConfigMapping().set_global(qconfig).set_object_type(
+                nn.Conv2d, qconfig
+            ).set_object_type(nn.BatchNorm2d,
+                              qconfig).set_object_type(nn.Linear,
+                                                       qconfig).set_object_type(Requant, qconfig)
         )
-        for fused_t in (getattr(nni, "ConvBn2d", None),
-                        getattr(nni, "ConvReLU2d", None),
-                        getattr(nni, "ConvBnReLU2d", None)):
+        for fused_t in (
+            getattr(nni, "ConvBn2d", None), getattr(nni, "ConvReLU2d",
+                                                    None), getattr(nni, "ConvBnReLU2d", None)
+        ):
             if fused_t is not None:
                 qconfig_mapping = qconfig_mapping.set_object_type(fused_t, qconfig)
 
@@ -290,12 +275,10 @@ def train(hyp, opt, device, callbacks):
                 pass
         model = tie_requant_observers_fx(model)
 
-    # Backend knobs
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = False
 
-    # Optimizer / param groups
     nbs = 64
     accumulate = max(round(nbs / batch_size), 1)
     lambda_target = optimizer_settings.get("weight_decay", 0.0)
@@ -303,7 +286,9 @@ def train(hyp, opt, device, callbacks):
     decoupled_settings = optimizer_settings.get("decoupled_lr", {})
     lr_scale_backbone = decoupled_settings.get("backbone", {}).get("lr_scale", 1.0)
     lr_scale_head = decoupled_settings.get("head", {}).get("lr_scale", 1.0)
-    lr_scale_sppf = decoupled_settings.get("sppf", {}).get("lr_scale", (lr_scale_backbone + lr_scale_head) / 2.0)
+    lr_scale_sppf = decoupled_settings.get("sppf", {}).get(
+        "lr_scale", (lr_scale_backbone + lr_scale_head) / 2.0
+    )
 
     if hasattr(model, 'yaml') and 'backbone' in model.yaml:
         backbone_full_len = len(model.yaml['backbone'])
@@ -313,15 +298,24 @@ def train(hyp, opt, device, callbacks):
     else:
         backbone_len = 10
         sppf_index = backbone_len
-        LOGGER.warning("Could not find model.yaml['backbone']. Falling back to default backbone length of %d.", backbone_len)
+        LOGGER.warning(
+            "Could not find model.yaml['backbone']. Falling back to default backbone length of %d.",
+            backbone_len
+        )
 
     backbone_indices = range(backbone_len)
     param_groups = {
-        "backbone_weights": {"params": [], "lr_scale": lr_scale_backbone, "weight_decay": scaled_weight_decay},
+        "backbone_weights": {
+            "params": [], "lr_scale": lr_scale_backbone, "weight_decay": scaled_weight_decay
+        },
         "backbone_others": {"params": [], "lr_scale": lr_scale_backbone, "weight_decay": 0.0},
-        "sppf_weights": {"params": [], "lr_scale": lr_scale_sppf, "weight_decay": scaled_weight_decay},
+        "sppf_weights": {
+            "params": [], "lr_scale": lr_scale_sppf, "weight_decay": scaled_weight_decay
+        },
         "sppf_others": {"params": [], "lr_scale": lr_scale_sppf, "weight_decay": 0.0},
-        "head_weights": {"params": [], "lr_scale": lr_scale_head, "weight_decay": scaled_weight_decay},
+        "head_weights": {
+            "params": [], "lr_scale": lr_scale_head, "weight_decay": scaled_weight_decay
+        },
         "head_others": {"params": [], "lr_scale": lr_scale_head, "weight_decay": 0.0},
     }
     for name, p in model.named_parameters():
@@ -346,15 +340,14 @@ def train(hyp, opt, device, callbacks):
         if group_data["params"]:
             group_lr = base_lr * group_data["lr_scale"]
             optimizer_param_groups.append({
-                "params": group_data["params"],
-                "lr": group_lr,
-                "initial_lr": group_lr,
-                "weight_decay": group_data["weight_decay"],
-                "name": group_name
+                "params": group_data["params"], "lr": group_lr, "initial_lr": group_lr,
+                "weight_decay": group_data["weight_decay"], "name": group_name
             })
 
     if opt.optimizer == "SGD":
-        optimizer = torch.optim.SGD(optimizer_param_groups, momentum=optimizer_settings["momentum"], nesterov=True)
+        optimizer = torch.optim.SGD(
+            optimizer_param_groups, momentum=optimizer_settings["momentum"], nesterov=True
+        )
     elif opt.optimizer == "LION":
         optimizer = Lion(
             optimizer_param_groups,
@@ -371,7 +364,6 @@ def train(hyp, opt, device, callbacks):
     else:
         raise NotImplementedError(f"Unknown optimizer {opt.optimizer}")
 
-    # LR schedule
     lr_scheduler_type = optimizer_settings.get("lr_scheduler_type", "cosine")
     lrf = optimizer_settings["lrf"]
     if lr_scheduler_type == "cosine":
@@ -395,33 +387,31 @@ def train(hyp, opt, device, callbacks):
 
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
 
-    # SyncBN if DDP
     if opt.sync_bn and cuda and RANK != -1:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
 
-    # Compile (train graph)
     if hasattr(torch, "compile") and not opt.qat:
         model.to(memory_format=torch.channels_last)
         LOGGER.info("Compiling model with torch.compile(mode='reduce-overhead')...")
         with SuppressLogs():
-            model = torch.compile(model, backend="inductor", mode="reduce-overhead", fullgraph=False, dynamic=False)
+            model = torch.compile(
+                model, backend="inductor", mode="reduce-overhead", fullgraph=False, dynamic=False
+            )
 
-    # EMA
     ema = None
     if RANK in {-1, 0}:
         ema = ModelEMA(model)
 
-    # Resume
     best_fitness, start_epoch = 0.0, 0
     if pretrained and resume:
-        best_fitness, start_epoch, epochs = smart_resume(ckpt, optimizer, ema, weights, epochs, resume)
+        best_fitness, start_epoch, epochs = smart_resume(
+            ckpt, optimizer, ema, weights, epochs, resume
+        )
         del ckpt, csd
 
-    # DataParallel if single-process multi-GPU
     if cuda and RANK == -1 and torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
 
-    # Dataloaders
     train_loader, dataset = create_dataloader(
         train_path,
         imgsz,
@@ -445,7 +435,6 @@ def train(hyp, opt, device, callbacks):
     assert mlc < nc, f'Label class {mlc} exceeds nc={nc} in {data}.'
 
     if RANK in {-1, 0}:
-        # Validation batch size: double train batch size per requirements
         val_bs = batch_size // WORLD_SIZE * 2
         val_loader = create_dataloader(
             val_path,
@@ -464,7 +453,6 @@ def train(hyp, opt, device, callbacks):
         if not resume:
             labels = np.concatenate(dataset.labels, 0)
             callbacks.run("on_pretrain_routine_end", labels, names)
-    # DDP wrap
     if cuda and RANK != -1:
         model = smart_DDP(model)
 
@@ -485,7 +473,6 @@ def train(hyp, opt, device, callbacks):
         f"Logging results to {colorstr('bold', save_dir)}\nStarting training for {epochs} epochs..."
     )
 
-    # Validation precision: FP16 unless QAT is enabled
     half_val = (not opt.qat)
 
     for epoch in range(start_epoch, epochs):
@@ -493,7 +480,7 @@ def train(hyp, opt, device, callbacks):
         model.train()
 
         if opt.image_weights:
-            cw = model.class_weights.cpu().numpy() * (1 - maps) ** 2 / nc
+            cw = model.class_weights.cpu().numpy() * (1 - maps)**2 / nc
             iw = labels_to_image_weights(dataset.labels, nc=nc, class_weights=cw)
             dataset.indices = random.choices(range(dataset.n), weights=iw, k=dataset.n)
 
@@ -508,7 +495,8 @@ def train(hyp, opt, device, callbacks):
             train_loader.sampler.set_epoch(epoch)
 
         pbar = enumerate(train_loader)
-        LOGGER.info(("\n" + "%11s" * 7) % ("Epoch", "GPU_mem", "box_loss", "cls_loss", "dfl_loss", "Instances", "Size"))
+        LOGGER.info(("\n" + "%11s" * 7) %
+                    ("Epoch", "GPU_mem", "box_loss", "cls_loss", "dfl_loss", "Instances", "Size"))
         if RANK in {-1, 0}:
             pbar = tqdm(pbar, total=nb, bar_format=TQDM_BAR_FORMAT)
 
@@ -523,22 +511,27 @@ def train(hyp, opt, device, callbacks):
                 imgs = imgs.half()
             imgs = imgs / 255
 
-            # warmup
             if ni <= nw:
                 xi = [0, nw]
                 accumulate = max(1, np.interp(ni, xi, [1, nbs / batch_size]).round())
                 for j, x in enumerate(optimizer.param_groups):
                     x["lr"] = np.interp(
-                        ni, xi,
-                        [optimizer_settings["warmup_bias_lr"] if x.get('name', '').endswith('others') else 0.0,
-                         x["initial_lr"] * lf(epoch)]
+                        ni, xi, [
+                            optimizer_settings["warmup_bias_lr"]
+                            if x.get('name', '').endswith('others') else 0.0,
+                            x["initial_lr"] * lf(epoch)
+                        ]
                     )
                     if 'momentum' in optimizer_settings:
                         x['momentum'] = np.interp(
-                            ni, xi, [optimizer_settings['warmup_momentum'], optimizer_settings['momentum']]
+                            ni, xi,
+                            [optimizer_settings['warmup_momentum'], optimizer_settings['momentum']]
                         )
                     if 'betas' in x:
-                        new_beta1 = np.interp(ni, xi, [optimizer_settings['warmup_momentum'], optimizer_settings['b1']])
+                        new_beta1 = np.interp(
+                            ni, xi,
+                            [optimizer_settings['warmup_momentum'], optimizer_settings['b1']]
+                        )
                         x['betas'] = (new_beta1, x['betas'][1])
 
             will_step = (ni - last_opt_step) >= accumulate
@@ -590,7 +583,9 @@ def train(hyp, opt, device, callbacks):
         if RANK in {-1, 0}:
             callbacks.run("on_train_epoch_end", epoch=epoch)
             if ema:
-                ema.update_attr(model, include=["yaml", "nc", "hyp", "names", "stride", "class_weights"])
+                ema.update_attr(
+                    model, include=["yaml", "nc", "hyp", "names", "stride", "class_weights"]
+                )
 
             final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
 
@@ -598,7 +593,6 @@ def train(hyp, opt, device, callbacks):
                 prev = compute_loss.ddp_reduce
                 compute_loss.ddp_reduce = False
 
-                # mark boundary before switching to eval/val run
                 _mark_cudagraph_step()
                 results, maps, _ = validate.run(
                     data_dict,
@@ -668,7 +662,9 @@ def train(hyp, opt, device, callbacks):
             break
 
     if RANK in {-1, 0}:
-        LOGGER.info(f"\n{epoch - start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours.")
+        LOGGER.info(
+            f"\n{epoch - start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours."
+        )
         for f in (last, best):
             if f.exists():
                 strip_optimizer(f)
@@ -700,58 +696,134 @@ def train(hyp, opt, device, callbacks):
     gc.collect()
     return results
 
-
-# --------------------------- ARGS / MAIN ---------------------------
 def parse_opt(known=False):
     parser = argparse.ArgumentParser()
     parser.add_argument("--weights", type=str, default="", help="initial weights path")
     parser.add_argument("--cfg", type=str, default="", help="model.yaml path")
-    parser.add_argument("--data", type=str, default=ROOT / "data/coco128.yaml", help="dataset.yaml path")
-    parser.add_argument("--hyp", type=str, default=ROOT / "data/hyps/hyp.scratch-low.yaml", help="hyperparameters path")
+    parser.add_argument(
+        "--data", type=str, default=ROOT / "data/coco128.yaml", help="dataset.yaml path"
+    )
+    parser.add_argument(
+        "--hyp",
+        type=str,
+        default=ROOT / "data/hyps/hyp.scratch-low.yaml",
+        help="hyperparameters path"
+    )
     parser.add_argument("--epochs", type=int, default=100, help="total training epochs")
-    parser.add_argument("--batch-size", type=int, default=-1, help="total batch size for all GPUs, -1 for autobatch")
-    parser.add_argument("--imgsz", "--img", "--img-size", type=int, default=640, help="train, val image size (pixels)")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=-1,
+        help="total batch size for all GPUs, -1 for autobatch"
+    )
+    parser.add_argument(
+        "--imgsz",
+        "--img",
+        "--img-size",
+        type=int,
+        default=640,
+        help="train, val image size (pixels)"
+    )
     parser.add_argument("--rect", action="store_true", help="rectangular training")
-    parser.add_argument("--resume", nargs="?", const=True, default=False, help="resume most recent training")
+    parser.add_argument(
+        "--resume", nargs="?", const=True, default=False, help="resume most recent training"
+    )
     parser.add_argument("--nosave", action="store_true", help="only save final checkpoint")
     parser.add_argument("--noval", action="store_true", help="only validate final epoch")
     parser.add_argument("--noautoanchor", action="store_true", help="disable AutoAnchor")
     parser.add_argument("--noplots", action="store_true", help="save no plot files")
-    parser.add_argument("--evolve", type=int, nargs="?", const=300, help="evolve hyperparameters for x generations")
+    parser.add_argument(
+        "--evolve", type=int, nargs="?", const=300, help="evolve hyperparameters for x generations"
+    )
     parser.add_argument("--bucket", type=str, default="", help="gsutil bucket")
     parser.add_argument("--cache", type=str, nargs="?", const="ram", help="image --cache ram/disk")
-    parser.add_argument("--image-weights", action="store_true", help="use weighted image selection for training")
+    parser.add_argument(
+        "--image-weights", action="store_true", help="use weighted image selection for training"
+    )
     parser.add_argument("--device", default="", help="cuda device, i.e. 0 or 0,1,2,3 or cpu")
-    parser.add_argument("--single-cls", action="store_true", help="train multi-class data as single-class")
-    parser.add_argument("--optimizer", type=str, choices=["SGD", "Adam", "AdamW", "LION"], default="SGD", help="optimizer")
-    parser.add_argument("--sync-bn", action="store_true", help="use SyncBatchNorm, only available in DDP mode")
-    parser.add_argument("--workers", type=int, default=8, help="max dataloader workers (per RANK in DDP mode)")
+    parser.add_argument(
+        "--single-cls", action="store_true", help="train multi-class data as single-class"
+    )
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        choices=["SGD", "Adam", "AdamW", "LION"],
+        default="SGD",
+        help="optimizer"
+    )
+    parser.add_argument(
+        "--sync-bn", action="store_true", help="use SyncBatchNorm, only available in DDP mode"
+    )
+    parser.add_argument(
+        "--workers", type=int, default=8, help="max dataloader workers (per RANK in DDP mode)"
+    )
     parser.add_argument("--project", default=ROOT / "runs/train", help="save to project/name")
     parser.add_argument("--name", default="exp", help="save to project/name")
-    parser.add_argument("--exist-ok", action="store_true", help="existing project/name ok, do not increment")
+    parser.add_argument(
+        "--exist-ok", action="store_true", help="existing project/name ok, do not increment"
+    )
     parser.add_argument("--quad", action="store_true", help="quad dataloader")
-    parser.add_argument("--label-smoothing", type=float, default=0.0, help="Label smoothing epsilon")
-    parser.add_argument("--patience", type=int, default=100, help="EarlyStopping patience (epochs without improvement)")
-    parser.add_argument("--freeze", nargs="+", type=int, default=[0], help="Freeze layers: backbone=10, first3=0 1 2")
-    parser.add_argument("--save-period", type=int, default=-1, help="Save checkpoint every x epochs (disabled if < 1)")
+    parser.add_argument(
+        "--label-smoothing", type=float, default=0.0, help="Label smoothing epsilon"
+    )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=100,
+        help="EarlyStopping patience (epochs without improvement)"
+    )
+    parser.add_argument(
+        "--freeze",
+        nargs="+",
+        type=int,
+        default=[0],
+        help="Freeze layers: backbone=10, first3=0 1 2"
+    )
+    parser.add_argument(
+        "--save-period",
+        type=int,
+        default=-1,
+        help="Save checkpoint every x epochs (disabled if < 1)"
+    )
     parser.add_argument("--seed", type=int, default=0, help="Global training seed")
-    parser.add_argument("--local-rank", type=int, default=-1, help="Automatic DDP Multi-GPU argument, do not modify")
+    parser.add_argument(
+        "--local-rank",
+        type=int,
+        default=-1,
+        help="Automatic DDP Multi-GPU argument, do not modify"
+    )
     parser.add_argument("--min-items", type=int, default=0, help="Experimental")
     parser.add_argument("--close-mosaic", type=int, default=10, help="Experimental")
     parser.add_argument("--entity", default=None, help="W&B: Entity")
-    parser.add_argument("--upload_dataset", nargs="?", const=True, default=False, help='W&B: Upload data, "val" option')
-    parser.add_argument("--bbox_interval", type=int, default=-1, help="W&B: Set bounding-box image logging interval")
-    parser.add_argument("--artifact_alias", type=str, default="latest", help="W&B: Version of dataset artifact to use")
-    parser.add_argument("--amp", default=True, action="store_true", help="Enable mixed precision (fp16 amp)")
+    parser.add_argument(
+        "--upload_dataset",
+        nargs="?",
+        const=True,
+        default=False,
+        help='W&B: Upload data, "val" option'
+    )
+    parser.add_argument(
+        "--bbox_interval",
+        type=int,
+        default=-1,
+        help="W&B: Set bounding-box image logging interval"
+    )
+    parser.add_argument(
+        "--artifact_alias",
+        type=str,
+        default="latest",
+        help="W&B: Version of dataset artifact to use"
+    )
+    parser.add_argument(
+        "--amp", default=True, action="store_true", help="Enable mixed precision (fp16 amp)"
+    )
     parser.add_argument("--qat", action="store_true", help="Enable quantization-aware training")
     return parser.parse_known_args()[0] if known else parser.parse_args()
-
 
 def main(opt, callbacks=Callbacks()):
     if RANK in {-1, 0}:
         print_args(vars(opt))
 
-    # If QAT requested, disable AMP for training (fake-quant needs FP32 compute path)
     if opt.qat and opt.amp:
         opt.amp = False
 
@@ -803,13 +875,17 @@ def main(opt, callbacks=Callbacks()):
     else:
         meta = {
             'lr0': (1, 1e-5, 1e-1), 'lrf': (1, 0.01, 1.0), 'momentum': (0.3, 0.6, 0.98),
-            'weight_decay': (1, 0.0, 0.001), 'warmup_epochs': (1, 0.0, 5.0), 'warmup_momentum': (1, 0.0, 0.95),
-            'warmup_bias_lr': (1, 0.0, 0.2), 'box': (1, 0.02, 0.2), 'cls': (1, 0.2, 4.0),
-            'cls_pw': (1, 0.5, 2.0), 'obj': (1, 0.2, 4.0), 'obj_pw': (1, 0.5, 2.0), 'iou_t': (0, 0.1, 0.7),
-            'fl_gamma': (0, 0.0, 2.0), 'hsv_h': (1, 0.0, 0.1), 'hsv_s': (1, 0.0, 0.9), 'hsv_v': (1, 0.0, 0.9),
-            'degrees': (1, 0.0, 45.0), 'translate': (1, 0.0, 0.9), 'scale': (1, 0.0, 0.9), 'shear': (1, 0.0, 10.0),
-            'perspective': (0, 0.0, 0.001), 'flipud': (1, 0.0, 1.0), 'fliplr': (0, 0.0, 1.0),
-            'mosaic': (1, 0.0, 1.0), 'mixup': (1, 0.0, 1.0), 'copy_paste': (1, 0.0, 1.0)
+            'weight_decay': (1, 0.0, 0.001), 'warmup_epochs': (1, 0.0, 5.0), 'warmup_momentum': (
+                1, 0.0, 0.95
+            ), 'warmup_bias_lr': (1, 0.0, 0.2), 'box': (1, 0.02, 0.2), 'cls': (1, 0.2, 4.0),
+            'cls_pw': (1, 0.5, 2.0), 'obj': (1, 0.2, 4.0), 'obj_pw': (1, 0.5, 2.0), 'iou_t': (
+                0, 0.1, 0.7
+            ), 'fl_gamma': (0, 0.0, 2.0), 'hsv_h': (1, 0.0, 0.1), 'hsv_s': (1, 0.0, 0.9), 'hsv_v':
+                (1, 0.0, 0.9), 'degrees': (1, 0.0, 45.0), 'translate': (1, 0.0, 0.9), 'scale': (
+                    1, 0.0, 0.9
+                ), 'shear': (1, 0.0, 10.0), 'perspective': (0, 0.0, 0.001), 'flipud': (1, 0.0, 1.0),
+            'fliplr': (0, 0.0, 1.0), 'mosaic': (1, 0.0, 1.0), 'mixup': (1, 0.0, 1.0), 'copy_paste':
+                (1, 0.0, 1.0)
         }
         with open(opt.hyp, errors="ignore") as f:
             hyp = yaml.safe_load(f)
@@ -839,7 +915,8 @@ def main(opt, callbacks=Callbacks()):
                 ng = len(evolve_keys)
                 v = np.ones(ng)
                 while all(v == 1):
-                    v = (g * (npr.random(ng) < mp) * npr.randn(ng) * npr.random() * s + 1).clip(0.3, 3.0)
+                    v = (g * (npr.random(ng) < mp) * npr.randn(ng) * npr.random() * s +
+                         1).clip(0.3, 3.0)
                 parent_values = x[7:]
                 for i, k in enumerate(evolve_keys):
                     flat_hyp[k] = parent_values[i] * v[i]
@@ -868,14 +945,12 @@ def main(opt, callbacks=Callbacks()):
             f'Usage example: $ python train.py --hyp {evolve_yaml}'
         )
 
-
 def run(**kwargs):
     opt = parse_opt(True)
     for k, v in kwargs.items():
         setattr(opt, k, v)
     main(opt)
     return opt
-
 
 if __name__ == "__main__":
     opt = parse_opt()

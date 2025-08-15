@@ -198,9 +198,9 @@ def run(
             if isinstance(output, tuple):
                 head_out, feat_out = output
                 if isinstance(head_out, list):
-                    preds = head_out[-1]  
+                    preds = head_out[-1]
                 else:
-                    preds = head_out  
+                    preds = head_out
                 if isinstance(feat_out, (list, tuple)):
                     if len(feat_out) == 2 and isinstance(feat_out[0], (list, tuple)) and isinstance(
                         feat_out[1], (list, tuple)
