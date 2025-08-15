@@ -201,10 +201,8 @@ def train(hyp, opt, device, callbacks):
         from torch.ao.quantization.quantize_fx import prepare_qat_fx
         from torch.ao.quantization import QConfigMapping, get_default_qat_qconfig
         import torch.ao.nn.intrinsic as nni
-
         torch.backends.quantized.engine = "fbgemm"
         qconfig = get_default_qat_qconfig("fbgemm")
-
         qconfig_mapping = (
             QConfigMapping().set_global(qconfig).set_object_type(
                 nn.Conv2d, qconfig
@@ -218,7 +216,6 @@ def train(hyp, opt, device, callbacks):
         ):
             if fused_t is not None:
                 qconfig_mapping = qconfig_mapping.set_object_type(fused_t, qconfig)
-
         model.train()
         example_inputs = (torch.randn(1, 3, int(opt.imgsz), int(opt.imgsz), device=device), )
         model = prepare_qat_fx(model, qconfig_mapping, example_inputs)
@@ -348,7 +345,6 @@ def train(hyp, opt, device, callbacks):
         LOGGER.info("Compiling TRAIN graph (inductor, max-autotune)...")
         with SuppressLogs():
             torch.backends.cudnn.benchmark = True
-
             opt_dict = {
                 "max_autotune": True,
                 "coordinate_descent_tuning": True,
@@ -357,7 +353,6 @@ def train(hyp, opt, device, callbacks):
                 "use_fast_math": True,
                 "triton.cudagraphs": False,
             }
-
             model = torch.compile(
                 model,
                 backend="inductor",
@@ -403,7 +398,7 @@ def train(hyp, opt, device, callbacks):
     assert mlc < nc, f'Label class {mlc} exceeds nc={nc} in {data}.'
 
     if RANK in {-1, 0}:
-        val_bs = batch_size // WORLD_SIZE * 2
+        val_bs = batch_size // WORLD_SIZE
         val_loader = create_dataloader(
             val_path,
             imgsz,
@@ -435,13 +430,63 @@ def train(hyp, opt, device, callbacks):
     scaler = torch.cuda.amp.GradScaler(enabled=amp)
     stopper, stop = EarlyStopping(patience=opt.patience), False
 
+    class CudaPrefetcher:
+        def __init__(self, loader, device, amp=False):
+            self.base = loader
+            self.device = device
+            self.amp = amp
+            self.stream = torch.cuda.Stream()
+            self.iterator = None
+            self.next_imgs = None
+            self.next_targets = None
+            self.next_paths = None
+            self.next_shapes = None
+            self.reset()
+        def __len__(self):
+            return len(self.base)
+        def reset(self):
+            self.iterator = iter(self.base)
+            self.next_imgs = None
+            self._preload()
+        def _preload(self):
+            try:
+                imgs, targets, paths, shapes = next(self.iterator)
+            except StopIteration:
+                self.next_imgs = None
+                return
+            with torch.cuda.stream(self.stream):
+                imgs = imgs.to(self.device, non_blocking=True).to(memory_format=torch.channels_last)
+                if self.amp:
+                    imgs = imgs.half()
+                else:
+                    imgs = imgs.float()
+                imgs = imgs / 255
+                targets = targets.to(self.device, non_blocking=True)
+                self.next_imgs = imgs
+                self.next_targets = targets
+                self.next_paths = paths
+                self.next_shapes = shapes
+        def __iter__(self):
+            return self
+        def __next__(self):
+            torch.cuda.current_stream().wait_stream(self.stream)
+            if self.next_imgs is None:
+                raise StopIteration
+            imgs = self.next_imgs
+            targets = self.next_targets
+            paths = self.next_paths
+            shapes = self.next_shapes
+            self._preload()
+            return imgs, targets, paths, shapes
+
     callbacks.run("on_train_start")
     LOGGER.info(
         f"Image sizes {imgsz} train, {imgsz} val\nUsing {train_loader.num_workers * WORLD_SIZE} dataloader workers\n"
         f"Logging results to {colorstr('bold', save_dir)}\nStarting training for {epochs} epochs..."
     )
 
-    half_val = (not opt.qat)
+    half_val = False
+    use_prefetch = cuda
 
     for epoch in range(start_epoch, epochs):
         callbacks.run("on_train_epoch_start")
@@ -462,7 +507,9 @@ def train(hyp, opt, device, callbacks):
         if RANK != -1:
             train_loader.sampler.set_epoch(epoch)
 
-        pbar = enumerate(train_loader)
+        iterator = CudaPrefetcher(train_loader, device, amp) if use_prefetch else train_loader
+
+        pbar = enumerate(iterator)
         LOGGER.info(("\n" + "%11s" * 7) %
                     ("Epoch", "GPU_mem", "box_loss", "cls_loss", "dfl_loss", "Instances", "Size"))
         if RANK in {-1, 0}:
@@ -474,10 +521,12 @@ def train(hyp, opt, device, callbacks):
             callbacks.run("on_train_batch_start")
             ni = i + nb * epoch
 
-            imgs = imgs.to(device, non_blocking=True).to(memory_format=torch.channels_last)
-            if amp:
-                imgs = imgs.half()
-            imgs = imgs / 255
+            if not use_prefetch:
+                imgs = imgs.to(device, non_blocking=True).to(memory_format=torch.channels_last)
+                if amp:
+                    imgs = imgs.half()
+                imgs = imgs / 255
+            tgt = targets if use_prefetch else targets.to(device)
 
             if ni <= nw:
                 xi = [0, nw]
@@ -509,7 +558,7 @@ def train(hyp, opt, device, callbacks):
                     with torch.cuda.amp.autocast(enabled=amp):
                         pred = model(imgs)
                         pred = pred
-                        loss, loss_items = compute_loss(pred, targets.to(device))
+                        loss, loss_items = compute_loss(pred, tgt)
                         if opt.quad:
                             loss *= 4.0
                     scaler.scale(loss).backward()
@@ -517,7 +566,7 @@ def train(hyp, opt, device, callbacks):
                 with torch.cuda.amp.autocast(enabled=amp):
                     pred = model(imgs)
                     pred = pred
-                    loss, loss_items = compute_loss(pred, targets.to(device))
+                    loss, loss_items = compute_loss(pred, tgt)
                     if opt.quad:
                         loss *= 4.0
                 scaler.scale(loss).backward()
@@ -537,9 +586,9 @@ def train(hyp, opt, device, callbacks):
                 mem = f"{torch.cuda.memory_reserved() / 1e9 if torch.cuda.is_available() else 0:.3g}G"
                 pbar.set_description(
                     ("%11s" * 2 + "%11.4g" * 5) %
-                    (f"{epoch}/{epochs - 1}", mem, *mloss, targets.shape[0], imgs.shape[-1])
+                    (f"{epoch}/{epochs - 1}", mem, *mloss, tgt.shape[0], imgs.shape[-1])
                 )
-                callbacks.run("on_train_batch_end", model, ni, imgs, targets, paths, list(mloss))
+                callbacks.run("on_train_batch_end", model, ni, imgs, tgt, paths, list(mloss))
                 if callbacks.stop_training:
                     return
 
@@ -549,46 +598,20 @@ def train(hyp, opt, device, callbacks):
         if RANK in {-1, 0}:
             callbacks.run("on_train_epoch_end", epoch=epoch)
             if ema:
-                ema.update_attr(
-                    model, include=["yaml", "nc", "hyp", "names", "stride", "class_weights"]
-                )
+                ema.update_attr(model, include=["yaml", "nc", "hyp", "names", "stride", "class_weights"])
 
             final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
 
             if not noval or final_epoch:
                 prev = compute_loss.ddp_reduce
                 compute_loss.ddp_reduce = False
-                torch.cuda.empty_cache()  
-                vm = ema.ema if ema else model
-                if compiled_val is None:
-                    vm.to(memory_format=torch.channels_last)
-                    vm.eval()
-                    LOGGER.info("Compiling VAL graph")
-                    with SuppressLogs():
-                        torch.backends.cudnn.benchmark = True
 
-                        opt_dict = {
-                            "max_autotune": True,
-                            "coordinate_descent_tuning": True,
-                            "epilogue_fusion": True,
-                            "shape_padding": True,
-                            "use_fast_math": True,
-                            "triton.cudagraphs": False,
-                        }
-
-                        model = torch.compile(
-                            model,
-                            backend="inductor",
-                            fullgraph=True,
-                            dynamic=False,
-                            options=opt_dict
-                        )
                 results, maps, _ = validate.run(
                     data_dict,
                     batch_size=val_bs,
                     imgsz=imgsz,
                     half=half_val,
-                    model=compiled_val,
+                    model=ema.ema if ema else model,
                     single_cls=single_cls,
                     dataloader=val_loader,
                     save_dir=save_dir,
@@ -610,7 +633,6 @@ def train(hyp, opt, device, callbacks):
             callbacks.run("on_fit_epoch_end", log_vals, epoch, best_fitness, fi)
 
             if (not nosave) or (final_epoch and not evolve):
-
                 def _clone_for_save(mm):
                     m2 = deepcopy(de_parallel(mm)).float()
                     for _m in m2.modules():
@@ -620,7 +642,6 @@ def train(hyp, opt, device, callbacks):
                             except Exception:
                                 pass
                     return m2
-
                 ckpt_model = _clone_for_save(model)
                 ckpt_ema = _clone_for_save(ema.ema) if ema else None
                 ckpt = {
@@ -661,7 +682,6 @@ def train(hyp, opt, device, callbacks):
                     LOGGER.info(f"\nValidating {f}...")
                     prev = compute_loss.ddp_reduce
                     compute_loss.ddp_reduce = False
-
                     results, _, _ = validate.run(
                         data_dict,
                         batch_size=val_bs,
@@ -675,7 +695,7 @@ def train(hyp, opt, device, callbacks):
                         plots=plots,
                         callbacks=callbacks,
                         compute_loss=compute_loss,
-                        half=half_val  
+                        half=half_val
                     )
                     compute_loss.ddp_reduce = prev
         callbacks.run("on_train_end", last, best, epoch, results)

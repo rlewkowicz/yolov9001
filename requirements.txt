@@ -3,6 +3,9 @@ torch==2.8.0
 torchvision 
 torchaudio==2.8.0
 
+decord
+pafy
+mss
 absl-py~=2.3.1
 ai-edge-litert~=1.4.0
 albumentations~=1.0.3

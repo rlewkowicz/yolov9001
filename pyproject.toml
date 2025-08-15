@@ -8,6 +8,8 @@ dependencies = [
   "torchaudio==2.8.0",
 
   # All the rest come from PyPI
+  "pafy",
+  "mss",
   "sng4onnx~=1.0.4",
   "ai-edge-litert~=1.4.0",
   "keras~=3.10.0",

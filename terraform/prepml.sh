@@ -67,7 +67,7 @@ sudo -u ubuntu screen -dmS ddptrain bash -ilc '
   conda activate yolov9
   nvidia-smi >/dev/null 2>&1 || true
   cd ~/yolov9001
-  ./yolov9001 ddptrain --optimizer LION --epochs 200 --cache ram
+  ./yolov9001 ddptrain --optimizer AdamW --epochs 300 --cache ram
   # ./yolov9001 ddptrain --optimizer SGD --epochs 300 --cache ram --weights ./best.pt --hyp hyp.finetune-coco.yaml
-  # exec bash
+  exec bash
 '

@@ -17,7 +17,26 @@ A bastardized implementation of:
 
 And some other cool stuff I made myself
 
+# Work in Progress and some requirements. 
+
+> ##### Ampere+ recommended - any thing else considered untested 
+`./init.sh` - This works great on ubuntu. It used to work on fedora, but I have not tried in a moment just because I'm tuning else where. It checks for conda and creates an env, and installs requirements. 
+
+or do python `~3.10` and `pip install -r requirements.txt`
+
+### Training
+
+
+
+### LION by default
+
+
+
+
 ### TOC
+- [Work in Progress and some requirements.](#work-in-progress-and-some-requirements)
+        - [](#)
+    - [TOC](#toc)
 - [It's Over 9000](#its-over-9000)
   - [Preface](#preface)
     - [There Can Only be One](#there-can-only-be-one)
