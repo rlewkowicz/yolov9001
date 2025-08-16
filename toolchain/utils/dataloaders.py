@@ -142,7 +142,7 @@ def create_dataloader(
     pad=0.0,
     rect=False,
     rank=-1,
-    workers=24,
+    workers = os.cpu_count(),
     image_weights=False,
     close_mosaic=False,
     quad=False,
@@ -197,7 +197,7 @@ def create_dataloader(
         generator=generator,
     )
     if nw > 0:
-        loader_kwargs.update(dict(prefetch_factor=12, persistent_workers=True))
+        loader_kwargs.update(dict(prefetch_factor=7, persistent_workers=True))
 
     return (
         loader(**loader_kwargs),

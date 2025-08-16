@@ -8,6 +8,9 @@ dependencies = [
   "torchaudio==2.8.0",
 
   # All the rest come from PyPI
+  "decord",
+  "pafy",
+  "mss",
   "pafy",
   "mss",
   "sng4onnx~=1.0.4",

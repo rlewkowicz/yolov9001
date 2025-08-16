@@ -152,23 +152,30 @@ def train(hyp, opt, device, callbacks):
 
     check_suffix(weights, ".pt")
     pretrained = weights.endswith(".pt")
-
+    ckpt = None
     if pretrained:
         with torch_distributed_zero_first(LOCAL_RANK):
             weights = attempt_download(weights)
-        ckpt = torch.load(weights, map_location="cpu", weights_only=False)
-        model = Model(
-            cfg or ckpt["model"].yaml, ch=3, nc=nc, anchors=hyp.get("anchors"), qat=opt.qat
-        ).to(device)
-        exclude = ["anchor"] if (cfg or hyp.get("anchors")) and not resume else []
-        model_in_ckpt = ckpt['model']
-        csd = model_in_ckpt.float().state_dict(
-        ) if hasattr(model_in_ckpt, 'state_dict') else model_in_ckpt
-        csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)
-        model.load_state_dict(csd, strict=False)
-        LOGGER.info(f"Transferred {len(csd)}/{len(model.state_dict())} items from {weights}")
+        ckpt = torch.load(weights, map_location="cpu", weights_only=False)  # Load checkpoint
+
+    if resume:
+        model = ckpt['model'].to(device)
+        LOGGER.info(f'Resuming training with model from {weights}')
     else:
-        model = Model(cfg, ch=3, nc=nc, anchors=hyp.get("anchors"), qat=opt.qat).to(device)
+        if pretrained:
+            # For transfer learning (not resuming), create a new model and load compatible weights.
+            model = Model(
+                cfg or ckpt["model"].yaml, ch=3, nc=nc, anchors=hyp.get("anchors"), qat=opt.qat
+            ).to(device)
+            exclude = ["anchor"] if (cfg or hyp.get("anchors")) else []
+            model_in_ckpt = ckpt['model']
+            csd = model_in_ckpt.float().state_dict(
+            ) if hasattr(model_in_ckpt, 'state_dict') else model_in_ckpt
+            csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)
+            model.load_state_dict(csd, strict=False)
+            LOGGER.info(f"Transferred {len(csd)}/{len(model.state_dict())} items from {weights}")
+        else:
+            model = Model(cfg, ch=3, nc=nc, anchors=hyp.get("anchors"), qat=opt.qat).to(device)
 
     _YOLO_ATTRS_TO_SAVE = ("stride", "names", "nc", "hyp", "class_weights", "yaml", "inplace")
     _yolo_attr_backup = {k: getattr(model, k) for k in _YOLO_ATTRS_TO_SAVE if hasattr(model, k)}
@@ -348,10 +355,10 @@ def train(hyp, opt, device, callbacks):
             opt_dict = {
                 "max_autotune": True,
                 "coordinate_descent_tuning": True,
-                "epilogue_fusion": True,
+                # "epilogue_fusion": True,
                 "shape_padding": True,
                 "use_fast_math": True,
-                "triton.cudagraphs": False,
+                "triton.cudagraphs": True,
             }
             model = torch.compile(
                 model,
@@ -386,7 +393,7 @@ def train(hyp, opt, device, callbacks):
         cache=None if opt.cache == 'val' else opt.cache,
         rect=opt.rect,
         rank=LOCAL_RANK,
-        workers=workers,
+        workers=os.cpu_count(),
         image_weights=opt.image_weights,
         close_mosaic=opt.close_mosaic != 0,
         quad=opt.quad,
@@ -409,7 +416,7 @@ def train(hyp, opt, device, callbacks):
             cache=None if noval else opt.cache,
             rect=True,
             rank=-1,
-            workers=workers * 2,
+            workers=workers,
             pad=0.5,
             prefix=colorstr('val: ')
         )[0]
