@@ -118,7 +118,6 @@ class RN_DualDDetect(nn.Module):
             b[-1].bias.data[:self.nc] = math.log(5 / self.nc / (640 / s)**2)  # cls bias
 
 class Model(nn.Module):
-    """YOLOv9-style model composed of a backbone and a detection head."""
     def __init__(self, cfg='yolo.yaml', ch=3, nc=None, hyp=None, anchors=None):
         super().__init__()
         self.hyp = hyp
@@ -142,9 +141,9 @@ class Model(nn.Module):
         self.names = [str(i) for i in range(self.yaml['nc'])]
         self.inplace = self.yaml.get('inplace', True)
 
-        m = self.model[-1]  # The last module is the detection head
+        m = self.model[-1]
         if isinstance(m, RN_DualDDetect):
-            s = 256  # A standard image size for stride calculation
+            s = 256
             m.inplace = self.inplace
             dummy_input = torch.zeros(1, ch, s, s)
             dummy_feats = self._forward_once(dummy_input, get_feats=True)
@@ -156,11 +155,10 @@ class Model(nn.Module):
         self.info()
 
     def _forward_once(self, x, get_feats=False):
-        """Single forward pass through the network."""
-        y = []  # A list to store intermediate layer outputs
+        y = []
         head_input = []
         for m in self.model:
-            if m.f != -1:  # if not from previous layer
+            if m.f != -1:
                 x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]
             x = m(x)
             y.append(x if m.i in self.save else None)
@@ -168,15 +166,15 @@ class Model(nn.Module):
                 head_input = [y[j] for j in m.f]
 
         if get_feats:
-            return head_input  # Return feature maps for stride calculation
+            return head_input
         return x
 
-    def forward(self, x):
+    def forward(self, x, **kwargs):
         return self._forward_once(x)
 
     def info(self, verbose=False, img_size=640):
-        """Prints model summary."""
         model_info(self, verbose, img_size)
+
 
 def parse_model(d, ch):
     """Parses a model dictionary and builds the layers."""
