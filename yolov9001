@@ -249,7 +249,7 @@ def ddptrain(ctx: click.Context) -> None:
         if "--qat" in ctx.args:
             reference_batch_size = 15
         else:
-            reference_batch_size = 38
+            reference_batch_size = 40
         
         gpu_mem_bytes = [
             torch.cuda.get_device_properties(i).total_memory for i in range(num_gpus)

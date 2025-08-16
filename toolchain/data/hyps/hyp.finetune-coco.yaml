@@ -15,13 +15,13 @@ optimizer:
         lr_scale: 1.0
   LION:
     lr_scheduler_type: cosine
-    lr0: 0.0008
-    lrf: 0.05
+    lr0: 0.001
+    lrf: 0.001
     b1: 0.9
     b2: 0.999
     alpha: 27
     bias_correction: false
-    weight_decay: 0.005
+    weight_decay: 0.006
     warmup_epochs: 0
     warmup_momentum: 0.9
     warmup_bias_lr: 1
@@ -41,7 +41,7 @@ optimizer:
     warmup_epochs: 5
     warmup_momentum: 0.8
     warmup_bias_lr: 0.002
-box: 7.5
+box: 7.6
 cls: 0.5
 cls_pw: 1.0
 obj: 0.77
@@ -59,6 +59,6 @@ shear: 0.0
 perspective: 0.0
 flipud: 0.0
 fliplr: 0.5
-mosaic: 0.7
+mosaic: 0.5
 mixup: 0.00
 copy_paste: 0.00

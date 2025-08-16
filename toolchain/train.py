@@ -23,27 +23,27 @@ from torch.optim import lr_scheduler
 from tqdm import tqdm
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from utils.torch_utils import de_parallel, EarlyStopping, ModelEMA, select_device, smart_DDP, smart_resume, torch_distributed_zero_first  
-from models.common import Requant  
-import val as validate  
-from models.experimental import attempt_load  
-from models.yolo import Model  
-from utils.autobatch import check_train_batch_size  
-from utils.callbacks import Callbacks  
-from utils.dataloaders import create_dataloader  
-from utils.downloads import attempt_download, is_url  
-from utils.general import (  
+from utils.torch_utils import de_parallel, EarlyStopping, ModelEMA, select_device, smart_DDP, smart_resume, torch_distributed_zero_first
+from models.common import Requant
+import val as validate
+from models.experimental import attempt_load
+from models.yolo import Model
+from utils.autobatch import check_train_batch_size
+from utils.callbacks import Callbacks
+from utils.dataloaders import create_dataloader
+from utils.downloads import attempt_download, is_url
+from utils.general import (
     LOGGER, TQDM_BAR_FORMAT, check_dataset, check_file, check_img_size, check_suffix, check_yaml,
     colorstr, get_latest_run, increment_path, init_seeds, intersect_dicts, labels_to_class_weights,
     labels_to_image_weights, methods, one_cycle, one_flat_cycle, print_args, print_mutation,
     strip_optimizer, yaml_save
 )
-from utils.loggers import Loggers  
-from utils.loggers.comet.comet_utils import check_comet_resume  
-from utils.loss_tal import RN_ComputeLoss  
-from utils.metrics import fitness  
-from utils.plots import plot_evolve  
-from utils.lion import Lion  
+from utils.loggers import Loggers
+from utils.loggers.comet.comet_utils import check_comet_resume
+from utils.loss_tal import RN_ComputeLoss
+from utils.metrics import fitness
+from utils.plots import plot_evolve
+from utils.lion import Lion
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]
@@ -93,12 +93,12 @@ def tie_requant_observers_fx(model: torch.nn.Module) -> torch.nn.Module:
         return model
     except Exception:
         return model
-    
+
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", -1))
 RANK = int(os.getenv("RANK", -1))
 WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
 GIT_INFO = None
-compiled_val = None 
+compiled_val = None
 torch.backends.cudnn.benchmark = True
 
 def train(hyp, opt, device, callbacks):
@@ -163,7 +163,6 @@ def train(hyp, opt, device, callbacks):
         LOGGER.info(f'Resuming training with model from {weights}')
     else:
         if pretrained:
-            # For transfer learning (not resuming), create a new model and load compatible weights.
             model = Model(
                 cfg or ckpt["model"].yaml, ch=3, nc=nc, anchors=hyp.get("anchors"), qat=opt.qat
             ).to(device)
@@ -355,17 +354,12 @@ def train(hyp, opt, device, callbacks):
             opt_dict = {
                 "max_autotune": True,
                 "coordinate_descent_tuning": True,
-                # "epilogue_fusion": True,
                 "shape_padding": True,
                 "use_fast_math": True,
                 "triton.cudagraphs": True,
             }
             model = torch.compile(
-                model,
-                backend="inductor",
-                fullgraph=True,
-                dynamic=False,
-                options=opt_dict
+                model, backend="inductor", fullgraph=True, dynamic=False, options=opt_dict
             )
 
     ema = None
@@ -449,12 +443,15 @@ def train(hyp, opt, device, callbacks):
             self.next_paths = None
             self.next_shapes = None
             self.reset()
+
         def __len__(self):
             return len(self.base)
+
         def reset(self):
             self.iterator = iter(self.base)
             self.next_imgs = None
             self._preload()
+
         def _preload(self):
             try:
                 imgs, targets, paths, shapes = next(self.iterator)
@@ -473,8 +470,10 @@ def train(hyp, opt, device, callbacks):
                 self.next_targets = targets
                 self.next_paths = paths
                 self.next_shapes = shapes
+
         def __iter__(self):
             return self
+
         def __next__(self):
             torch.cuda.current_stream().wait_stream(self.stream)
             if self.next_imgs is None:
@@ -605,7 +604,9 @@ def train(hyp, opt, device, callbacks):
         if RANK in {-1, 0}:
             callbacks.run("on_train_epoch_end", epoch=epoch)
             if ema:
-                ema.update_attr(model, include=["yaml", "nc", "hyp", "names", "stride", "class_weights"])
+                ema.update_attr(
+                    model, include=["yaml", "nc", "hyp", "names", "stride", "class_weights"]
+                )
 
             final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
 
@@ -640,6 +641,7 @@ def train(hyp, opt, device, callbacks):
             callbacks.run("on_fit_epoch_end", log_vals, epoch, best_fitness, fi)
 
             if (not nosave) or (final_epoch and not evolve):
+
                 def _clone_for_save(mm):
                     m2 = deepcopy(de_parallel(mm)).float()
                     for _m in m2.modules():
@@ -649,6 +651,7 @@ def train(hyp, opt, device, callbacks):
                             except Exception:
                                 pass
                     return m2
+
                 ckpt_model = _clone_for_save(model)
                 ckpt_ema = _clone_for_save(ema.ema) if ema else None
                 ckpt = {
@@ -760,11 +763,7 @@ def parse_opt(known=False):
         "--single-cls", action="store_true", help="train multi-class data as single-class"
     )
     parser.add_argument(
-        "--optimizer",
-        type=str,
-        choices=["SGD", "AdamW", "LION"],
-        default="SGD",
-        help="optimizer"
+        "--optimizer", type=str, choices=["SGD", "AdamW", "LION"], default="LION", help="optimizer"
     )
     parser.add_argument(
         "--sync-bn", action="store_true", help="use SyncBatchNorm, only available in DDP mode"
@@ -839,54 +838,48 @@ def main(opt, callbacks=Callbacks()):
     if RANK in {-1, 0}:
         print_args(vars(opt))
 
-    if opt.qat and opt.amp:
-        opt.amp = False
-
     if opt.resume and not check_comet_resume(opt) and not opt.evolve:
         last = Path(check_file(opt.resume) if isinstance(opt.resume, str) else get_latest_run())
-        opt_yaml = last.parent.parent / "opt.yaml"
-        opt_data = opt.data
+        opt_yaml = last.parent.parent / 'opt.yaml'  # train options yaml
+        opt_data = opt.data  # original dataset
         if opt_yaml.is_file():
-            with open(opt_yaml, errors="ignore") as f:
+            with open(opt_yaml, errors='ignore') as f:
                 d = yaml.safe_load(f)
         else:
-            d = torch.load(last, map_location="cpu", weights_only=False)["opt"]
-        opt = argparse.Namespace(**d)
-        opt.cfg, opt.weights, opt.resume = "", str(last), True
+            d = torch.load(last, map_location='cpu')['opt']
+        opt = argparse.Namespace(**d)  # replace
+        opt.cfg, opt.weights, opt.resume = '', str(last), True  # reinstate
         if is_url(opt_data):
-            opt.data = check_file(opt_data)
+            opt.data = check_file(opt_data)  # avoid HUB resume auth timeout
     else:
-        opt.data, opt.cfg, opt.hyp, opt.weights, opt.project = (
-            check_file(opt.data),
-            check_yaml(opt.cfg),
-            check_yaml(opt.hyp),
-            str(opt.weights),
-            str(opt.project),
-        )
-        assert len(opt.cfg) or len(opt.weights), "either --cfg or --weights must be specified"
+        opt.data, opt.cfg, opt.hyp, opt.weights, opt.project = \
+            check_file(opt.data), check_yaml(opt.cfg), check_yaml(opt.hyp), str(opt.weights), str(opt.project)  # checks
+        assert len(opt.cfg) or len(opt.weights), 'either --cfg or --weights must be specified'
         if opt.evolve:
-            if opt.project == str(ROOT / "runs/train"):
-                opt.project = str(ROOT / "runs/evolve")
-            opt.exist_ok, opt.resume = opt.resume, False
-        if opt.name == "exp":
-            opt.name = Path(opt.cfg).stem
+            if opt.project == str(
+                ROOT / 'runs/train'
+            ):  # if default project name, rename to runs/evolve
+                opt.project = str(ROOT / 'runs/evolve')
+            opt.exist_ok, opt.resume = opt.resume, False  # pass resume to exist_ok and disable resume
+        if opt.name == 'cfg':
+            opt.name = Path(opt.cfg).stem  # use model.yaml as name
         opt.save_dir = str(increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok))
 
     device = select_device(opt.device, batch_size=opt.batch_size)
-
     if LOCAL_RANK != -1:
-        msg = "is not compatible with YOLO Multi-GPU DDP training"
-        assert not opt.image_weights, f"--image-weights {msg}"
-        assert not opt.evolve, f"--evolve {msg}"
-        assert opt.batch_size != -1, f"AutoBatch with --batch-size -1 {msg}, please pass a valid --batch-size"
-        assert opt.batch_size % WORLD_SIZE == 0, f"--batch-size {opt.batch_size} must be multiple of WORLD_SIZE"
-        assert torch.cuda.device_count() > LOCAL_RANK, "insufficient CUDA devices for DDP command"
+        msg = 'is not compatible with YOLO Multi-GPU DDP training'
+        assert not opt.image_weights, f'--image-weights {msg}'
+        assert not opt.evolve, f'--evolve {msg}'
+        assert opt.batch_size != -1, f'AutoBatch with --batch-size -1 {msg}, please pass a valid --batch-size'
+        assert opt.batch_size % WORLD_SIZE == 0, f'--batch-size {opt.batch_size} must be multiple of WORLD_SIZE'
+        assert torch.cuda.device_count() > LOCAL_RANK, 'insufficient CUDA devices for DDP command'
         torch.cuda.set_device(LOCAL_RANK)
-        device = torch.device("cuda", LOCAL_RANK)
+        device = torch.device('cuda', LOCAL_RANK)
         dist.init_process_group(backend="nccl" if dist.is_nccl_available() else "gloo")
 
     if not opt.evolve:
         train(opt.hyp, opt, device, callbacks)
+
     else:
         meta = {
             'lr0': (1, 1e-5, 1e-1), 'lrf': (1, 0.01, 1.0), 'momentum': (0.3, 0.6, 0.98),

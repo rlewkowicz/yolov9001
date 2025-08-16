@@ -16,7 +16,7 @@ optimizer:
   LION:
     lr_scheduler_type: cosine
     lr0: 0.00005
-    lrf: 0.05
+    lrf: 0.001
     b1: 0.9
     b2: 0.999
     alpha: 27
@@ -36,7 +36,7 @@ optimizer:
     warmup_epochs: 5
     warmup_momentum: 0.8
     warmup_bias_lr: 0.002
-box: 7.5
+box: 7.6
 cls: 0.5
 cls_pw: 1.0
 obj: 0.77
@@ -54,6 +54,6 @@ shear: 0.0
 perspective: 0.0
 flipud: 0.0
 fliplr: 0.5
-mosaic: 0.5
+mosaic: 0.3
 mixup: 0.00
 copy_paste: 0.00
