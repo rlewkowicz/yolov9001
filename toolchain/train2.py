@@ -58,7 +58,6 @@ def _toggle_dfl_int8(model: torch.nn.Module, enabled: bool):
 # Trainer
 # -----------------------------------------------------------------------------
 class Trainer:
-    """Modern training class with EMA, per-group LR, warmup, and schedulers."""
     def __init__(self, opt, device):
         self.opt = opt
         self.device = device
@@ -78,7 +77,6 @@ class Trainer:
         self.nc = int(self.data_dict['nc'])
         self.names = self.data_dict['names']
 
-        # Build / load model
         if opt.use_graph and self.last_graph.exists():
             LOGGER.info(f"Loading exported graph from {self.last_graph}...")
             self.model = torch.export.load(str(self.last_graph)).to(self.device)
@@ -104,31 +102,27 @@ class Trainer:
             else:
                 LOGGER.info("Skipping model compilation for fast startup.")
 
-        # Stride / image size
         self.gs = 32
         if hasattr(self.model, 'stride'):
             self.gs = max(int(self.model.stride.max()), 32)
         self.imgsz = check_img_size(opt.imgsz, self.gs, floor=self.gs * 2)
 
-        # Optimizer + scheduler + loss + EMA
         self.optimizer = self._setup_optimizer()
         self.scheduler, self._lf_epoch = self._setup_scheduler()
         self.loss_fn = RN_ComputeLoss(self.model)
-        self.ema = ModelEMA(self.model)
 
-        # AMP scaler
+        base_for_ema = self.model._orig_mod if hasattr(self.model, '_orig_mod') else self.model
+        self.ema = ModelEMA(base_for_ema)
+
         self.scaler = torch.amp.GradScaler(self.device.type, enabled=True)
 
-        # Checkpoint resume
         self.start_epoch = 0
         self.best_fitness = 0.0
         if opt.resume:
             self.load_checkpoint(opt.weights)
 
-        # Data
         self.train_loader, self.dataset, self.val_loader = self._setup_dataloaders()
 
-        # Live logging
         self.global_step = 0
         self.tb = None
         if getattr(opt, "tb", False):
@@ -139,13 +133,10 @@ class Trainer:
             except Exception as e:
                 LOGGER.warning(f"TensorBoard not available: {e}")
 
-        # Accumulation
         self._nbs = 64
         self.accumulate = max(round(self._nbs / max(1, self.opt.batch_size)), 1)
 
-    # ------- optimizer / scheduler builders ---------------------------------
     def _setup_optimizer(self):
-        """Sets up optimizer with per-group learning rates."""
         optimizer_settings = self.hyp['optimizer'][self.opt.optimizer]
         uncompiled = self.model._orig_mod if hasattr(self.model, '_orig_mod') else self.model
 
@@ -205,7 +196,6 @@ class Trainer:
             raise NotImplementedError(f"Optimizer {self.opt.optimizer} not implemented.")
 
     def _setup_scheduler(self):
-        """Sets up the learning rate scheduler."""
         optimizer_settings = self.hyp['optimizer'][self.opt.optimizer]
         lr_scheduler_type = optimizer_settings.get("lr_scheduler_type", "cosine")
         lrf = optimizer_settings['lrf']
@@ -221,17 +211,13 @@ class Trainer:
 
         return lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lf), lf
 
-    # ------- data ------------------------------------------------------------
     def _setup_dataloaders(self):
-        """Sets up training and validation dataloaders."""
         LOGGER.info("Setting up dataloaders...")
         train_loader, dataset = create_dataloader(self.train_path, self.imgsz, self.opt.batch_size, self.gs, single_cls=False, hyp=self.hyp, augment=True, rect=self.opt.rect, workers=self.opt.workers, prefix=colorstr('train: '), cache=self.opt.cache, shuffle=True)
         val_loader = create_dataloader(self.val_path, self.imgsz, self.opt.batch_size, self.gs, single_cls=False, hyp=self.hyp, workers=self.opt.workers, prefix=colorstr('val: '), cache=self.opt.cache)[0]
         return train_loader, dataset, val_loader
 
-    # ------- training --------------------------------------------------------
     def train(self):
-        """Main training loop."""
         LOGGER.info(f"Starting training from epoch {self.start_epoch} for {self.opt.epochs} epochs...")
         optim_set = self.hyp['optimizer'][self.opt.optimizer]
         nb = len(self.train_loader)
@@ -264,7 +250,6 @@ class Trainer:
         if self.tb: self.tb.close()
 
     def _train_epoch(self, epoch, nw, last_opt_step):
-        """Runs a single training epoch."""
         self.model.train()
         pbar = tqdm(self.train_loader, total=len(self.train_loader), bar_format=TQDM_BAR_FORMAT, desc=f'Epoch {epoch}/{self.opt.epochs}')
         mloss = torch.zeros(3, device=self.device)
@@ -308,25 +293,26 @@ class Trainer:
 
         return mloss.detach(), last_opt_step
 
-    # ------- validation / ckpt ----------------------------------------------
     def _run_validation(self):
-        """Runs validation on the EMA model."""
         model_to_validate = self.ema.ema
         _toggle_dfl_int8(model_to_validate, True)
         LOGGER.info("Running validation...")
         try:
+            model_to_validate.eval()
             results, maps, _ = validate.run(data=self.data_dict, batch_size=self.opt.batch_size, imgsz=self.imgsz, model=model_to_validate, dataloader=self.val_loader, save_dir=self.save_dir, compute_loss=self.loss_fn, half=True, plots=False)
         finally:
             _toggle_dfl_int8(model_to_validate, False)
         return results, maps
 
     def save_checkpoint(self, epoch, is_best):
-        """Saves the current model checkpoint."""
+        model_sd = (self.model._orig_mod if hasattr(self.model, '_orig_mod') else self.model).state_dict()
+        ema_sd = self.ema.ema.state_dict()
         checkpoint = {
             'epoch': epoch,
             'best_fitness': self.best_fitness,
-            'model_state_dict': deepcopy(self.model).state_dict(),
-            'ema_state_dict': deepcopy(self.ema.ema).state_dict(),
+            'model_state_dict': model_sd,
+            'ema_state_dict': ema_sd,
+            'ema_updates': getattr(self.ema, 'updates', 0),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scaler_state_dict': self.scaler.state_dict(),
             'opt': vars(self.opt),
@@ -337,7 +323,6 @@ class Trainer:
             torch.save(checkpoint, self.best_pt)
 
     def load_checkpoint(self, path):
-        """Loads a model checkpoint to resume training."""
         if not Path(path).exists():
             LOGGER.warning(f"Checkpoint not found at {path}. Starting from scratch.")
             return
@@ -348,12 +333,16 @@ class Trainer:
         self.scaler.load_state_dict(ckpt['scaler_state_dict'])
         if 'ema_state_dict' in ckpt:
             self.ema.ema.load_state_dict(ckpt['ema_state_dict'])
+        if 'ema_updates' in ckpt:
+            try:
+                self.ema.updates = ckpt['ema_updates']
+            except Exception:
+                pass
         self.start_epoch = ckpt['epoch'] + 1
         self.best_fitness = ckpt.get('best_fitness', 0.0)
         LOGGER.info(f"Resumed from epoch {self.start_epoch}. Best fitness: {self.best_fitness:.5f}")
 
     def export_graph(self):
-        """Exports the model graph for faster inference."""
         try:
             LOGGER.info("Exporting model graph...")
             model_to_export = self.ema.ema._orig_mod if hasattr(self.ema.ema, '_orig_mod') else self.ema.ema
@@ -363,6 +352,7 @@ class Trainer:
             LOGGER.info(f"Successfully saved exported graph to {self.last_graph}")
         except Exception as e:
             LOGGER.error(f"Failed to export model graph: {e}")
+
 
 # -----------------------------------------------------------------------------
 # CLI
