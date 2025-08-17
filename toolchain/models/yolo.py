@@ -23,12 +23,11 @@ from utils.tal.anchor_generator import make_anchors, dist2bbox
 from utils.torch_utils import initialize_weights, model_info
 
 class RN_DualDDetect(nn.Module):
-    """Detection head for YOLO, adapted for dual outputs."""
+    """Dual-head detection with distributional regression (DFL) and optional Requant blocks."""
     dynamic = False
     export = False
     shape = None
     anchors = torch.empty(0)
-    strides = torch.empty(0)
 
     def __init__(self, nc=80, ch=(), inplace=True):
         super().__init__()
@@ -37,9 +36,12 @@ class RN_DualDDetect(nn.Module):
         self.reg_max = 16
         self.no = nc + self.reg_max * 4
         self.inplace = inplace
-        self.stride = torch.zeros(self.nl)
+
+        # keep stride as a registered buffer to avoid device hops
+        self.register_buffer("stride", torch.zeros(self.nl), persistent=True)
         self.export_logits = True
 
+        # head-1 heads
         c2 = make_divisible(max((ch[0] // 4, self.reg_max * 4, 16)), 4)
         c3 = max(ch[0], min(self.nc * 2, 128))
         self.cv2 = nn.ModuleList(
@@ -53,6 +55,7 @@ class RN_DualDDetect(nn.Module):
         )
         self.dfl = DFL(self.reg_max)
 
+        # head-2 heads
         c4 = make_divisible(max((ch[self.nl] // 4, self.reg_max * 4, 16)), 4)
         c5 = max(ch[self.nl], min(self.nc * 2, 128))
         self.cv4 = nn.ModuleList(
@@ -89,12 +92,17 @@ class RN_DualDDetect(nn.Module):
         for i in range(nl):
             d2.append(
                 rq2(
-                    torch.cat((self.cv4[i](x[input_offset + i]), self.cv5[i](x[input_offset + i])),
-                              1)
+                    torch.cat(
+                        (self.cv4[i](x[input_offset + i]), self.cv5[i](x[input_offset + i])),
+                        1
+                    )
                 )
             )
 
-        anc, strd = (t.transpose(0, 1) for t in make_anchors(d2, self.stride, 0.5))
+        # strides: already on correct device via registered buffer; match dtype only
+        strides_local = self.stride.to(dtype=d2[0].dtype)
+
+        anc, strd = (t.transpose(0, 1) for t in make_anchors(d2, strides_local, 0.5))
         box2, cls2 = torch.cat([di.view(shape[0], self.no, -1) for di in d2],
                                2).split((self.reg_max * 4, self.nc), 1)
 
@@ -108,53 +116,66 @@ class RN_DualDDetect(nn.Module):
         return y_main if self.export else (y_main, d2)
 
     def bias_init(self):
-        """Initialize biases for objectness and classification scores."""
+        """Initialize biases for classification logits similarly to YOLO practice."""
         if hasattr(self, "cv2"):
             for a, b, s in zip(self.cv2, self.cv3, self.stride):
-                a[-1].bias.data[:] = 1.0  # obj bias
-                b[-1].bias.data[:self.nc] = math.log(5 / self.nc / (640 / s)**2)  # cls bias
+                a[-1].bias.data[:] = 1.0
+                b[-1].bias.data[:self.nc] = math.log(5 / self.nc / (640 / s)**2)
         for a, b, s in zip(self.cv4, self.cv5, self.stride):
-            a[-1].bias.data[:] = 1.0  # obj bias
-            b[-1].bias.data[:self.nc] = math.log(5 / self.nc / (640 / s)**2)  # cls bias
+            a[-1].bias.data[:] = 1.0
+            b[-1].bias.data[:self.nc] = math.log(5 / self.nc / (640 / s)**2)
 
 class Model(nn.Module):
-    def __init__(self, cfg='yolo.yaml', ch=3, nc=None, hyp=None, anchors=None):
+    """
+    Top-level YOLO model that parses the provided YAML into a module graph
+    and wires an RN_DualDDetect head. Designed to be compile-friendly.
+    """
+
+    def __init__(self, cfg="yolo.yaml", ch=3, nc=None, hyp=None, anchors=None):
         super().__init__()
         self.hyp = hyp
         if isinstance(cfg, dict):
             self.yaml = cfg
         else:
             import yaml
+
             self.yaml_file = Path(cfg).name
             with open(cfg, encoding="ascii", errors="ignore") as f:
                 self.yaml = yaml.safe_load(f)
 
-        ch = self.yaml['ch'] = self.yaml.get('ch', ch)
-        if nc and nc != self.yaml['nc']:
+        # channel, classes, anchors overrides
+        ch = self.yaml["ch"] = self.yaml.get("ch", ch)
+        if nc and nc != self.yaml["nc"]:
             LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
-            self.yaml['nc'] = nc
+            self.yaml["nc"] = nc
         if anchors:
-            LOGGER.info(f"Overriding model.yaml anchors with passed anchors")
-            self.yaml['anchors'] = anchors
+            LOGGER.info("Overriding model.yaml anchors with passed anchors")
+            self.yaml["anchors"] = anchors
 
+        # build
         self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])
-        self.names = [str(i) for i in range(self.yaml['nc'])]
-        self.inplace = self.yaml.get('inplace', True)
+        self.names = [str(i) for i in range(self.yaml["nc"])]
+        self.inplace = self.yaml.get("inplace", True)
 
+        # detect head setup (stride probe)
         m = self.model[-1]
         if isinstance(m, RN_DualDDetect):
             s = 256
             m.inplace = self.inplace
-            dummy_input = torch.zeros(1, ch, s, s)
-            dummy_feats = self._forward_once(dummy_input, get_feats=True)
-            m.stride = torch.tensor([s / x.shape[-2] for x in dummy_feats])
-            self.stride = m.stride
-            m.bias_init()
+            with torch.no_grad():
+                dummy_input = torch.zeros(1, ch, s, s)
+                dummy_feats = self._forward_once(dummy_input, get_feats=True)
+                strides = torch.tensor([s / x.shape[-2] for x in dummy_feats],
+                                       device=m.stride.device, dtype=m.stride.dtype)
+                m.stride.data.copy_(strides)
+                self.stride = m.stride
+                m.bias_init()
 
         initialize_weights(self)
         self.info()
 
-    def _forward_once(self, x, get_feats=False):
+    # ---- forward helpers ----
+    def _forward_once(self, x, get_feats: bool = False):
         y = []
         head_input = []
         for m in self.model:
@@ -164,17 +185,14 @@ class Model(nn.Module):
             y.append(x if m.i in self.save else None)
             if isinstance(m, RN_DualDDetect):
                 head_input = [y[j] for j in m.f]
-
-        if get_feats:
-            return head_input
-        return x
+        return head_input if get_feats else x
 
     def forward(self, x, **kwargs):
         return self._forward_once(x)
 
-    def info(self, verbose=False, img_size=640):
+    # ---- utils ----
+    def info(self, verbose: bool = False, img_size: int = 640):
         model_info(self, verbose, img_size)
-
 
 def parse_model(d, ch):
     """Parses a model dictionary and builds the layers."""

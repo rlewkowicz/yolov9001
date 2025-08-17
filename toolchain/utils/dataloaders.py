@@ -1,25 +1,38 @@
+# utils/dataloaders.py
+
 import contextlib
 import glob
 import hashlib
-import math
 import os
 import random
-from itertools import repeat
-from multiprocessing.pool import Pool, ThreadPool
+from multiprocessing.pool import ThreadPool
 from pathlib import Path
+from typing import List, Tuple, Union
 
 import numpy as np
 import psutil
 import torch
 import torch.nn.functional as F
 from PIL import ExifTags, Image
-from torch.utils.data import DataLoader, Dataset, distributed
+from torch.utils.data import Dataset, distributed
 from tqdm import tqdm
 
-from utils.augmentations import Albumentations, augment_hsv, copy_paste, letterbox, mixup, random_perspective
+from utils.augmentations import (
+    Albumentations,
+    augment_hsv,
+    copy_paste,
+    letterbox,
+    mixup,
+    random_perspective,
+)
 from utils.general import (
-    LOGGER, NUM_THREADS, TQDM_BAR_FORMAT, check_requirements, clean_str, cv2, segments2boxes,
-    xywhn2xyxy, xyxy2xywhn
+    LOGGER,
+    NUM_THREADS,
+    TQDM_BAR_FORMAT,
+    cv2,
+    segments2boxes,
+    xywhn2xyxy,
+    xyxy2xywhn,
 )
 from utils.torch_utils import torch_distributed_zero_first
 
@@ -27,24 +40,29 @@ IMG_FORMATS = ("bmp", "dng", "jpeg", "jpg", "mpo", "png", "tif", "tiff", "webp",
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", -1))
 RANK = int(os.getenv("RANK", -1))
 
+# EXIF Orientation key
 for orientation in ExifTags.TAGS.keys():
     if ExifTags.TAGS[orientation] == "Orientation":
         break
 
+# --- TurboJPEG (keep both FASTUPSAMPLE + FASTDCT flags) ---
 try:
     from turbojpeg import TurboJPEG, TJFLAG_FASTUPSAMPLE, TJFLAG_FASTDCT
+
     _JPEG_TURBO = TurboJPEG()
     LOGGER.info("TurboJPEG enabled for faster JPG decoding.")
 except ImportError:
     _JPEG_TURBO = None
 
-def get_hash(paths):
+
+def get_hash(paths: List[str]) -> str:
     size = sum(os.path.getsize(p) for p in paths if os.path.exists(p))
     h = hashlib.md5(str(size).encode())
     h.update("".join(paths).encode())
     return h.hexdigest()
 
-def exif_size(img):
+
+def exif_size(img: Image.Image) -> Tuple[int, int]:
     s = img.size
     with contextlib.suppress(Exception):
         rotation = dict(img._getexif().items())[orientation]
@@ -52,10 +70,56 @@ def exif_size(img):
             s = (s[1], s[0])
     return s
 
+
 def seed_worker(worker_id):
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
+
+
+def _free_ram_fraction() -> float:
+    mem = psutil.virtual_memory()
+    return float(mem.available) / float(mem.total) if mem.total else 0.0
+
+
+def _resolve_cache_mode(cache, prefix: str):
+    """
+    Normalize the cache mode: False | 'ram' | 'disk' | 'hybrid'
+    Behavior:
+      - For any mode that uses RAM ('ram' or 'hybrid'), if free RAM < 30% at the start of this pass,
+        fall back to 'disk'.
+      - Validation/Test are NOT forced to disk; they follow the same rule as train.
+      - True is treated like 'ram'.
+    """
+    pref = (prefix or "").lower()
+    is_train = "train" in pref
+
+    # Normalize input
+    mode = cache
+    if mode is True:
+        mode = "ram"
+    if isinstance(mode, str):
+        mode = mode.lower()
+        if mode not in ("ram", "disk", "hybrid"):
+            mode = False
+
+    # RAM guard
+    if mode in ("ram", "hybrid"):
+        frac = _free_ram_fraction()
+        if frac < 0.30:
+            LOGGER.warning(
+                f"{prefix}Free RAM < 30% ({frac:.1%}), falling back to disk cache for this pass."
+            )
+            mode = "disk"
+        else:
+            LOGGER.info(f"{prefix}Using {mode} cache (free RAM {frac:.1%}).")
+    elif mode == "disk":
+        LOGGER.info(f"{prefix}Using disk cache.")
+    else:
+        LOGGER.info(f"{prefix}No image caching.")
+
+    return mode
+
 
 def create_dataloader(
     path,
@@ -65,14 +129,21 @@ def create_dataloader(
     single_cls=False,
     hyp=None,
     augment=False,
-    cache=False,
+    cache=False,  # False | True | 'ram' | 'disk' | 'hybrid'
     pad=0.0,
     rect=False,
     rank=-1,
     workers=8,
     prefix="",
-    shuffle=False
+    shuffle=False,
+    **_ignored,  # allow compatibility args from older callsites (image_weights, quad, etc.)
 ):
+    """
+    Returns (InfiniteDataLoader, dataset)
+    Accepts extra kwargs to stay compatible with legacy callers (ignored).
+    """
+    cache_mode = _resolve_cache_mode(cache, prefix)
+
     with torch_distributed_zero_first(rank):
         dataset = LoadImagesAndLabels(
             path,
@@ -80,8 +151,8 @@ def create_dataloader(
             batch_size,
             augment=augment,
             hyp=hyp,
-            rect=False,
-            cache_images=cache,
+            rect=rect,                # respect caller; your training uses fixed-size via letterbox(auto=False)
+            cache_images=cache_mode,  # normalized: False|'ram'|'disk'|'hybrid'
             single_cls=single_cls,
             stride=int(stride),
             pad=pad,
@@ -91,6 +162,8 @@ def create_dataloader(
     n = len(dataset)
     if batch_size < 1:
         batch_size = 1
+
+    # make batch divide dataset length if possible (keeps epoch steps stable)
     if n % batch_size != 0:
         target = batch_size
         best = None
@@ -131,19 +204,18 @@ def create_dataloader(
         sampler=sampler,
         pin_memory=True,
         collate_fn=LoadImagesAndLabels.collate_fn,
-        worker_init_fn=seed_worker
+        worker_init_fn=seed_worker,
     )
     if nw > 0:
-        loader_kwargs.update({'persistent_workers': True, 'prefetch_factor': 2})
+        loader_kwargs.update({"persistent_workers": True, "prefetch_factor": 2})
 
     return InfiniteDataLoader(**loader_kwargs), dataset
-
 
 
 class InfiniteDataLoader(torch.utils.data.dataloader.DataLoader):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        object.__setattr__(self, 'batch_sampler', _RepeatSampler(self.batch_sampler))
+        object.__setattr__(self, "batch_sampler", _RepeatSampler(self.batch_sampler))
         self.iterator = super().__iter__()
 
     def __len__(self):
@@ -153,6 +225,7 @@ class InfiniteDataLoader(torch.utils.data.dataloader.DataLoader):
         for _ in range(len(self)):
             yield next(self.iterator)
 
+
 class _RepeatSampler:
     def __init__(self, sampler):
         self.sampler = sampler
@@ -160,6 +233,7 @@ class _RepeatSampler:
     def __iter__(self):
         while True:
             yield from iter(self.sampler)
+
 
 class LoadImagesAndLabels(Dataset):
     cache_version = 0.8
@@ -172,40 +246,45 @@ class LoadImagesAndLabels(Dataset):
         augment=False,
         hyp=None,
         rect=False,
-        cache_images=False,
+        cache_images=False,  # False | 'ram' | 'disk' | 'hybrid'
         single_cls=False,
         stride=32,
         pad=0.0,
-        prefix=""
+        prefix="",
     ):
-        self.img_size = img_size
+        self.img_size = int(img_size)
         self.augment = augment
-        self.hyp = hyp
+        self.hyp = hyp or {}
         self.rect = rect
         self.mosaic = augment and not rect
         self.mosaic_border = [-img_size // 2, -img_size // 2]
         self.stride = stride
         self.path = path
+        self.pad = pad
+        self.single_cls = single_cls
         self.albumentations = Albumentations(size=img_size) if augment else None
 
         self.im_files = self._get_image_files(prefix)
         self.label_files = [
-            Path(x).with_suffix('.txt').as_posix().replace('images', 'labels')
-            for x in self.im_files
+            Path(x).with_suffix(".txt").as_posix().replace("images", "labels") for x in self.im_files
         ]
 
-        cache_path = Path(path).with_suffix(".cache") if isinstance(path, str) else Path(
-            self.im_files[0]
-        ).parent.with_suffix('.cache')
+        cache_path = (
+            Path(path).with_suffix(".cache")
+            if isinstance(path, str)
+            else Path(self.im_files[0]).parent.with_suffix(".cache")
+        )
         self._cache_labels(cache_path, prefix)
 
         self.n = len(self.im_files)
         self.indices = range(self.n)
 
-        self.ims = [None] * self.n
-        self.npy_files = [Path(f).with_suffix('.npy') for f in self.im_files]
+        self.ims: List[Union[np.ndarray, None]] = [None] * self.n
+        self.npy_files = [Path(f).with_suffix(".npy") for f in self.im_files]
         if cache_images:
             self._init_image_cache(cache_images, prefix)
+
+    # ---------- file discovery / labels cache ----------
 
     def _get_image_files(self, prefix):
         try:
@@ -221,9 +300,9 @@ class LoadImagesAndLabels(Dataset):
                         f += [x.replace("./", parent) if x.startswith("./") else x for x in lines]
                 else:
                     raise FileNotFoundError(f"{prefix}{p} does not exist")
-            im_files = sorted([
-                x.replace("/", os.sep) for x in f if x.split(".")[-1].lower() in IMG_FORMATS
-            ])
+            im_files = sorted(
+                [x.replace("/", os.sep) for x in f if x.split(".")[-1].lower() in IMG_FORMATS]
+            )
             assert im_files, f"{prefix}No images found"
             return im_files
         except Exception as e:
@@ -232,12 +311,12 @@ class LoadImagesAndLabels(Dataset):
     def _cache_labels(self, path, prefix):
         try:
             cache, exists = torch.load(path), True
-            assert cache['version'] == self.cache_version
-            assert cache['hash'] == get_hash(self.im_files + self.label_files)
+            assert cache["version"] == self.cache_version
+            assert cache["hash"] == get_hash(self.im_files + self.label_files)
         except Exception:
             cache, exists = self._create_label_cache(path, prefix), False
 
-        nf, nm, ne, nc, n = cache.pop('results')
+        nf, nm, ne, nc, n = cache.pop("results")
         if exists:
             LOGGER.info(
                 f"Scanning '{path}' for images and labels... {nf} found, {nm} missing, {ne} empty, {nc} corrupt"
@@ -245,31 +324,35 @@ class LoadImagesAndLabels(Dataset):
 
         assert nf > 0 or not self.augment, f"{prefix}No labels found in {path}, can not start training."
 
-        [cache.pop(k) for k in ('hash', 'version')]
-        self.labels = [np.array(x['labels'], dtype=np.float32) for x in cache.values()]
-        self.shapes = np.array([x['shape'] for x in cache.values()], dtype=np.float64)
+        [cache.pop(k) for k in ("hash", "version")]
+        self.labels = [np.array(x["labels"], dtype=np.float32) for x in cache.values()]
+        self.shapes = np.array([x["shape"] for x in cache.values()], dtype=np.float64)
         self.im_files = list(cache.keys())
         self.label_files = [
-            Path(x).with_suffix('.txt').as_posix().replace('images', 'labels')
-            for x in self.im_files
+            Path(x).with_suffix(".txt").as_posix().replace("images", "labels") for x in self.im_files
         ]
+
+        if self.single_cls:
+            for i in range(len(self.labels)):
+                if self.labels[i].size:
+                    self.labels[i][:, 0] = 0
 
     def _create_label_cache(self, path, prefix):
         x = {}
         nm, nf, ne, nc = 0, 0, 0, 0
         pbar = tqdm(
             zip(self.im_files, self.label_files),
-            desc=f'{prefix}Scanning images',
+            desc=f"{prefix}Scanning images",
             total=len(self.im_files),
-            bar_format=TQDM_BAR_FORMAT
+            bar_format=TQDM_BAR_FORMAT,
         )
         for im_file, lb_file in pbar:
             try:
                 im = Image.open(im_file)
                 im.verify()
                 shape = exif_size(im)
-                assert (shape[0] > 9) & (shape[1] > 9), f'image size {shape} <10 pixels'
-                assert im.format.lower() in IMG_FORMATS, f'invalid image format {im.format}'
+                assert (shape[0] > 9) & (shape[1] > 9), f"image size {shape} <10 pixels"
+                assert im.format.lower() in IMG_FORMATS, f"invalid image format {im.format}"
 
                 l = []
                 if os.path.exists(lb_file):
@@ -286,9 +369,9 @@ class LoadImagesAndLabels(Dataset):
                                 l = l.reshape(1, 5)
                             else:
                                 l = np.zeros((0, 5), dtype=np.float32)
-                        assert l.shape[1] == 5, 'labels require 5 columns'
-                        assert (l >= 0).all(), 'negative labels'
-                        assert (l[:, 1:] <= 1).all(), 'non-normalized or out of bounds coordinate'
+                        assert l.shape[1] == 5, "labels require 5 columns"
+                        assert (l >= 0).all(), "negative labels"
+                        assert (l[:, 1:] <= 1).all(), "non-normalized or out of bounds coordinate"
                         nf += 1
                     else:
                         l = np.zeros((0, 5), dtype=np.float32)
@@ -297,38 +380,115 @@ class LoadImagesAndLabels(Dataset):
                     l = np.zeros((0, 5), dtype=np.float32)
                     nm += 1
 
-                x[im_file] = {'labels': l, 'shape': shape}
+                x[im_file] = {"labels": l, "shape": shape}
             except Exception as e:
                 nc += 1
-                LOGGER.warning(f'{prefix}WARNING ⚠️ Ignoring corrupt image/label: {im_file}: {e}')
+                LOGGER.warning(f"{prefix}WARNING ⚠️ Ignoring corrupt image/label: {im_file}: {e}")
 
-        x['hash'] = get_hash(self.im_files + self.label_files)
-        x['version'] = self.cache_version
-        x['results'] = nf, nm, ne, nc, len(self.im_files)
+        x["hash"] = get_hash(self.im_files + self.label_files)
+        x["version"] = self.cache_version
+        x["results"] = nf, nm, ne, nc, len(self.im_files)
         torch.save(x, path)
         return x
 
-    def _init_image_cache(self, cache_type, prefix):
-        if cache_type == 'ram' and psutil.virtual_memory(
-        ).available < (self.n * self.img_size**2 * 3) * 0.5:
-            LOGGER.warning("Not enough RAM to cache images, switching to disk cache.")
-            cache_type = 'disk'
+    # ---------- caching ----------
 
-        if cache_type == 'disk':
+    def _estimate_resized_bytes(self, i: int) -> int:
+        """Estimate bytes after resizing to self.img_size, uint8 HxWx3."""
+        h0, w0 = self.shapes[i]
+        r = self.img_size / max(h0, w0)
+        h = int(round(h0 * r))
+        w = int(round(w0 * r))
+        if h <= 0 or w <= 0:
+            return 0
+        return int(h * w * 3)  # uint8, 3 channels
+
+    def _init_image_cache(self, cache_type: str, prefix: str):
+        # If RAM-based mode but we already dipped under 30%, fall back to disk.
+        if cache_type in ("ram", "hybrid") and _free_ram_fraction() < 0.30:
+            LOGGER.warning(f"{prefix}Free RAM < 30% at dataset init; falling back to disk cache.")
+            cache_type = "disk"
+
+        if cache_type == "disk":
             results = ThreadPool(NUM_THREADS).imap(self.cache_image_to_disk, range(self.n))
-        else:
-            results = ThreadPool(NUM_THREADS).imap(self._load_image_to_ram, range(self.n))
+            pbar = tqdm(
+                enumerate(results),
+                total=self.n,
+                bar_format=TQDM_BAR_FORMAT,
+                desc=f"{prefix}Caching images (disk)",
+            )
+            for _ in pbar:
+                pass
+            pbar.close()
+            return
 
-        pbar = tqdm(
-            enumerate(results),
-            total=self.n,
-            bar_format=TQDM_BAR_FORMAT,
-            desc=f'{prefix}Caching images'
-        )
-        for i, im in pbar:
-            if cache_type == 'ram':
+        if cache_type == "ram":
+            results = ThreadPool(NUM_THREADS).imap(self._load_image_to_ram, range(self.n))
+            pbar = tqdm(
+                enumerate(results),
+                total=self.n,
+                bar_format=TQDM_BAR_FORMAT,
+                desc=f"{prefix}Caching images (ram)",
+            )
+            for i, im in pbar:
                 self.ims[i] = im
-        pbar.close()
+            pbar.close()
+            return
+
+        if cache_type == "hybrid":
+            # Budget: use up to 50% of *current* free memory
+            free_bytes = psutil.virtual_memory().available
+            budget = int(0.50 * free_bytes)
+
+            est_bytes = np.array([self._estimate_resized_bytes(i) for i in range(self.n)], dtype=np.int64)
+            cum = est_bytes.cumsum()
+            k = int((cum <= budget).sum())
+
+            if k <= 0:
+                LOGGER.warning(f"{prefix}Hybrid cache: budget too small for RAM, falling back to disk-only.")
+                cache_type = "disk"
+                results = ThreadPool(NUM_THREADS).imap(self.cache_image_to_disk, range(self.n))
+                pbar = tqdm(
+                    enumerate(results),
+                    total=self.n,
+                    bar_format=TQDM_BAR_FORMAT,
+                    desc=f"{prefix}Caching images (disk)",
+                )
+                for _ in pbar:
+                    pass
+                pbar.close()
+                return
+
+            # First k -> RAM
+            results_ram = ThreadPool(NUM_THREADS).imap(self._load_image_to_ram, range(k))
+            pbar = tqdm(
+                enumerate(results_ram),
+                total=k,
+                bar_format=TQDM_BAR_FORMAT,
+                desc=f"{prefix}Caching images (hybrid-ram, ~{budget/1e9:.1f} GB)",
+            )
+            for i, im in pbar:
+                self.ims[i] = im
+            pbar.close()
+
+            # Remaining -> disk
+            if k < self.n:
+                results_disk = ThreadPool(NUM_THREADS).imap(self.cache_image_to_disk, range(k, self.n))
+                pbar2 = tqdm(
+                    enumerate(results_disk),
+                    total=(self.n - k),
+                    bar_format=TQDM_BAR_FORMAT,
+                    desc=f"{prefix}Caching images (hybrid-disk)",
+                )
+                for _ in pbar2:
+                    pass
+                pbar2.close()
+            return
+
+        # else: no caching
+        return
+
+    # ---------- Dataset protocol ----------
 
     def __len__(self):
         return len(self.im_files)
@@ -336,34 +496,39 @@ class LoadImagesAndLabels(Dataset):
     def __getitem__(self, index):
         index = self.indices[index]
         hyp = self.hyp
-        h0 = self.img_size
-        w0 = self.img_size
 
-        if self.mosaic and random.random() < hyp['mosaic']:
-            img, labels = self._load_mosaic(index)
-            if random.random() < hyp['mixup']:
-                img2, labels2 = self._load_mosaic(random.randint(0, self.n - 1))
-                img, labels = mixup(img, labels, img2, labels2)
+        mosaic_flag = bool(self.mosaic and random.random() < hyp.get("mosaic", 0.0))
+
+        if mosaic_flag:
+            # Mosaic path
+            img, labels = self._load_mosaic(index)  # already s x s
+            h0, w0 = img.shape[:2]
+            shapes = (h0, w0)  # training ignores shapes
         else:
+            # Standard path
             img, (h0, w0), (h, w) = self.load_image(index)
             shape = self.img_size
             img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
             labels = self.labels[index].copy()
             if labels.size:
+                # to pixel xyxy with resize+pad applied
                 labels[:, 1:] = xywhn2xyxy(
                     labels[:, 1:], ratio[0] * w, ratio[1] * h, padw=pad[0], padh=pad[1]
                 )
+            shapes = (h0, w0)
+
             if self.augment:
                 img, labels = random_perspective(
                     img,
                     labels,
-                    degrees=hyp['degrees'],
-                    translate=hyp['translate'],
-                    scale=hyp['scale'],
-                    shear=hyp['shear'],
-                    perspective=hyp['perspective']
+                    degrees=hyp.get("degrees", 0.0),
+                    translate=hyp.get("translate", 0.0),
+                    scale=hyp.get("scale", 0.0),
+                    shear=hyp.get("shear", 0.0),
+                    perspective=hyp.get("perspective", 0.0),
                 )
 
+        # Normalize labels back to xywhn in [0,1], clip
         nl = len(labels)
         if nl:
             labels[:, 1:5] = xyxy2xywhn(
@@ -375,33 +540,36 @@ class LoadImagesAndLabels(Dataset):
             wh_ok = (labels[:, 3] > eps) & (labels[:, 4] > eps)
             labels = labels[wh_ok]
 
+        # Albumentations (expects normalized xywh)
         if self.albumentations and len(labels):
             img, labels = self.albumentations(img, labels)
+            if len(labels):
+                labels[:, 1:3] = np.clip(labels[:, 1:3], 1e-6, 1.0 - 1e-6)
+                labels[:, 3:5] = np.clip(labels[:, 3:5], 1e-6, 1.0)
 
+        # Simple color/flip augs
         if self.augment:
-            augment_hsv(img, hgain=hyp['hsv_h'], sgain=hyp['hsv_s'], vgain=hyp['hsv_v'])
-            if random.random() < hyp['flipud']:
+            augment_hsv(img, hgain=hyp.get("hsv_h", 0.0), sgain=hyp.get("hsv_s", 0.0), vgain=hyp.get("hsv_v", 0.0))
+            if random.random() < hyp.get("flipud", 0.0):
                 img = np.flipud(img)
                 if len(labels):
                     labels[:, 2] = 1 - labels[:, 2]
-            if random.random() < hyp['fliplr']:
+            if random.random() < hyp.get("fliplr", 0.0):
                 img = np.fliplr(img)
                 if len(labels):
                     labels[:, 1] = 1 - labels[:, 1]
 
-        labels_out = torch.zeros((len(labels), 6))
+        # Pack labels
+        labels_out = torch.zeros((len(labels), 6), dtype=torch.float32)
         if len(labels):
             labels_out[:, 1:] = torch.from_numpy(labels)
 
-        img_h, img_w = img.shape[:2]
-        if self.mosaic:
-            h0, w0 = img_h, img_w
-
+        # HWC -> CHW, BGR->RGB
         img = img.transpose((2, 0, 1))[::-1]
         img = np.ascontiguousarray(img)
 
-        return torch.from_numpy(img), labels_out, self.im_files[index], (h0, w0)
-
+        shapes_out = shapes  # (h0, w0)
+        return torch.from_numpy(img), labels_out, self.im_files[index], shapes_out
 
     @staticmethod
     def collate_fn(batch):
@@ -410,24 +578,30 @@ class LoadImagesAndLabels(Dataset):
             lb[:, 0] = i
         return torch.stack(im, 0), torch.cat(label, 0), path, shapes
 
-    def _load_image_raw(self, path):
-        if _JPEG_TURBO and Path(path).suffix.lower() in ('.jpg', '.jpeg'):
-            with open(path, 'rb') as f:
-                return _JPEG_TURBO.decode(f.read(), flags=TJFLAG_FASTUPSAMPLE | TJFLAG_FASTDCT)
+    # ---------- image I/O ----------
+
+    def _load_image_raw(self, path: str):
+        # Use TurboJPEG if available (FASTUPSAMPLE | FASTDCT) to preserve previous speed behavior
+        if _JPEG_TURBO and Path(path).suffix.lower() in (".jpg", ".jpeg"):
+            with open(path, "rb") as f:
+                return _JPEG_TURBO.decode(
+                    f.read(), flags=(TJFLAG_FASTUPSAMPLE | TJFLAG_FASTDCT)
+                )
         return cv2.imread(path)
 
-    def _load_image_to_ram(self, i):
+    def _load_image_to_ram(self, i: int):
         im = self._load_image_raw(self.im_files[i])
         assert im is not None, f"Image Not Found {self.im_files[i]}"
         r = self.img_size / max(im.shape[:2])
         if r != 1:
             im = cv2.resize(
-                im, (int(im.shape[1] * r), int(im.shape[0] * r)),
-                interpolation=cv2.INTER_LINEAR if self.augment else cv2.INTER_AREA
+                im,
+                (int(im.shape[1] * r), int(im.shape[0] * r)),
+                interpolation=cv2.INTER_LINEAR if self.augment else cv2.INTER_AREA,
             )
         return im
 
-    def load_image(self, i):
+    def load_image(self, i: int):
         im = self.ims[i]
         if im is None:
             npy_f = self.npy_files[i]
@@ -441,42 +615,96 @@ class LoadImagesAndLabels(Dataset):
             r = self.img_size / max(h0, w0)
             if r != 1:
                 im = cv2.resize(
-                    im, (int(w0 * r), int(h0 * r)),
-                    interpolation=cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA
+                    im,
+                    (int(w0 * r), int(h0 * r)),
+                    interpolation=cv2.INTER_LINEAR if (self.augment or r > 1) else cv2.INTER_AREA,
                 )
             return im, (h0, w0), im.shape[:2]
         return im, self.shapes[i], self.shapes[i]
 
-    def cache_image_to_disk(self, i):
+    def cache_image_to_disk(self, i: int):
         f = self.npy_files[i]
         if not f.exists():
             im, _, _ = self.load_image(i)
             np.save(f.as_posix(), im)
 
+    # ---------- mosaic (robust) ----------
+
     def _load_mosaic(self, index):
+        """Robust 4-image mosaic with safe pasting to prevent broadcast mismatches."""
         labels4 = []
-        s = self.img_size
-        yc, xc = [int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border]
+        s = int(self.img_size)
+        yc = int(random.uniform(-s // 2, 2 * s + s // 2))
+        xc = int(random.uniform(-s // 2, 2 * s + s // 2))
+
         indices = [index] + random.choices(self.indices, k=3)
-        img4 = np.full((s * 2, s * 2, 3), 114, dtype=np.uint8)
+        img4 = np.full((2 * s, 2 * s, 3), 114, dtype=np.uint8)
+
+        def safe_paste(dst, src, x1a, y1a, x2a, y2a, x1b, y1b, x2b, y2b):
+            # ints
+            x1a = int(x1a)
+            y1a = int(y1a)
+            x2a = int(x2a)
+            y2a = int(y2a)
+            x1b = int(x1b)
+            y1b = int(y1b)
+            x2b = int(x2b)
+            y2b = int(y2b)
+
+            # clip to dst/src bounds
+            x1a = max(0, min(x1a, dst.shape[1]))
+            x2a = max(0, min(x2a, dst.shape[1]))
+            y1a = max(0, min(y1a, dst.shape[0]))
+            y2a = max(0, min(y2a, dst.shape[0]))
+
+            x1b = max(0, min(x1b, src.shape[1]))
+            x2b = max(0, min(x2b, src.shape[1]))
+            y1b = max(0, min(y1b, src.shape[0]))
+            y2b = max(0, min(y2b, src.shape[0]))
+
+            da_h = y2a - y1a
+            da_w = x2a - x1a
+            db_h = y2b - y1b
+            db_w = x2b - x1b
+            if da_h <= 0 or da_w <= 0 or db_h <= 0 or db_w <= 0:
+                return None
+
+            h = min(da_h, db_h)
+            w = min(da_w, db_w)
+            y2a = y1a + h
+            x2a = x1a + w
+            y2b = y1b + h
+            x2b = x1b + w
+            if h <= 0 or w <= 0:
+                return None
+
+            dst[y1a:y2a, x1a:x2a] = src[y1b:y2b, x1b:x2b]
+            return (x1a, y1a, x2a, y2a, x1b, y1b, x2b, y2b)
 
         for i, index in enumerate(indices):
             img, _, (h, w) = self.load_image(index)
-            if i == 0:
+
+            if i == 0:  # top-left
                 x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc
                 x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h
-            elif i == 1:
-                x1a, y1a, x2a, y2a = xc, max(yc - h, 0), min(xc + w, s * 2), yc
+            elif i == 1:  # top-right
+                x1a, y1a, x2a, y2a = xc, max(yc - h, 0), min(xc + w, 2 * s), yc
                 x1b, y1b, x2b, y2b = 0, h - (y2a - y1a), min(w, x2a - x1a), h
-            elif i == 2:
-                x1a, y1a, x2a, y2a = max(xc - w, 0), yc, xc, min(s * 2, yc + h)
+            elif i == 2:  # bottom-left
+                x1a, y1a, x2a, y2a = max(xc - w, 0), yc, xc, min(yc + h, 2 * s)
                 x1b, y1b, x2b, y2b = w - (x2a - x1a), 0, w, min(h, y2a - y1a)
-            elif i == 3:
-                x1a, y1a, x2a, y2a = xc, yc, min(xc + w, s * 2), min(s * 2, yc + h)
+            else:  # i == 3, bottom-right
+                x1a, y1a, x2a, y2a = xc, yc, min(xc + w, 2 * s), min(yc + h, 2 * s)
                 x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(h, y2a - y1a)
 
-            img4[y1a:y2a, x1a:x2a] = img[y1b:y2b, x1b:x2b]
-            padw, padh = x1a - x1b, y1a - y1b
+            pasted = safe_paste(img4, img, x1a, y1a, x2a, y2a, x1b, y1b, x2b, y2b)
+
+            if pasted is None:
+                padw = padh = 0
+            else:
+                x1a, y1a, x2a, y2a, x1b, y1b, x2b, y2b = pasted
+                padw = x1a - x1b
+                padh = y1a - y1b
 
             labels = self.labels[index].copy()
             if labels.ndim == 1:
@@ -490,6 +718,7 @@ class LoadImagesAndLabels(Dataset):
                 labels[:, 1:] = xywhn2xyxy(labels[:, 1:], w, h, padw, padh)
             labels4.append(labels)
 
+        # concat/clip labels to [0, 2s]
         if len(labels4):
             labels4 = [lab if lab.ndim == 2 else np.zeros((0, 5), dtype=np.float32) for lab in labels4]
             labels4 = np.concatenate(labels4, 0)
@@ -497,6 +726,7 @@ class LoadImagesAndLabels(Dataset):
         else:
             labels4 = np.zeros((0, 5), dtype=np.float32)
 
+        # random crop back to s x s
         x_start = min(max(xc - s // 2, 0), 2 * s - s)
         y_start = min(max(yc - s // 2, 0), 2 * s - s)
         x_end = x_start + s
@@ -509,4 +739,3 @@ class LoadImagesAndLabels(Dataset):
             np.clip(labels4[:, 1:], 0, s, out=labels4[:, 1:])
 
         return img_out, labels4
-

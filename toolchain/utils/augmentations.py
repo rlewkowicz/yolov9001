@@ -24,9 +24,7 @@ class Albumentations:
 
             check_version(A.__version__, "1.0.3", hard=True)
             T = [
-                A.RandomResizedCrop(
-                    height=size, width=size, scale=(0.8, 1.0), ratio=(0.9, 1.11), p=0.0
-                ),
+                A.RandomResizedCrop(height=size, width=size, scale=(0.8, 1.0), ratio=(0.9, 1.11), p=0.0),
                 A.Blur(p=0.01),
                 A.MedianBlur(p=0.01),
                 A.ToGray(p=0.01),
@@ -37,11 +35,9 @@ class Albumentations:
             ]
             self.transform = A.Compose(
                 T,
-                bbox_params=A.BboxParams(format="yolo", label_fields=["class_labels"]),
+                bbox_params=A.BboxParams(format="yolo", label_fields=["class_labels"], min_visibility=0.1),
             )
-            LOGGER.info(
-                prefix + ", ".join((f"{x}".replace("always_apply=False, ", "") for x in T if x.p))
-            )
+            LOGGER.info(prefix + ", ".join((f"{x}".replace("always_apply=False, ", "") for x in T if x.p)))
         except ImportError:
             pass
         except Exception as e:
@@ -49,12 +45,25 @@ class Albumentations:
 
     def __call__(self, im, labels, p=1.0):
         if self.transform and random.random() < p:
-            new = self.transform(image=im, bboxes=labels[:, 1:], class_labels=labels[:, 0])
-            (im, labels) = (
-                new["image"],
-                np.array([[c, *b] for (c, b) in zip(new["class_labels"], new["bboxes"])]),
-            )
-        return (im, labels)
+            if labels.size == 0:
+                new = self.transform(image=im, bboxes=[], class_labels=[])
+                im = new["image"]
+                labels = np.zeros((0, 5), dtype=np.float32)
+                return im, labels
+            b = labels[:, 1:].astype(np.float32)
+            c = labels[:, 0].astype(np.float32)
+            eps = 1e-6
+            b[:, 0:2] = np.clip(b[:, 0:2], eps, 1.0 - eps)
+            b[:, 2:4] = np.clip(b[:, 2:4], eps, 1.0)
+            new = self.transform(image=im, bboxes=b, class_labels=c)
+            im = new["image"]
+            nb = np.array(new["bboxes"], dtype=np.float32)
+            nc = np.array(new["class_labels"], dtype=np.float32).reshape(-1, 1)
+            if nb.size == 0:
+                labels = np.zeros((0, 5), dtype=np.float32)
+            else:
+                labels = np.concatenate([nc, nb], axis=1).astype(np.float32)
+        return im, labels
 
 def normalize(x, mean=IMAGENET_MEAN, std=IMAGENET_STD, inplace=False):
     return TF.normalize(x, mean, std, inplace=inplace)
@@ -158,17 +167,17 @@ def random_perspective(
             xy = (xy[:, :2] / xy[:, 2:3] if perspective else xy[:, :2]).reshape(n, 8)
             x = xy[:, [0, 2, 4, 6]]
             y = xy[:, [1, 3, 5, 7]]
-            new = (np.concatenate((x.min(1), y.min(1), x.max(1), y.max(1))).reshape(4, n).T)
+            new = np.concatenate((x.min(1), y.min(1), x.max(1), y.max(1))).reshape(4, n).T
             new[:, [0, 2]] = new[:, [0, 2]].clip(0, width)
             new[:, [1, 3]] = new[:, [1, 3]].clip(0, height)
         i = box_candidates(
-            box1=targets[:, 1:5].T * s,
+            box1=targets[:, 1:5].T,
             box2=new.T,
             area_thr=0.01 if use_segments else 0.1,
         )
         targets = targets[i]
         targets[:, 1:5] = new[i]
-    return (im, targets)
+    return im, targets
 
 def copy_paste(im, labels, segments, p=0.5):
     n = len(segments)

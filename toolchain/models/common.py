@@ -12,13 +12,25 @@ from utils.plots import Annotator, colors, save_one_box
 from torch.nn import Parameter
 
 class Requant(nn.Module):
-    def __init__(self, tag: str | None = None):
+    def __init__(self, tag: str | None = None, momentum: float = 0.01):
         super().__init__()
-        self.act = nn.Identity()
-        self.tag = tag  # used by the training script to tie observers
+        self.tag = tag
+        self.momentum = float(momentum)
+        self.register_buffer("running_min", torch.tensor(0.0))
+        self.register_buffer("running_max", torch.tensor(0.0))
 
     def forward(self, x):
-        return self.act(x)
+        if self.training:
+            # compute in current dtype, then cast to buffer dtype (compile/AMP safe)
+            cur_min = x.detach().amin().to(self.running_min.dtype)
+            cur_max = x.detach().amax().to(self.running_max.dtype)
+
+            # EMA update (avoid lerp_.Scalar meta path)
+            # running = running + m * (cur - running)
+            m = self.momentum
+            self.running_min.add_((cur_min - self.running_min) * m)
+            self.running_max.add_((cur_max - self.running_max) * m)
+        return x
 
 def autopad(k, p=None, d=1):
     if d > 1:
@@ -156,44 +168,113 @@ class RepConvN(nn.Module):
 
 class DFL(nn.Module):
     """
-    Distribution Focal Loss projection.
-    - Training/backprop: uses true softmax (float) for exact gradients.
-    - Inference/export (opt-in): integer-LUT softmax approximation for full INT8 graphs.
+    Distribution Focal Loss projection with compile-safe calibration for INT8 LUT softmax.
+
+    Train:
+      - Uses true softmax (float) for exact gradients.
+      - Optionally collects EMA(absmax) of logits to tune LUT range.
+
+    Eval/Infer:
+      - Uses LUT softmax: exp lookups over a learned (min,max) range → stable INT8 path.
     """
-    def __init__(self, c1=17):
+    def __init__(self, c1=17, lut_steps=256, ema_momentum=0.01, collect_stats=True):
         super().__init__()
+        # fixed projection layer (no grad)
         self.conv = nn.Conv2d(c1, 1, 1, bias=False).requires_grad_(False)
         self.conv.weight.data[:] = torch.arange(c1, dtype=torch.float).view(1, c1, 1, 1)
+
+        # shape / mode
         self.c1 = c1
-        self.requant = Requant()
+        self.lut_steps = int(lut_steps)
         self.use_int8_lut = False
-        self.register_buffer("_lut_x", torch.linspace(-8.0, 8.0, steps=256))
+
+        # ---- compile-safe calibration state (EMA of abs-max) ----
+        # start with conservative [-8, +8]
+        self.register_buffer("ema_absmax", torch.tensor(8.0))
+        self.ema_momentum = float(ema_momentum)
+        self.collect_stats = bool(collect_stats)
+
+        # ---- affine for LUT index: idx = clamp(round(x / scale + zp), 0..steps-1) ----
+        self.register_buffer("lut_scale", torch.tensor(16.0 / (self.lut_steps - 1)))
+        self.register_buffer("lut_zero_point", torch.tensor(self.lut_steps - 1.0) * 0.5)  # symmetric
+
+        # ---- LUT domain & exp(table) (same shape forever → no recompiles) ----
+        self.register_buffer("_lut_x", torch.linspace(-8.0, 8.0, steps=self.lut_steps))
         self.register_buffer("_lut_exp", torch.exp(self._lut_x))
 
+    # ----------------- public toggles -----------------
     def enable_int8_lut(self, enabled: bool = True):
         self.use_int8_lut = bool(enabled)
 
+    @torch.no_grad()
+    def update_lut_from_ema(self):
+        """Rebuilds LUT & affine from the current EMA(absmax). Compile-safe (in-place, same shapes)."""
+        # symmetric range
+        amax = self.ema_absmax.clamp(min=1e-6)  # avoid degenerate
+        minv = -amax
+        maxv =  amax
+
+        # update affine
+        # scale = (max - min) / (steps - 1), zp = -min/scale
+        stepsm1 = torch.tensor(float(self.lut_steps - 1), device=amax.device, dtype=amax.dtype)
+        scale = (maxv - minv) / stepsm1
+        zp    = (-minv / scale)
+
+        self.lut_scale.copy_(scale)
+        self.lut_zero_point.copy_(zp)
+
+        # rebuild LUT domain & table in-place (same shape → no recompile)
+        self._lut_x.copy_(torch.linspace(minv.item() if minv.numel()==1 else float(minv),
+                                         maxv.item() if maxv.numel()==1 else float(maxv),
+                                         steps=self.lut_steps,
+                                         device=self._lut_x.device,
+                                         dtype=self._lut_x.dtype))
+        self._lut_exp.copy_(torch.exp(self._lut_x))
+
+    # ----------------- internal helpers -----------------
+    @torch.no_grad()
+    def _calib_update_ema(self, logits: torch.Tensor):
+        """EMA update of abs-max of pre-softmax logits (no .item(), compile-safe)."""
+        # logits shape: [B, C1, 4, A] after view+transpose below
+        cur_absmax = logits.detach().abs().amax()
+        m = self.ema_momentum
+        # ema_absmax = (1-m)*ema + m*cur
+        self.ema_absmax.mul_(1.0 - m).add_(m * cur_absmax)
+
     def _softmax_int8_lut(self, x: torch.Tensor, dim: int = 1) -> torch.Tensor:
         """
-        Approx softmax via exp-LUT index: i = round( (x+8) * 255/16 ). Range is clamped.
-        Returns float outputs normalized along 'dim'. No gradients required (inference only).
+        Approx softmax via LUT:
+            idx = clamp( round(x / scale + zp), 0..steps-1 )
+            exp ~ table[idx]
+            softmax = exp / sum(exp, dim)
+        All params are buffers (static shapes), so compiling stays stable.
         """
-        scale = 255.0 / 16.0  # 16 = 8 - (-8)
-        idx = torch.clamp(((x + 8.0) * scale).round().long(), 0, 255)
-        exp_approx = self._lut_exp[idx]  # gather LUT
-        exp_sum = exp_approx.sum(dim=dim, keepdim=True).clamp_min(1e-12)
+        # idx compute in float → long
+        idx = (x / self.lut_scale + self.lut_zero_point).round().to(torch.long)
+        idx = idx.clamp_(0, self.lut_steps - 1)
+        exp_approx = self._lut_exp[idx]           # gather LUT
+        exp_sum = exp_approx.sum(dim=dim, keepdim=True).clamp_min_(1e-12)
         return exp_approx / exp_sum
 
+    # ----------------- forward -----------------
     def forward(self, x):
+        # x: [B, 4*C1, A] → [B, 4, C1, A], softmax over C1
         b, c, a = x.shape
-        x = x.view(b, 4, self.c1, a).transpose(2, 1)  # [B, 4, C1, A] -> softmax over C1
+        x = x.view(b, 4, self.c1, a).transpose(2, 1)  # [B, C1, 4, A]
+
+        # collect calibration (compile-safe, no graph breaks)
+        if self.training and self.collect_stats:
+            self._calib_update_ema(x)
+
+        # choose softmax
         if not self.training and self.use_int8_lut:
             sm = self._softmax_int8_lut(x, dim=1)
         else:
             sm = x.softmax(1)
-        rq = getattr(self, "requant", nn.Identity())
-        sm = rq(sm)
-        return self.conv(sm).view(b, 4, a)
+
+        # project expectation of distances
+        y = self.conv(sm).view(b, 4, a)
+        return y
 
 class GatedPool(nn.Module):
     def __init__(self, kernel_size=5, stride=1):

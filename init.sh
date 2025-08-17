@@ -16,7 +16,7 @@ fi
 if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
   ORIGINAL_USER="$SUDO_USER"
 else
-  abort "This script must be run via sudo by a non-root user (e.g., 'sudo ./script.sh')."
+  ORIGINAL_USER=$USER 
 fi
 
 USER_HOME=$(getent passwd "$ORIGINAL_USER" | cut -d: -f6)
