@@ -692,7 +692,6 @@ def scale_boxes(img1_shape, boxes, img0_shape, ratio_pad=None):
       - ((gain_x, gain_y), (padw, padh))    -> anisotropic form; we use first element (x) for backward-compat
     """
     def _to_pair(x):
-        # Convert x to a 2-tuple of floats when possible, otherwise (x,x)
         if isinstance(x, torch.Tensor):
             x = x.detach().cpu().flatten().tolist()
         if isinstance(x, (list, tuple, np.ndarray)):
@@ -705,48 +704,41 @@ def scale_boxes(img1_shape, boxes, img0_shape, ratio_pad=None):
         return float(x), float(x)
 
     if ratio_pad is None:
-        # Compute isotropic gain and pad from shapes
         gain = min(img1_shape[0] / img0_shape[0], img1_shape[1] / img0_shape[1])
         pad = (
             (img1_shape[1] - img0_shape[1] * gain) / 2.0,
             (img1_shape[0] - img0_shape[0] * gain) / 2.0,
         )
     else:
-        # Normalize provided ratio_pad into (gain, (padw,padh))
-        if isinstance(ratio_pad, (int, float, np.floating)) or (
-            isinstance(ratio_pad, torch.Tensor) and ratio_pad.numel() == 1
-        ):
+        if isinstance(ratio_pad,
+                      (int, float, np.floating
+                      )) or (isinstance(ratio_pad, torch.Tensor) and ratio_pad.numel() == 1):
             gain = float(ratio_pad)
             pad = (0.0, 0.0)
         elif isinstance(ratio_pad, (list, tuple)):
             rp0 = ratio_pad[0] if len(ratio_pad) > 0 else 1.0
             rp1 = ratio_pad[1] if len(ratio_pad) > 1 else (0.0, 0.0)
 
-            # rp0 may be scalar or a pair (gain_x, gain_y). For historical compatibility, use the first.
             if isinstance(rp0, (list, tuple, np.ndarray, torch.Tensor)):
                 gx, _gy = _to_pair(rp0)
                 gain = float(gx)
             else:
                 gain = float(rp0)
 
-            # rp1 is pad: scalar or pair
             if isinstance(rp1, (list, tuple, np.ndarray, torch.Tensor)):
                 pad = _to_pair(rp1)
             else:
                 p = float(rp1)
                 pad = (p, p)
         else:
-            # Fallback: treat as scalar gain
             gain = float(ratio_pad)
             pad = (0.0, 0.0)
 
-    # Apply inverse letterbox
     boxes[:, [0, 2]] -= pad[0]
     boxes[:, [1, 3]] -= pad[1]
     boxes[:, :4] /= gain
     clip_boxes(boxes, img0_shape)
     return boxes
-
 
 def clip_boxes(boxes, shape):
     if isinstance(boxes, torch.Tensor):

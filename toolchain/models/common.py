@@ -12,25 +12,13 @@ from utils.plots import Annotator, colors, save_one_box
 from torch.nn import Parameter
 
 class Requant(nn.Module):
-    def __init__(self, tag: str | None = None, momentum: float = 0.01):
+    def __init__(self, tag: str | None = None):
         super().__init__()
-        self.tag = tag
-        self.momentum = float(momentum)
-        self.register_buffer("running_min", torch.tensor(0.0))
-        self.register_buffer("running_max", torch.tensor(0.0))
+        self.act = nn.Identity()
+        self.tag = tag  # used by the training script to tie observers
 
     def forward(self, x):
-        if self.training:
-            # compute in current dtype, then cast to buffer dtype (compile/AMP safe)
-            cur_min = x.detach().amin().to(self.running_min.dtype)
-            cur_max = x.detach().amax().to(self.running_max.dtype)
-
-            # EMA update (avoid lerp_.Scalar meta path)
-            # running = running + m * (cur - running)
-            m = self.momentum
-            self.running_min.add_((cur_min - self.running_min) * m)
-            self.running_max.add_((cur_max - self.running_max) * m)
-        return x
+        return self.act(x)
 
 def autopad(k, p=None, d=1):
     if d > 1:
@@ -168,113 +156,91 @@ class RepConvN(nn.Module):
 
 class DFL(nn.Module):
     """
-    Distribution Focal Loss projection with compile-safe calibration for INT8 LUT softmax.
-
-    Train:
-      - Uses true softmax (float) for exact gradients.
-      - Optionally collects EMA(absmax) of logits to tune LUT range.
-
-    Eval/Infer:
-      - Uses LUT softmax: exp lookups over a learned (min,max) range → stable INT8 path.
+    Distribution Focal Loss projection.
+    - Training/backprop: uses true softmax (float) for exact gradients.
+    - Inference/export: uses an integer-LUT softmax approximation.
+    - EMA tracking: dynamically calibrates the LUT range to prevent saturation.
     """
-    def __init__(self, c1=17, lut_steps=256, ema_momentum=0.01, collect_stats=True):
+    def __init__(self, c1=17):
         super().__init__()
-        # fixed projection layer (no grad)
         self.conv = nn.Conv2d(c1, 1, 1, bias=False).requires_grad_(False)
         self.conv.weight.data[:] = torch.arange(c1, dtype=torch.float).view(1, c1, 1, 1)
-
-        # shape / mode
         self.c1 = c1
-        self.lut_steps = int(lut_steps)
+        self.requant = Requant()
         self.use_int8_lut = False
 
-        # ---- compile-safe calibration state (EMA of abs-max) ----
-        # start with conservative [-8, +8]
-        self.register_buffer("ema_absmax", torch.tensor(8.0))
-        self.ema_momentum = float(ema_momentum)
-        self.collect_stats = bool(collect_stats)
+        self.ema_momentum = 0.99
+        self.register_buffer("ema_min", torch.tensor(0.0))
+        self.register_buffer("ema_max", torch.tensor(0.0))
+        self.ema_initialized = False
 
-        # ---- affine for LUT index: idx = clamp(round(x / scale + zp), 0..steps-1) ----
-        self.register_buffer("lut_scale", torch.tensor(16.0 / (self.lut_steps - 1)))
-        self.register_buffer("lut_zero_point", torch.tensor(self.lut_steps - 1.0) * 0.5)  # symmetric
+        self.register_buffer("_lut_x", torch.empty(256))
+        self.register_buffer("_lut_exp", torch.empty(256))
+        self.register_buffer("_lut_scale", torch.tensor(1.0))
+        self.register_buffer("_lut_offset", torch.tensor(0.0))
+        self.update_lut_range(-8.0, 8.0)
 
-        # ---- LUT domain & exp(table) (same shape forever → no recompiles) ----
-        self.register_buffer("_lut_x", torch.linspace(-8.0, 8.0, steps=self.lut_steps))
-        self.register_buffer("_lut_exp", torch.exp(self._lut_x))
+    def _update_ema(self, x):
+        """Update EMA stats for min/max of the input tensor."""
+        x_min = x.min().detach().float()
+        x_max = x.max().detach().float()
 
-    # ----------------- public toggles -----------------
+        if not self.ema_initialized:
+            self.ema_min.copy_(x_min)
+            self.ema_max.copy_(x_max)
+            self.ema_initialized = True
+        else:
+            self.ema_min.lerp_(x_min, 1.0 - self.ema_momentum)
+            self.ema_max.lerp_(x_max, 1.0 - self.ema_momentum)
+
+    def update_lut_range(self, min_val, max_val):
+        """Helper to build the LUT from a given min/max range."""
+        min_val, max_val = float(min_val), float(max_val)
+        device = self._lut_x.device
+        self._lut_x.copy_(torch.linspace(min_val, max_val, steps=256, device=device))
+        self._lut_exp.copy_(torch.exp(self._lut_x))
+        self._lut_scale.fill_(255.0 / (max_val - min_val) if max_val > min_val else 1.0)
+        self._lut_offset.fill_(min_val)
+
+    def update_lut_from_ema(self):
+        """
+        Updates the LUT's range based on the tracked EMA min/max. This is called
+        by the training script before validation or inference.
+        """
+        margin = 0.1 * (self.ema_max - self.ema_min)
+        lut_min = self.ema_min - margin
+        lut_max = self.ema_max + margin
+        self.update_lut_range(lut_min, lut_max)
+        LOGGER.info(f"DFL LUT updated from EMA. New range: [{lut_min:.4f}, {lut_max:.4f}]")
+
     def enable_int8_lut(self, enabled: bool = True):
         self.use_int8_lut = bool(enabled)
 
-    @torch.no_grad()
-    def update_lut_from_ema(self):
-        """Rebuilds LUT & affine from the current EMA(absmax). Compile-safe (in-place, same shapes)."""
-        # symmetric range
-        amax = self.ema_absmax.clamp(min=1e-6)  # avoid degenerate
-        minv = -amax
-        maxv =  amax
-
-        # update affine
-        # scale = (max - min) / (steps - 1), zp = -min/scale
-        stepsm1 = torch.tensor(float(self.lut_steps - 1), device=amax.device, dtype=amax.dtype)
-        scale = (maxv - minv) / stepsm1
-        zp    = (-minv / scale)
-
-        self.lut_scale.copy_(scale)
-        self.lut_zero_point.copy_(zp)
-
-        # rebuild LUT domain & table in-place (same shape → no recompile)
-        self._lut_x.copy_(torch.linspace(minv.item() if minv.numel()==1 else float(minv),
-                                         maxv.item() if maxv.numel()==1 else float(maxv),
-                                         steps=self.lut_steps,
-                                         device=self._lut_x.device,
-                                         dtype=self._lut_x.dtype))
-        self._lut_exp.copy_(torch.exp(self._lut_x))
-
-    # ----------------- internal helpers -----------------
-    @torch.no_grad()
-    def _calib_update_ema(self, logits: torch.Tensor):
-        """EMA update of abs-max of pre-softmax logits (no .item(), compile-safe)."""
-        # logits shape: [B, C1, 4, A] after view+transpose below
-        cur_absmax = logits.detach().abs().amax()
-        m = self.ema_momentum
-        # ema_absmax = (1-m)*ema + m*cur
-        self.ema_absmax.mul_(1.0 - m).add_(m * cur_absmax)
-
     def _softmax_int8_lut(self, x: torch.Tensor, dim: int = 1) -> torch.Tensor:
         """
-        Approx softmax via LUT:
-            idx = clamp( round(x / scale + zp), 0..steps-1 )
-            exp ~ table[idx]
-            softmax = exp / sum(exp, dim)
-        All params are buffers (static shapes), so compiling stays stable.
+        Approximate softmax via exp-LUT using the dynamic range from EMA.
+        Returns float outputs normalized along 'dim'.
         """
-        # idx compute in float → long
-        idx = (x / self.lut_scale + self.lut_zero_point).round().to(torch.long)
-        idx = idx.clamp_(0, self.lut_steps - 1)
-        exp_approx = self._lut_exp[idx]           # gather LUT
-        exp_sum = exp_approx.sum(dim=dim, keepdim=True).clamp_min_(1e-12)
+        idx = torch.clamp(((x - self._lut_offset) * self._lut_scale).round().long(), 0, 255)
+        exp_approx = self._lut_exp[idx]
+        exp_sum = exp_approx.sum(dim=dim, keepdim=True).clamp_min(1e-12)
         return exp_approx / exp_sum
 
-    # ----------------- forward -----------------
     def forward(self, x):
-        # x: [B, 4*C1, A] → [B, 4, C1, A], softmax over C1
+        if self.training:
+            self._update_ema(x)
+
         b, c, a = x.shape
-        x = x.view(b, 4, self.c1, a).transpose(2, 1)  # [B, C1, 4, A]
+        x = x.view(b, 4, self.c1, a).transpose(2, 1)  # [B, 4, C1, A] -> softmax over C1
 
-        # collect calibration (compile-safe, no graph breaks)
-        if self.training and self.collect_stats:
-            self._calib_update_ema(x)
-
-        # choose softmax
         if not self.training and self.use_int8_lut:
             sm = self._softmax_int8_lut(x, dim=1)
         else:
             sm = x.softmax(1)
 
-        # project expectation of distances
-        y = self.conv(sm).view(b, 4, a)
-        return y
+        rq = getattr(self, "requant", nn.Identity())
+        sm = rq(sm)
+        return self.conv(sm).view(b, 4, a)
 
 class GatedPool(nn.Module):
     def __init__(self, kernel_size=5, stride=1):
@@ -463,11 +429,16 @@ class QARepVGGBlockV2(nn.Module):
     def forward(self, inputs):
         if self.deploy:
             return self.nonlinearity(self.se(self.rbr_reparam(inputs)))
-        base = self.rbr_dense(inputs) + self.rbr_1x1(inputs)
-        id_out = self.rbr_identity(inputs
-                                  ) if self.rbr_identity is not None else torch.zeros_like(base)
-        avg_out = self.rbr_avg(inputs) if self.rbr_avg is not None else torch.zeros_like(base)
-        return self.nonlinearity(self.bn(self.se(base + id_out + avg_out)))
+
+        outputs = [self.rbr_dense(inputs), self.rbr_1x1(inputs)]
+        if self.rbr_identity is not None:
+            outputs.append(self.rbr_identity(inputs))
+        if self.rbr_avg is not None:
+            outputs.append(self.rbr_avg(inputs))
+
+        result = torch.sum(torch.stack(outputs), dim=0)
+
+        return self.nonlinearity(self.bn(self.se(result)))
 
     def get_equivalent_kernel_bias(self):
         (kernel3x3, bias3x3) = self._fuse_bn_tensor(self.rbr_dense)
