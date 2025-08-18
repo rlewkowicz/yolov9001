@@ -54,6 +54,14 @@ def _toggle_dfl_int8(model: torch.nn.Module, enabled: bool):
                 m.update_lut_from_ema()
             m.enable_int8_lut(enabled)
 
+def _prepare_eval_model(m: torch.nn.Module) -> torch.nn.Module:
+    """Return a float32, eval, no-grad copy/reference suitable for validation."""
+    m.eval()
+    m.float()
+    for p in m.parameters():
+        p.requires_grad_(False)
+    return m
+
 # -----------------------------------------------------------------------------
 # Trainer
 # -----------------------------------------------------------------------------
@@ -204,7 +212,7 @@ class Trainer:
 
         def lf(epoch):
             factor = lf_original(epoch)
-            if RANK != -1 and epoch < 2:
+            if RANK != -1 and epoch < 0:
                 damp = 0.6 + 0.4 * (1 - 0.5 * (1 + math.cos(math.pi * epoch / 2)))
                 factor *= damp
             return factor
@@ -213,25 +221,74 @@ class Trainer:
 
     def _setup_dataloaders(self):
         LOGGER.info("Setting up dataloaders...")
-        train_loader, dataset = create_dataloader(self.train_path, self.imgsz, self.opt.batch_size, self.gs, single_cls=False, hyp=self.hyp, augment=True, rect=self.opt.rect, workers=self.opt.workers, prefix=colorstr('train: '), cache=self.opt.cache, shuffle=True)
-        val_loader = create_dataloader(self.val_path, self.imgsz, self.opt.batch_size, self.gs, single_cls=False, hyp=self.hyp, workers=self.opt.workers, prefix=colorstr('val: '), cache=self.opt.cache)[0]
+        train_loader, dataset = create_dataloader(
+            self.train_path,
+            self.imgsz,
+            self.opt.batch_size,
+            self.gs,
+            single_cls=False,
+            hyp=self.hyp,
+            augment=True,
+            rect=False,
+            workers=self.opt.workers,
+            prefix=colorstr('train: '),
+            cache=self.opt.cache,
+            shuffle=True
+        )
+        val_loader = create_dataloader(
+            self.val_path,
+            self.imgsz,
+            self.opt.batch_size,
+            self.gs,
+            single_cls=False,
+            rect=False,
+            hyp=self.hyp,
+            workers=self.opt.workers,
+            # pad=0.5,
+            prefix=colorstr('val: '),
+            cache=self.opt.cache,
+            close_mosaic=True,
+            shuffle=False
+        )[0]
         return train_loader, dataset, val_loader
+
+    # -------------------- EMA-aware validation model selection --------------------
+    def _pick_val_model(self) -> torch.nn.Module:
+        """Use EMA if it has at least one update; otherwise fall back to the raw model."""
+        use_ema = self.ema is not None and getattr(self.ema, "updates", 0) > 0
+        model_to_validate = self.ema.ema if use_ema else (self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model)
+        return _prepare_eval_model(model_to_validate)
+
+    def _get_raw_eval_model(self) -> torch.nn.Module:
+        """Return the non-EMA model prepared for eval/validation."""
+        m = self.model._orig_mod if hasattr(self.model, "_orig_mod") else self.model
+        return _prepare_eval_model(m)
 
     def train(self):
         LOGGER.info(f"Starting training from epoch {self.start_epoch} for {self.opt.epochs} epochs...")
         optim_set = self.hyp['optimizer'][self.opt.optimizer]
         nb = len(self.train_loader)
+        # Warmup steps (batches)
         nw = max(round(optim_set.get("warmup_epochs", 0.0) * nb), 100)
         last_opt_step = -1
 
         for epoch in range(self.start_epoch, self.opt.epochs):
             mloss, last_opt_step = self._train_epoch(epoch, nw, last_opt_step)
             self.scheduler.step()
+            # Keep EMA attrs synced so validation doesn't break early
             self.ema.update_attr(self.model, include=['yaml', 'nc', 'hyp', 'names', 'stride'])
 
-            results, _ = self._run_validation()
+            # -------------------- Validation (EMA-aware) --------------------
+            results, _ = self._run_validation()  # picks EMA if ready, otherwise raw
             mp, mr, map50, map_ = results[:4]
-            LOGGER.info(f"Epoch {epoch+1:>3}/{self.opt.epochs} | loss(box/cls/dfl): {mloss[0]:.4f}/{mloss[1]:.4f}/{mloss[2]:.4f} | mP {mp:.4f} mR {mr:.4f} mAP50 {map50:.4f} mAP {map_:.4f}")
+            LOGGER.info(f"Epoch {epoch+1:>3}/{self.opt.epochs} | "
+                        f"loss(box/cls/dfl): {mloss[0]:.4f}/{mloss[1]:.4f}/{mloss[2]:.4f} | "
+                        f"mP {mp:.4f} mR {mr:.4f} mAP50 {map50:.4f} mAP {map_:.4f}")
+
+            # Optional side-by-side: compare EMA vs RAW when EMA is initialized
+            if getattr(self.ema, "updates", 0) > 0:
+                raw_results, _ = self._run_validation(model=self._get_raw_eval_model())
+                LOGGER.info(f"Validation compare → mAP50 EMA={map50:.4f} | RAW={raw_results[2]:.4f}")
 
             if self.tb:
                 self.tb.add_scalar("val/mP", mp, epoch + 1)
@@ -246,8 +303,10 @@ class Trainer:
 
             torch._dynamo.reset()
 
-        if self.opt.save_graph: self.export_graph()
-        if self.tb: self.tb.close()
+        if self.opt.save_graph: 
+            self.export_graph()
+        if self.tb: 
+            self.tb.close()
 
     def _train_epoch(self, epoch, nw, last_opt_step):
         self.model.train()
@@ -256,16 +315,26 @@ class Trainer:
         optim_set = self.hyp['optimizer'][self.opt.optimizer]
         nb = len(self.train_loader)
 
+        # Safety net: accumulation should not exceed number of batches (prevents zero-step epoch)
+        self.accumulate = min(self.accumulate, nb)
+
         for i, (imgs, targets, _, _) in enumerate(pbar):
-            ni = i + nb * (epoch - 1)
+            # Use canonical definition of ni so warmup and step logic are stable
+            ni = i + nb * epoch
+
+            # Warmup
             if ni <= nw:
                 xi = [0, nw]
                 self.accumulate = int(max(1, np.interp(ni, xi, [1, self._nbs / max(1, self.opt.batch_size)]).round()))
+                self.accumulate = min(self.accumulate, nb)  # never exceed number of batches
                 for pg in self.optimizer.param_groups:
                     start_lr = optim_set.get("warmup_bias_lr", 0.0) if "others" in pg.get("name", "") else 0.0
                     pg["lr"] = float(np.interp(ni, xi, [start_lr, pg["initial_lr"] * self._lf_epoch(epoch)]))
-                    if 'momentum' in pg: pg['momentum'] = float(np.interp(ni, xi, [optim_set.get('warmup_momentum', 0.0), optim_set['momentum']]))
-                    if 'betas' in pg: pg['betas'] = (float(np.interp(ni, xi, [optim_set.get('warmup_momentum', 0.0), optim_set['b1']])), pg['betas'][1])
+                    if 'momentum' in pg:
+                        pg['momentum'] = float(np.interp(ni, xi, [optim_set.get('warmup_momentum', 0.0), optim_set['momentum']]))
+                    if 'betas' in pg:
+                        beta1 = float(np.interp(ni, xi, [optim_set.get('warmup_momentum', 0.0), optim_set['b1']]))
+                        pg['betas'] = (beta1, pg['betas'][1])
 
             imgs = imgs.to(self.device, non_blocking=True).float() / 255.0
             with torch.amp.autocast(self.device.type, enabled=True):
@@ -273,17 +342,27 @@ class Trainer:
                 loss, loss_items = self.loss_fn(preds, targets.to(self.device))
             self.scaler.scale(loss).backward()
 
-            if (ni - last_opt_step) >= self.accumulate:
+            # Guarantee at least one optimizer step per epoch: step on last batch too
+            will_step = (ni - last_opt_step) >= self.accumulate or (i == nb - 1)
+
+            if will_step:
                 self.scaler.unscale_(self.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
-                self.ema.update(self.model)
+                if self.ema:
+                    self.ema.update(self.model)
                 last_opt_step = ni
 
             mloss = (mloss * i + loss_items) / (i + 1)
-            pbar.set_postfix(mem=f'{torch.cuda.memory_reserved()/1E9:.3g}G', lr=f'{self.optimizer.param_groups[0]["lr"]:.3e}', box=mloss[0].item(), cls=mloss[1].item(), dfl=mloss[2].item())
+            pbar.set_postfix(
+                mem=f'{torch.cuda.memory_reserved()/1E9:.3g}G',
+                lr=f'{self.optimizer.param_groups[0]["lr"]:.3e}',
+                box=mloss[0].item(),
+                cls=mloss[1].item(),
+                dfl=mloss[2].item()
+            )
             if self.tb:
                 self.tb.add_scalar("train/loss_box", loss_items[0].item(), self.global_step)
                 self.tb.add_scalar("train/loss_cls", loss_items[1].item(), self.global_step)
@@ -293,13 +372,25 @@ class Trainer:
 
         return mloss.detach(), last_opt_step
 
-    def _run_validation(self):
-        model_to_validate = self.ema.ema
+    def _run_validation(self, model: torch.nn.Module = None):
+        # Pick EMA if ready, else raw model, unless a specific model is provided
+        model_to_validate = model if model is not None else self._pick_val_model()
         _toggle_dfl_int8(model_to_validate, True)
         LOGGER.info("Running validation...")
         try:
-            model_to_validate.eval()
-            results, maps, _ = validate.run(data=self.data_dict, batch_size=self.opt.batch_size, imgsz=self.imgsz, model=model_to_validate, dataloader=self.val_loader, save_dir=self.save_dir, compute_loss=self.loss_fn, half=True, plots=False)
+            # Validate in float32 for stability with compiled graphs and EMA
+            model_to_validate = _prepare_eval_model(model_to_validate)
+            results, maps, _ = validate.run(
+                data=self.data_dict,
+                batch_size=self.opt.batch_size,
+                imgsz=self.imgsz,
+                model=model_to_validate,
+                dataloader=self.val_loader,
+                save_dir=self.save_dir,
+                compute_loss=self.loss_fn,
+                half=True,          # keep validation in float32 to avoid early-epoch EMA issues
+                plots=False
+            )
         finally:
             _toggle_dfl_int8(model_to_validate, False)
         return results, maps
