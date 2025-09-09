@@ -6,14 +6,39 @@ build-backend = "setuptools.build_meta"
 name = "yolov9001"
 version = "0.1.0"
 requires-python = ">=3.8"
+readme = "README.md"
 dependencies = [
-    "pyyaml",
-    "albumentations>=1.3.1",
-    "torchvision",
-    "torch",
-    "pytest",
+  # Core runtime
+  "torch==2.8.0+cu129",
+  "torchvision==0.23.0+cu129",
+  "numpy==1.26.4",
+  "opencv-python==4.11.0.86",
+  "Pillow==11.3.0",
+  "PyYAML==6.0.2",
+  "tqdm==4.67.1",
+  "tensorboard==2.18.0",
+  # Optional in-code imports used for plots/profiling/algorithms
+  "matplotlib==3.9.4",
+  "scipy==1.13.1",
+  "psutil==7.0.0",
+  "thop==0.1.1.post2209072238",
+  # DINO teacher stack (used when enabled)
+  "transformers==4.56.0",
+  "torchao==0.13.0",
+  # Tools/tests in this repo
+  "openai==1.101.0",
+  "pytest==8.4.1",
 ]
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["models*", "utils*", "core*"]
+
+[[tool.uv.index]]
+name     = "pytorch-cu129"
+url      = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu129" }
+torchvision = { index = "pytorch-cu129" }
