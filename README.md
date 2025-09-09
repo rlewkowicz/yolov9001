@@ -1,9 +1,22 @@
-**YOLOv9001**
+# YOLOv9001
 This was based on yolov9 before the rewrite. Now it's completely distinct training platform for detection models. Similar concepts, very different architectures. The current core model is based on hyper model:
 
 https://github.com/iMoonLab/Hyper-YOLO
 
-**CLI Usage**
+- [YOLOv9001](#yolov9001)
+  - [CLI Usage](#cli-usage)
+  - [Examples](#examples)
+  - [Runtime Attachment (core/runtime.py)](#runtime-attachment-coreruntimepy)
+  - [Central Config (core/config.py)](#central-config-coreconfigpy)
+  - [DINOv3 Integration](#dinov3-integration)
+  - [Example Hyp: models/hyps/low.yaml](#example-hyp-modelshypslowyaml)
+  - [Augmentation Validator](#augmentation-validator)
+  - [Data Loading](#data-loading)
+  - [Datasets](#datasets)
+  - [Notes \& Tips](#notes--tips)
+
+
+## CLI Usage
 - Basic: `python 9001.py <mode> [options]`
 - Modes: `train`, `val`, `detect`, `benchmark`, `export`
 - Common options:
@@ -20,7 +33,7 @@ https://github.com/iMoonLab/Hyper-YOLO
   - `--tb-only`: TensorBoard-only logging; minimal CLI/file logs.
   - `--log-dir`: base run dir (auto-incremented unless resuming).
 
-**Examples**
+## Examples
 - Train (fresh): `python 9001.py train --data /path/to/dataset --hyp models/hyps/low.yaml --epochs 100 --batch-size 16`
 - Train (resume): `python 9001.py train --resume runs/exp42`
 - Validate: `python 9001.py val --data /path/to/dataset --weights runs/exp42/checkpoints/best.pt`
@@ -29,14 +42,14 @@ https://github.com/iMoonLab/Hyper-YOLO
 - Inline overrides: `python 9001.py train --data ... --hyp models/hyps/low.yaml --hypo "dino.enabled:true,dino.quant:fp16,assign_mode:simota"`
 
 
-**Runtime Attachment (core/runtime.py)**
+## Runtime Attachment (core/runtime.py)
 - `attach_runtime(model, imgsz)` ensures a single source of truth for runtime fields:
   - Finds the `Detect` module, infers level strides via a no-grad forward at `imgsz` and caches `detect.last_shapes` → `detect.strides`.
   - Sets `model.nc`, `model.reg_max`, `model.strides`, `model.detect_layer`.
   - Creates or updates a `DFLDecoder` with `reg_max`, `strides`, and `dfl_tau` from config.
   - Attaches a `Postprocessor` with thresholds from config (NMS, class-agnostic, pre/post top-k, etc.).
 
-**Central Config (core/config.py)**
+## Central Config (core/config.py)
 - `YOLOConfig` holds normalized defaults across model, dataloaders, training, loss, and postprocess.
 - Merge priority in `get_config(...)`:
   - Hyp dict (highest) → hyp file path → `cfg['hyp']` if present → in-repo defaults.
@@ -49,7 +62,7 @@ https://github.com/iMoonLab/Hyper-YOLO
   - Postprocess: `conf_thresh`, `iou_thresh`, pre/post top-k, class-agnostic NMS, NMS-free flags.
   - DINO distillation: see below.
 
-**DINOv3 Integration**
+## DINOv3 Integration
 - Teacher wrapper: `utils/dino_teacher.DINOTeacher`
   - Loads HF DINOv3 ViT models (e.g., `facebook/dinov3-vitb16-pretrain-lvd1689m`).
   - Optional weight-only quantization (torchao) with `quant: int4|int8|fp16|fp32|bf16`; defaults to bf16/fp16 where appropriate.
@@ -65,7 +78,7 @@ https://github.com/iMoonLab/Hyper-YOLO
   - Optional `centroid_align`: aligns predicted box centers with saliency centers in early epochs.
   - Prototype-based class soft targets (`dino.cls_proto`) and region contrastive (`dino.contrast`) are available in config defaults.
 
-**Example Hyp: models/hyps/low.yaml**
+## Example Hyp: models/hyps/low.yaml
 ```
 optimizer:
   SGD:
@@ -114,7 +127,7 @@ dino:
   quant: fp16
 ```
 
-**Augmentation Validator**
+## Augmentation Validator
 This repo doesn't use albumtations, or ultralytics. They're all "from scratch". So while the transforms are similar, they're structurally different. My mosaic is different. Copy paste is different etc. To test the validity of the transforms, you can use this tool.
 
 - Script: `tools/validate_augmentations.py` — visualizes and sanity-checks the augmentation pipeline on your dataset.
@@ -139,11 +152,11 @@ This repo doesn't use albumtations, or ultralytics. They're all "from scratch". 
   - `--full-pipeline`: enable end-to-end dataloader path with `--gpu-collate`, `--cuda-prefetch`, `--prefetch-*`, `--cache`, `--ram-compress`.
   - `--samples`, `--per-grid`: number of grids and tiles per grid saved in full pipeline mode.
 
-**Data Loading**
+## Data Loading
 - `utils.dataloaders.create_dataloader` auto-detects YOLO (labels/*.txt + images) or COCO JSON, reads `data.yaml` names if present, and supports RAM/disk caches.
 - Prefetch: `cuda_prefetch`, `prefetch_factor`, `persistent_workers`, optional GPU-side collate/affine.
 
-**Datasets**
+## Datasets
 - Supported formats: YOLO and COCO.
 - YOLO layout example:
   - `dataset/`
@@ -163,7 +176,7 @@ This repo doesn't use albumtations, or ultralytics. They're all "from scratch". 
   - GPU collate/affine and CUDA prefetch are available (see Augmentation Validator section for profiling).
 
 
-**Notes & Tips**
+## Notes & Tips
 - When using DINO, some Hugging Face model repos may require authentication; set `HF_TOKEN` or pass `dino.hf_token` in your hyp.
 - `attach_runtime` should be called after loading weights and before training/validation/inference (handled by `9001.py`).
 - For custom models, implement `DetectModelBase.parse_model`, expose a `Detect` head, and rely on `attach_runtime` to finalize runtime attributes.
