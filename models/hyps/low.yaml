@@ -35,7 +35,7 @@ dino:
   objfor02: true
   resolution: 512
   reg_weight_with_saliency: true
-  reg_weight_floor: 0.2
+  reg_weight_floor: 0.5
   reg_weight_power: 2.0
   centroid_align: true
   centroid_weight: 0.1
