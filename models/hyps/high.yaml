@@ -1,0 +1,52 @@
+optimizer:
+  LION:
+    lr0: 0.01
+    lrf: 1
+    b1: 0.9
+    b2: 0.999
+    alpha: 20
+    bias_correction: false
+    weight_decay: 0.005
+    decoupled_lr:
+      backbone: 
+        lr_scale: 1.0
+      head: 
+        lr_scale: 1.0
+
+# TAL & Loss
+box: 7.5
+cls: .5
+dfl: 1.5
+iou_type: MPDIoU
+assign_mode: simota
+cls_type: qfl
+# vfl_alpha: 0.20
+# vfl_gamma: 1.1
+
+assign_radius: 1.1
+assign_lambda_iou: 3.5
+assign_topq: 10
+
+# Ancillary
+min_stride_box_alpha: 0.0
+
+# Augmentations
+hsv_h: 0.015
+hsv_s: 0.7
+hsv_v: 0.4
+degrees: 1.0
+translate: 0.1
+scale: 0.5
+fliplr: 0.5
+mosaic: .5
+mixup: 0.0
+copy_paste: 0.1
+
+# Add Dino distillation (default: First 3 epochs)
+dino:
+  model_name: facebook/dinov3-vitb16-pretrain-lvd1689m
+  enabled: true
+  objfor02: true
+  max_epochs: 200
+  every_n: 1
+  quant: fp16

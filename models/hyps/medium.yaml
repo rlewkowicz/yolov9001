@@ -1,0 +1,37 @@
+optimizer:
+  LION:
+    lr0: 0.001
+    lrf: 1
+    b1: 0.9
+    b2: 0.999
+    alpha: 28
+    bias_correction: false
+    weight_decay: 0.001
+    decoupled_lr:
+      backbone: 
+        lr_scale: 1.0
+      head: 
+        lr_scale: 1.0
+
+assign_mode: "mixed"
+assign_lambda_iou: 5.0
+obj_weight: 45
+objless_target_iou: 0.95   # Linear ramp: floor → 1.0 by target IoU (0 disables)
+objless_weight_floor: 0.01 # Minimum scaling at IoU=0 (0..1)
+
+l1_weight: 0.05  # Optional L1 box loss weight (0 to disable)
+
+min_stride_box_alpha: 0.15    # 10 / 32 = 0.3125 → ~10px at top stride
+
+cls: 1.0
+iou_type: MPDIoU  # Options: IoU, GIoU, DIoU, CIoU, SIoU, MPDIoU
+hsv_h: 0.015
+hsv_s: 0.7
+hsv_v: 0.4
+degrees: 2.0
+translate: 0.05
+scale: 0.7
+fliplr: 0.5
+mosaic: 0.5
+mixup: 0.05
+copy_paste: 0.3

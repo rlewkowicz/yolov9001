@@ -1,0 +1,8 @@
+*.egg-info
+**/runs/
+**/__pycache__/
+.claude/
+.pytest_cache
+**/aug_outcomes
+.torch_kernels/
+action_plan/
