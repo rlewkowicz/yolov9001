@@ -144,8 +144,21 @@ class YOLOConfig:
             "resolution": 384,  # Conservative teacher resolution (24x24 tokens)
             "every_n": 3,  # Compute teacher every N steps to limit overhead
             "quant": "int4",  # Options: int8 | int4 | fp16 | fp32 | bf16
+            "compile": False,  # Optionally torch.compile() the teacher after load/quant
             "log_interval": 10,  # Log less frequently by default
             "prewarm": True,  # Avoid eager download/alloc unless explicitly enabled
+            # Distillation switch (independent of objfor02 prior)
+            "distillation": True,
+            # Linear decay-to-zero horizons (epochs). Per-step scale computed from epoch+step/nb.
+            # Set to 0 to disable decay (constant weight/prior).
+            "distill_decay_epochs": 0,
+            "objfor02_decay_epochs": 0,
+            # Patience: disable DINO distillation after X epochs without improvement
+            # Improvement is measured on epoch-averaged distillation total loss (lower is better).
+            # Set to 0 to disable patience behavior.
+            "patience_epochs": 0,
+            # Optional tolerance to consider as improvement (absolute), e.g., 1e-3
+            "patience_delta": 0.0,
             # Modest loss weights; only early epochs (see max_epochs)
             "alpha": 0.5,  # Patch-token cosine
             "beta": 0.3,  # Saliency KL (CLS-attn/energy -> aux obj) — slightly lowered
@@ -162,6 +175,18 @@ class YOLOConfig:
             },
             # Gate for using DINO teacher objectness for assignment cost bias only (no distill losses)
             "objfor02": False,
+            # Optional: switch optimizer once DINO turns off
+            # Provide a full optimizer block (same shape as top-level 'optimizer', e.g., {"SGD": {...}} or {"LION": {...}})
+            # If null/None, no optimizer change occurs.
+            "optimizer_after_off": None,
+            # Optional: change classification loss type after DINO turns off
+            # One of: "vfl" | "qfl" | "bce". If null/None, leave unchanged.
+            "cls_type_after_off": None,
+            # Logging for objfor02 effect on SimOTA
+            # Recompute assignment without prior every N steps to measure suppression/help.
+            "objfor02_log_every": 5,
+            # Threshold to count a positive as low-prior when logging
+            "objfor02_lowprior_thresh": 0.2,
             # Saliency-weighted regression (boxes/DFL) — gated to positives only
             "reg_weight_with_saliency": False,
             "reg_weight_floor": 0.2,   # minimum weight when saliency is 0

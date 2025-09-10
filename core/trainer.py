@@ -9,7 +9,7 @@ from tqdm import tqdm
 
 from .base import BaseRunner
 from .validator import Validator
-from utils.optimizer import build_optimizer, print_optimizer_info
+from utils.optimizer import build_optimizer, build_sgd_optimizer, print_optimizer_info
 from utils.ema import ModelEMA
 from utils.prefetcher import CUDAPrefetcher
 from .config import get_config
@@ -262,6 +262,7 @@ class Trainer(BaseRunner):
                     device=self.device,
                     hf_token=(self.dino_cfg.get("hf_token") or os.getenv("HF_TOKEN")),
                     sal_from=str(self.dino_cfg.get("sal_from", "auto")),
+                    compile=bool(self.dino_cfg.get("compile", False)),
                 )
                 try:
                     self._dino_log_interval = int(self.dino_cfg.get("log_interval", 100))
@@ -279,6 +280,9 @@ class Trainer(BaseRunner):
                             "dino/prewarm", {
                                 "model": self.dino_cfg["model_name"],
                                 "resolution": int(self.dino_cfg["resolution"]),
+                                "quant": str(quant_mode),
+                                "quant_applied": bool(getattr(self.dino_teacher, "_quant_applied", False)),
+                                "compiled": bool(getattr(self.dino_teacher, "_compiled", False)),
                             }
                         )
                     except Exception as e:
@@ -322,6 +326,60 @@ class Trainer(BaseRunner):
         self._head_nominal_lr_epoch: list[float] = []
         self._dino_loss_ema: float = 0.0
         self._dino_loss_peak: float = 0.0
+        # DINO patience tracking (epoch-level)
+        try:
+            self._dino_patience_epochs: int = int(self.dino_cfg.get("patience_epochs", 0))
+        except Exception:
+            self._dino_patience_epochs = 0
+        try:
+            self._dino_patience_delta: float = float(self.dino_cfg.get("patience_delta", 0.0))
+        except Exception:
+            self._dino_patience_delta = 0.0
+        self._dino_best_total: float = float("inf")
+        self._dino_since_improve: int = 0
+        # DINO decay-on-patience state
+        self._dino_decay_distill_active: bool = False
+        self._dino_decay_prior_active: bool = False
+        self._dino_decay_start_e: float = 0.0
+        self._dino_decay_len_distill: float = 0.0
+        self._dino_decay_len_prior: float = 0.0
+
+    def _current_frac_epoch(self) -> float:
+        try:
+            nb = float(getattr(self, '_epoch_nb', 0) or 0)
+            bi = float(getattr(self, '_epoch_batch_idx', 0) or 0)
+            e = float(self.epoch)
+            return e + (bi / nb) if nb > 0 else e
+        except Exception:
+            return float(self.epoch)
+
+    def _start_dino_decay(self, length_epochs: float = 3.0, include_distill: bool = True, include_prior: bool = True):
+        """Begin a linear decay of distillation weights and/or objfor02 prior over length_epochs.
+        Disabling occurs automatically when decay completes.
+        """
+        e0 = float(self.epoch)
+        self._dino_decay_start_e = e0
+        if include_distill:
+            self._dino_decay_distill_active = True
+            self._dino_decay_len_distill = float(length_epochs)
+        if include_prior:
+            self._dino_decay_prior_active = True
+            self._dino_decay_len_prior = float(length_epochs)
+            # Expose anchors to loss via model for prior scaling
+            try:
+                setattr(self.model, '_objfor_decay_start_e', float(e0))
+                setattr(self.model, '_objfor_decay_len', float(length_epochs))
+            except Exception:
+                pass
+        try:
+            self.logger.info('dino/patience_decay_start', {
+                'epoch': int(self.epoch),
+                'len_epochs': float(length_epochs),
+                'distill': bool(include_distill),
+                'prior': bool(include_prior)
+            })
+        except Exception:
+            pass
 
     def _disable_dino(self, reason: str = ""):
         """Disable DINO distillation for the rest of training and unload the teacher."""
@@ -384,6 +442,55 @@ class Trainer(BaseRunner):
             self.dino_teacher = None
         self._dino_ready = False
         self._dino_levels = 0
+        # Optional: switch optimizer after turning off DINO, and reset EMA
+        try:
+            model_hyp = getattr(self.model, 'hyp', None)
+            cfg = get_config(cfg=self.cfg, hyp=model_hyp)
+            dino_block = dict(self.dino_cfg) if isinstance(self.dino_cfg, dict) else {}
+            opt_after = dino_block.get("optimizer_after_off", None)
+            if isinstance(opt_after, dict) and len(opt_after) > 0:
+                # Build using provided optimizer block only, keep other hyp unchanged
+                new_hyp = dict(model_hyp) if isinstance(model_hyp, dict) else {}
+                new_hyp['optimizer'] = opt_after
+                # Choose builder by key present
+                if 'SGD' in opt_after:
+                    new_opt, new_sched = build_sgd_optimizer(self.model, epochs=self.epochs, hyp=new_hyp)
+                    opt_name = 'SGD'
+                else:
+                    # Default to Lion if specified or fallback
+                    new_opt, new_sched = build_optimizer(self.model, epochs=self.epochs, hyp=new_hyp)
+                    opt_name = 'Lion'
+                self.optimizer = new_opt
+                self.scheduler = new_sched
+                try:
+                    self.logger.info('optimizer/switch', {'type': opt_name})
+                    print_optimizer_info(self.optimizer, self.scheduler)
+                except Exception:
+                    pass
+                # Leave EMA untouched by default after optimizer switch
+            # Optionally switch classification loss type in criterion/model hyp
+            try:
+                cls_after = dino_block.get('cls_type_after_off', None)
+                if isinstance(cls_after, str) and cls_after.strip():
+                    cls_after = cls_after.strip().lower()
+                    if cls_after in ('vfl', 'qfl', 'bce'):
+                        # Update model.hyp
+                        if isinstance(self.model.hyp, dict):
+                            self.model.hyp['cls_type'] = cls_after
+                        # Update criterion snapshot hyp
+                        if hasattr(self, 'criterion') and hasattr(self.criterion, 'hyp') and isinstance(self.criterion.hyp, dict):
+                            self.criterion.hyp['cls_type'] = cls_after
+                        try:
+                            self.logger.info('loss/cls_type_switch', {'cls_type': cls_after})
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        except Exception as e:
+            try:
+                self.logger.debug('optimizer/switch_error', str(e))
+            except Exception:
+                pass
         try:
             msg = {"epoch": int(self.epoch), "reason": reason or "disabled"}
             self.logger.info("dino/disabled", msg)
@@ -403,8 +510,10 @@ class Trainer(BaseRunner):
         self.optimizer.zero_grad(set_to_none=True)
         try:
             if getattr(self, 'dino_cfg', {}).get("enabled", False):
+                # If patience is configured, it overrides max_epochs hard stop.
+                use_pat = int(self.dino_cfg.get("patience_epochs", 0)) > 0
                 max_ep = int(self.dino_cfg.get("max_epochs", 0))
-                if max_ep > 0 and int(self.epoch) >= max_ep:
+                if (not use_pat) and (max_ep > 0 and int(self.epoch) >= max_ep):
                     self._disable_dino("hard_stop")
         except Exception:
             pass
@@ -422,6 +531,18 @@ class Trainer(BaseRunner):
                 self.logger.debug("dino/status", "enabled but teacher not initialized")
             except Exception:
                 pass
+        # Auto-disable after decay completes
+        try:
+            if getattr(self, 'dino_cfg', {}).get("enabled", False):
+                if (self._dino_decay_distill_active or self._dino_decay_prior_active):
+                    e = float(self.epoch)
+                    end_e = float(self._dino_decay_start_e) + max(
+                        float(self._dino_decay_len_distill), float(self._dino_decay_len_prior)
+                    )
+                    if e >= end_e:
+                        self._disable_dino("patience_decay_end")
+        except Exception:
+            pass
 
         use_prefetch = (self.device.type == "cuda") and bool(self.cfg.get("cuda_prefetch", True))
 
@@ -442,6 +563,14 @@ class Trainer(BaseRunner):
         try:
             for i, batch in pbar:
                 self.callbacks.on_batch_start(self, i)
+                # Expose per-epoch batch indexing for per-step decays
+                try:
+                    self._epoch_nb = nb
+                    self._epoch_batch_idx = i
+                    setattr(self.model, '_epoch_nb', nb)
+                    setattr(self.model, '_epoch_batch_idx', i)
+                except Exception:
+                    pass
 
                 if use_prefetch:
                     images, targets, _, _, _ = batch  # already on device and channels_last
@@ -800,14 +929,44 @@ class Trainer(BaseRunner):
         """Constant weights during active epochs; hard stop after max_epochs (if > 0).
         Uses defaults aligned with core/config.py DEFAULTS.dino if any key is missing.
         """
+        # Compute fractional epoch (epoch + step/nb) for smooth decay
         e = float(self.epoch)
+        try:
+            nb = float(getattr(self, '_epoch_nb', 0) or 0)
+            bi = float(getattr(self, '_epoch_batch_idx', 0) or 0)
+            if nb > 0:
+                e = e + (bi / nb)
+        except Exception:
+            pass
         max_ep = int(self.dino_cfg.get("max_epochs", 0))
-        if max_ep > 0 and e >= max_ep:
+        # If patience is enabled, allow DINO to run beyond max_epochs and let patience govern.
+        try:
+            pat = int(self.dino_cfg.get("patience_epochs", 0))
+        except Exception:
+            pat = 0
+        # Distillation master switch
+        if not bool(self.dino_cfg.get("distillation", True)):
+            return 0.0, 0.0, 0.0
+        if pat <= 0 and max_ep > 0 and e >= max_ep:
             return 0.0, 0.0, 0.0
         a0 = float(self.dino_cfg.get("alpha", 0.5))
         b0 = float(self.dino_cfg.get("beta", 0.2))
         g0 = float(self.dino_cfg.get("gamma", 0.1))
-        return a0, b0, g0
+        # Optional linear decay over epochs for distillation weights
+        if self._dino_decay_distill_active and self._dino_decay_len_distill > 0:
+            e0 = float(self._dino_decay_start_e)
+            dd = float(self._dino_decay_len_distill)
+            scale = max(0.0, 1.0 - ((e - e0) / dd))
+        else:
+            try:
+                dd = float(self.dino_cfg.get("distill_decay_epochs", 0))
+            except Exception:
+                dd = 0.0
+            if dd and dd > 0:
+                scale = max(0.0, 1.0 - (e / dd))
+            else:
+                scale = 1.0
+        return a0 * scale, b0 * scale, g0 * scale
 
     def _compute_dino_losses(self, images: torch.Tensor, targets: torch.Tensor | None = None):
         try:
@@ -826,14 +985,17 @@ class Trainer(BaseRunner):
                 return None, {}
         except Exception:
             pass
-        every_n = 1 if bool(self.dino_cfg.get("objfor02", False)
-                           ) else int(self.dino_cfg.get("every_n", 2))
+        want_prior = bool(self.dino_cfg.get("objfor02", False))
+        want_distill = bool(self.dino_cfg.get("distillation", True))
+        if (not want_prior) and (not want_distill):
+            return None, {}
+        every_n = 1 if want_prior else int(self.dino_cfg.get("every_n", 2))
         if every_n > 1 and (step % every_n) != 0:
             return None, {}
 
         a, b, g = self._dino_weights()
-        objfor02 = bool(self.dino_cfg.get("objfor02", False))
-        if (a + b + g) <= 1e-6 and (not objfor02):
+        objfor02 = want_prior
+        if (not want_distill) and (not objfor02):
             return None, {}
 
         teach = self.dino_teacher.forward(images)
@@ -888,7 +1050,8 @@ class Trainer(BaseRunner):
                     self.logger.debug("dino/obj_prior_error", str(e))
                 except Exception:
                     pass
-            return None, {}
+            if not want_distill:
+                return None, {}
 
         try:
             obj_levels: list[torch.Tensor] = []
@@ -974,7 +1137,7 @@ class Trainer(BaseRunner):
                 s_glb_i = torch.nn.functional.normalize(s_glb_i, dim=-1)
                 s_glb_agg = wi * s_glb_i if s_glb_agg is None else s_glb_agg + wi * s_glb_i
 
-        if objfor02:
+        if objfor02 and not want_distill:
             try:
                 obj_flat_list = []
                 obj_levels: list[torch.Tensor] = []
@@ -1295,6 +1458,42 @@ class Trainer(BaseRunner):
                 except Exception:
                     pass
 
+                # Patience on distillation losses: if enabled, disable DINO after
+                # patience_epochs with no improvement in avg_total.
+                try:
+                    if self._dino_patience_epochs > 0:
+                        improved = (float(self._dino_best_total) - float(avg_total)) > float(self._dino_patience_delta)
+                        if improved:
+                            self._dino_best_total = float(avg_total)
+                            self._dino_since_improve = 0
+                            try:
+                                self.logger.info("dino/patience_improve", {
+                                    "epoch": int(self.epoch),
+                                    "best_total": float(self._dino_best_total)
+                                })
+                            except Exception:
+                                pass
+                        else:
+                            self._dino_since_improve += 1
+                            if self._dino_since_improve >= int(self._dino_patience_epochs):
+                                # Start 3-epoch decay for both distill and prior instead of immediate disable
+                                self._start_dino_decay(length_epochs=3.0, include_distill=True, include_prior=True)
+                                try:
+                                    self.logger.info("dino/patience_stop", {
+                                        "epoch": int(self.epoch),
+                                        "no_improve_epochs": int(self._dino_since_improve),
+                                        "best_total": float(self._dino_best_total)
+                                    })
+                                except Exception:
+                                    pass
+                except Exception as e:
+                    try:
+                        self.logger.debug("dino/patience_error", str(e))
+                    except Exception:
+                        pass
+
+            # (objfor02 patience handled after validation when fitness is available)
+
             if self.val_loader is not None:
                 val_payload = self.validate(self.val_loader)
                 if isinstance(val_payload, dict) and 'scalars' in val_payload:
@@ -1305,6 +1504,44 @@ class Trainer(BaseRunner):
                     val_metrics = val_payload if isinstance(val_payload, dict) else {}
                     metrics.update(val_metrics)
                     self.callbacks.on_val_end(self, val_payload)
+
+            # Patience on objfor02: use validation fitness as the improvement signal.
+            try:
+                if getattr(self, 'dino_cfg', {}).get("enabled", False) and bool(self.dino_cfg.get("objfor02", False)) and self._dino_patience_epochs > 0:
+                    fit = metrics.get("fitness", None)
+                    if fit is not None:
+                        if not hasattr(self, "_dino_best_fitness"):
+                            self._dino_best_fitness = float("-inf")
+                            self._dino_since_improve_obj = 0
+                        improved = (float(fit) > float(self._dino_best_fitness) + float(self._dino_patience_delta))
+                        if improved:
+                            self._dino_best_fitness = float(fit)
+                            self._dino_since_improve_obj = 0
+                            try:
+                                self.logger.info("dino/patience_improve_fitness", {
+                                    "epoch": int(self.epoch),
+                                    "best_fitness": float(self._dino_best_fitness)
+                                })
+                            except Exception:
+                                pass
+                        else:
+                            self._dino_since_improve_obj += 1
+                            if self._dino_since_improve_obj >= int(self._dino_patience_epochs):
+                                # Start 3-epoch decay for both distill and prior instead of immediate disable
+                                self._start_dino_decay(length_epochs=3.0, include_distill=True, include_prior=True)
+                                try:
+                                    self.logger.info("dino/patience_stop_objfor02", {
+                                        "epoch": int(self.epoch),
+                                        "no_improve_epochs": int(self._dino_since_improve_obj),
+                                        "best_fitness": float(self._dino_best_fitness)
+                                    })
+                                except Exception:
+                                    pass
+            except Exception as e:
+                try:
+                    self.logger.debug("dino/patience_objfor02_error", str(e))
+                except Exception:
+                    pass
 
             self.callbacks.on_epoch_end(self, epoch, metrics)
 

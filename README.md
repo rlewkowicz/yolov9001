@@ -1,9 +1,29 @@
 # YOLOv9001
-This was based on yolov9 before the rewrite. Now it's completely distinct training platform for detection models. Similar concepts, very different architectures. The current core model is based on hyper model:
+This was based on yolov9 before the rewrite. Now it's completely distinct training platform for detection models. Similar concepts, very different architectures. This was built with LLMs, in a variety of workflows. 
+
+The current core model is based on hyper model:
 
 https://github.com/iMoonLab/Hyper-YOLO
 
+# License
+This *should* be MIT licensed?   
+
+```
+4.1. Generally. Customer and Customer’s End Users may provide Input and receive Output. As between Customer and OpenAI, to the extent permitted by applicable law, Customer: (a) retains all ownership rights in Input; and (b) owns all Output. OpenAI hereby assigns to Customer all OpenAI’s right, title, and interest, if any, in and to Output.
+```
+
+So I made this? I'm not a lawyer, I do try to respect licenses. I don't have albumtations, I don't a ton of stuff. This is all "from scratch". An LLM wrote 95% of this. I don't think I copy pasted anything. This started as an empty folder.
+
+Most of this space is tied into ultralytics, yolov5, which is what led to yolov7/9 and is used for a ton of research papers.
+
+So this is a similar but very very different software platform. This is a custom software architecture and it was a lot of work still.  
+
+# Content
 - [YOLOv9001](#yolov9001)
+- [License](#license)
+- [Content](#content)
+  - [General Goals](#general-goals)
+  - [Saliency‑Guided Assignment](#saliencyguided-assignment)
   - [CLI Usage](#cli-usage)
   - [Examples](#examples)
   - [Runtime Attachment (core/runtime.py)](#runtime-attachment-coreruntimepy)
@@ -15,6 +35,20 @@ https://github.com/iMoonLab/Hyper-YOLO
   - [Datasets](#datasets)
   - [Notes \& Tips](#notes--tips)
 
+## General Goals
+I'm making a product, and vision,language compute is just getting bigger and bigger. I'm trying to build an embedded device and all the edge models are very old. So I go and I read papers with code and I grab models that have the best map for small and nano models, and I try to quantize those. I've done well with a handful of models, I started with yolov9 but that repo is a mess and ultralytics is AGPL. RFDetr and roboflow are the new challengers, they have a software platform, but the detr variants are too heavy and don't quantize well. Plus, being they are a generalized software platform, their performance isn't always great. So the whole training platform is designed to reduce wall clock time. 
+
+
+## Saliency‑Guided Assignment
+So there's a lot of weird stuff you can do to the models and weight shapes. https://ai.meta.com/dinov3/ is the current world class... "vision foundation model". I'm not an academic. It does vision stuff. Among those things, is one thing I'm interested in. The objness. In some vision classification tasks you have, is it?, what is it?, where is it?
+
+So out of the box, untuned, "is it?" is better than any other publicly available model on the planet. The AI will actually advise against things, that I find will pump the mAP. I'm mostly exploring different techniques to reduce the wall clock train time of these models. From distillation to saliency guided alignment.
+
+It's called an auxiliary trainer. yolov9 does this with a dedicated dual head, but the idea is similar. 
+
+> `Distillation`: Match the teacher’s internal signals.
+
+> `Saliency‑guided`: Use the teacher as a prior to pick/weight what we already train on.
 
 ## CLI Usage
 - Basic: `python 9001.py <mode> [options]`
@@ -77,6 +111,10 @@ https://github.com/iMoonLab/Hyper-YOLO
   - `reg_weight_with_saliency`: weights regression/DFL terms by teacher saliency with `reg_weight_floor` and `reg_weight_power`.
   - Optional `centroid_align`: aligns predicted box centers with saliency centers in early epochs.
   - Prototype-based class soft targets (`dino.cls_proto`) and region contrastive (`dino.contrast`) are available in config defaults.
+  - Patience: set `dino.patience_epochs` (>0) to auto-disable DINO when there's no improvement for N epochs.
+    - Distillation mode: uses epoch-avg `dino_total` (lower is better).
+    - `objfor02` mode: uses validation `fitness` (higher is better).
+    - When patience is set, it overrides `max_epochs` hard-stop, allowing DINO to continue until patience triggers.
 
 ## Example Hyp: models/hyps/low.yaml
 ```
@@ -180,4 +218,3 @@ This repo doesn't use albumtations, or ultralytics. They're all "from scratch". 
 - When using DINO, some Hugging Face model repos may require authentication; set `HF_TOKEN` or pass `dino.hf_token` in your hyp.
 - `attach_runtime` should be called after loading weights and before training/validation/inference (handled by `9001.py`).
 - For custom models, implement `DetectModelBase.parse_model`, expose a `Detect` head, and rely on `attach_runtime` to finalize runtime attributes.
-

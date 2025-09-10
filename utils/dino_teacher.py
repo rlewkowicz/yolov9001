@@ -30,6 +30,7 @@ class DINOTeacher:
         device: Optional[torch.device] = None,
         hf_token: Optional[str] = None,
         sal_from: str = "auto",  # "attn" | "energy" | "auto"
+        compile: bool = False,
     ) -> None:
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model_name = model_name
@@ -49,6 +50,10 @@ class DINOTeacher:
             self.sal_from = "auto"
         self._auto_peak_mult: float = 5.0  # if max prob <= (k / N) treat as flat
         self._auto_entropy_thresh: float = 0.98  # if H/ln(N) >= thresh treat as flat
+        # Runtime flags
+        self._quant_applied: bool = False
+        self._compiled: bool = False
+        self._compile_requested: bool = bool(compile)
 
     def _lazy_init(self):
         if self._init_ok:
@@ -106,7 +111,7 @@ class DINOTeacher:
 
         def _load_model(qcfg):
             kwargs: Dict[str, Any] = {
-                "dtype": self.dtype,
+                "torch_dtype": self.dtype,
                 "trust_remote_code": True,
                 "device_map": None,
             }
@@ -114,9 +119,7 @@ class DINOTeacher:
                 try:
                     return AutoModel.from_pretrained(self.model_name, token=self._token, **kwargs)
                 except TypeError:
-                    return AutoModel.from_pretrained(
-                        self.model_name, use_auth_token=self._token, **kwargs
-                    )
+                    return AutoModel.from_pretrained(self.model_name, use_auth_token=self._token, **kwargs)
             else:
                 return AutoModel.from_pretrained(self.model_name, **kwargs)
 
@@ -135,15 +138,34 @@ class DINOTeacher:
                 try:
                     from torchao.quantization import quantize_ as _quantize_
                     _quantize_(self._model, quantization_config)
+                    self._quant_applied = True
                 except Exception as e:
                     self._last_error = f"torchao_weight_only_apply_error: {e}"
                     raise
+            # Optional torch.compile for inference speed (safe defaults)
+            if self._compile_requested:
+                try:
+                    self._model = torch.compile(
+                        self._model,
+                        backend="inductor",
+                        fullgraph=False,
+                        dynamic=False,
+                    )
+                    self._compiled = True
+                except Exception as e:
+                    # Non-fatal; just report and continue uncompiled
+                    try:
+                        self._logger.warning("dino/compile_failed", str(e))
+                    except Exception:
+                        pass
             self._init_ok = True
             self._logger.info(
                 "dino/loaded", {
                     "name": self.model_name,
                     "quant": self.quant,
                     "dtype": str(self.dtype),
+                    "quant_applied": bool(self._quant_applied),
+                    "compiled": bool(self._compiled),
                 }
             )
         except Exception as e:

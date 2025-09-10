@@ -122,7 +122,14 @@ class TaskAlignedAssigner(nn.Module):
                 pd_objectness=pd_objectness,
                 anc_strides=anc_strides
             )
-            return {"reg": o2m["reg"], "cls": o2o_cls["cls"]}
+            # Reuse classification O2O matches for objectness to avoid an extra Hungarian pass
+            cls_branch = o2o_cls["cls"]
+            obj_branch = {
+                "target_objectness": cls_branch["fg_mask"].float(),
+                "fg_mask": cls_branch["fg_mask"],
+                "matched_gt": cls_branch["matched_gt"],
+            }
+            return {"reg": o2m["reg"], "cls": cls_branch, "obj": obj_branch}
 
     def _tal_assign(
         self,

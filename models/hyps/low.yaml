@@ -1,11 +1,11 @@
 optimizer:
   SGD:
-    lr0: 0.01        # base LR
+    lr0: 0.02        # base LR
     lrf: 0.02        # final LR fraction for cosine decay
     momentum: 0.937  # SGD momentum
-    warmup_momentum: 0.8   # start momentum during warmup
-    warmup_epochs: 3.0     # linear warmup duration (epochs)
-    warmup_bias_lr: 0.1   # bias-group LR at start of warmup
+    warmup_momentum: 0.937   # start momentum during warmup
+    warmup_epochs: 0.0     # linear warmup duration (epochs)
+    warmup_bias_lr: 1   # bias-group LR at start of warmup
     nesterov: true
     weight_decay: 0.0005
     decoupled_lr:
@@ -25,21 +25,45 @@ fliplr: 0.5
 mosaic: 0.9
 
 assign_mode: simota
-assign_radius: 1.4
+assign_radius: 3.0
 assign_lambda_iou: 3.5
 assign_topq: 10
 
 dino:
-  model_name: facebook/dinov3-vitb16-pretrain-lvd1689m
   enabled: true
+  distillation: true
   objfor02: true
-  resolution: 512
+  resolution: 448
+  # Optional: stop DINO after no improvement (epoch-avg dino_total)
+  patience_epochs: 1  # set >0 to enable, e.g., 3
+  patience_delta: 0.0  # absolute tolerance for improvement
+  # Decays (per-epoch config, per-step computed):
+  # Linearly decay distillation weights (alpha/beta/gamma) to zero over N epochs
+  distill_decay_epochs: 4
+  # Linearly decay objfor02 prior influence to zero over N epochs
+  objfor02_decay_epochs: 3
+  # After DINO turns off (via patience), optionally switch optimizer and keep EMA
+  # Provide a full optimizer block; omit or set to null to keep current optimizer
+  optimizer_after_off:
+    LION:
+      lr0: 0.003
+      lrf: 0.01
+      b1: 0.9
+      b2: 0.999
+      alpha: 30
+      bias_correction: false
+      weight_decay: 0.004
+      decoupled_lr:
+        backbone:
+          lr_scale: 1.0
+        head:
+          lr_scale: 1.0
   reg_weight_with_saliency: true
   reg_weight_floor: 0.5
   reg_weight_power: 2.0
-  centroid_align: true
-  centroid_weight: 0.1
-  centroid_max_epochs: 6
-  max_epochs: 12
+  centroid_align: false
+  centroid_weight: 0.5
+  centroid_max_epochs: 4
+  max_epochs: 200
   every_n: 1
-  quant: fp16
+  quant: int4

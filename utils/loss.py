@@ -107,6 +107,20 @@ class DetectionLoss(nn.Module):
             self.centroid_max_epochs = int(dino_cfg.get('centroid_max_epochs', 0))
         except Exception:
             self.centroid_max_epochs = 0
+        try:
+            self.objfor_decay_epochs = int(dino_cfg.get('objfor02_decay_epochs', 0))
+        except Exception:
+            self.objfor_decay_epochs = 0
+        # Objfor02 logging knobs
+        try:
+            self.objfor_log_every = int(dino_cfg.get('objfor02_log_every', 0))
+        except Exception:
+            self.objfor_log_every = 0
+        try:
+            self.objfor_lowprior_thresh = float(dino_cfg.get('objfor02_lowprior_thresh', 0.2))
+        except Exception:
+            self.objfor_lowprior_thresh = 0.2
+        self._objfor_log_counter = 0
 
     def pack_targets(self, gt_labels_list, gt_bboxes_list):
         """
@@ -173,7 +187,34 @@ class DetectionLoss(nn.Module):
                 ) is not None:
                     prior = det_for_bias.last_dino_obj_flat  # [B,N] in [0,1]
                     prior = prior.clamp(1e-4, 1.0 - 1e-4)
-                    pd_obj = torch.logit(prior).unsqueeze(-1).to(dtype=pred_scores.dtype)
+                    logits = torch.logit(prior).to(dtype=pred_scores.dtype)
+                    # Optional per-step decay of prior influence via logit scaling
+                    # First prefer anchored decay started by trainer on patience
+                    if hasattr(self.model, '_objfor_decay_len') and float(getattr(self.model, '_objfor_decay_len', 0)) > 0:
+                        try:
+                            e = float(getattr(self.model, 'epoch', 0) or 0)
+                            nb = float(getattr(self.model, '_epoch_nb', 0) or 0)
+                            bi = float(getattr(self.model, '_epoch_batch_idx', 0) or 0)
+                            if nb > 0:
+                                e = e + (bi / nb)
+                            e0 = float(getattr(self.model, '_objfor_decay_start_e', 0) or 0)
+                            dd = float(getattr(self.model, '_objfor_decay_len', 0) or 0)
+                            scale = max(0.0, 1.0 - ((e - e0) / max(dd, 1e-12)))
+                            logits = logits * float(scale)
+                        except Exception:
+                            pass
+                    elif self.objfor_decay_epochs and self.objfor_decay_epochs > 0:
+                        try:
+                            e = float(getattr(self.model, 'epoch', 0) or 0)
+                            nb = float(getattr(self.model, '_epoch_nb', 0) or 0)
+                            bi = float(getattr(self.model, '_epoch_batch_idx', 0) or 0)
+                            if nb > 0:
+                                e = e + (bi / nb)
+                            scale = max(0.0, 1.0 - (e / float(self.objfor_decay_epochs)))
+                            logits = logits * float(scale)
+                        except Exception:
+                            pass
+                    pd_obj = logits.unsqueeze(-1)
         except Exception:
             pd_obj = None
 
@@ -187,6 +228,52 @@ class DetectionLoss(nn.Module):
             pd_objectness=pd_obj,  # DINO prior logits for cost bias if available
             anc_strides=anchor_strides  # [N, 1], used by SimOTA/mixed center prior
         )
+
+        # Optional: lightweight logging of objfor02 effect on SimOTA positives
+        if self.objfor_log_every and bool(self.hyp.get('dino', {}).get('objfor02', False)):
+            try:
+                self._objfor_log_counter += 1
+            except Exception:
+                self._objfor_log_counter = 1
+            if (self._objfor_log_counter % max(1, int(self.objfor_log_every))) == 0:
+                try:
+                    assign_noprior = self.assigner(
+                        pred_scores.detach(),
+                        pred_bboxes_px,
+                        anchors_px,
+                        gt_labels_b,
+                        gt_bboxes_b,
+                        gt_mask_b,
+                        pd_objectness=None,
+                        anc_strides=anchor_strides
+                    )
+                    fg_with = assign["reg"]["fg_mask"].to(torch.int32)
+                    fg_no = assign_noprior["reg"]["fg_mask"].to(torch.int32)
+                    suppressed = int((fg_no & (1 - fg_with)).sum().item())
+                    helped = int((fg_with & (1 - fg_no)).sum().item())
+                    total_with = int(fg_with.sum().item())
+                    total_no = int(fg_no.sum().item())
+                    lowp = None
+                    try:
+                        det = getattr(self.model, 'detect_layer', None)
+                        if det is not None and getattr(det, 'last_dino_obj_flat', None) is not None:
+                            prior = det.last_dino_obj_flat  # [B,N]
+                            thr = float(self.objfor_lowprior_thresh)
+                            lowp = int((assign["reg"]["fg_mask"] & (prior < thr)).sum().item())
+                    except Exception:
+                        lowp = None
+                    log = get_logger()
+                    log.basic('simota/pos_with_prior', float(total_with))
+                    log.basic('simota/pos_no_prior', float(total_no))
+                    log.basic('simota/suppressed', float(suppressed))
+                    log.basic('simota/helped', float(helped))
+                    if lowp is not None:
+                        log.basic('simota/lowprior_pos', float(lowp))
+                except Exception as e:
+                    try:
+                        get_logger().debug('simota/objfor02_log_error', str(e))
+                    except Exception:
+                        pass
 
         target_bboxes_px = assign["reg"]["target_bboxes"]  # [B, N, 4] pixels
         fg_mask = assign["reg"]["fg_mask"]  # [B, N] bool
@@ -235,6 +322,7 @@ class DetectionLoss(nn.Module):
         sal_w = None
         if self.salreg_enabled:
             try:
+                det = getattr(self.model, 'detect_layer', None)
                 if det is not None and getattr(det, 'last_dino_obj_flat', None) is not None:
                     prior = det.last_dino_obj_flat.clamp(0.0, 1.0)  # [B,N]
                     floor = 0.0 if self.salreg_floor < 0.0 else (
@@ -247,7 +335,8 @@ class DetectionLoss(nn.Module):
                 sal_w = None
 
         loss_box = self.box_loss(pred_bboxes_px, target_bboxes_px, q_anchor, fg_mask, Npos, sal_w)
-        loss_cls = self.cls_loss(pred_scores, q, fg_mask)
+        # Use classification mask for proper normalization in BCE path
+        loss_cls = self.cls_loss(pred_scores, q, fg_mask_cls)
         loss_dfl = self.dfl_loss(
             pred_distri, target_bboxes_grid, q_anchor, fg_mask, anchors, Npos, sal_w
         )
@@ -549,9 +638,7 @@ class DetectionLoss(nn.Module):
 
         alpha = float(self.vfl_alpha)
         gamma = float(self.vfl_gamma)
-        float(self.hyp.get("cls_pw", 1.0))
         pred_prob = pred_scores.sigmoid()
-        target_scores > 0
 
         if cls_type == "qfl":
             beta = float(self.qfl_beta)
